@@ -31,17 +31,20 @@ def parse_date_from_name(name: str):
     return dt.date(yyyy, mm, dd)
 
 def latest_reviews_file():
-    q = (
-        f"'{DRIVE_FOLDER_ID}' in parents and trashed=false and "
-        f"(name contains 'Reviews_' and (name ends with '.xls' or name ends with '.xlsx'))"
-    )
-    items = DRIVE.files().list(q=q, fields="files(id,name)").execute().get("files", [])
-    parsed = [(it["id"], it["name"], parse_date_from_name(it["name"])) for it in items]
-    parsed = [x for x in parsed if x[2] is not None]
-    if not parsed:
-        raise RuntimeError("Нет файлов Reviews_dd-mm-yyyy.xls(x) в указанной папке.")
-    parsed.sort(key=lambda t: t[2], reverse=True)
-    return parsed[0]  # id, name, date
+    # Берём все прямые файлы в папке и фильтруем по шаблону Reviews_dd-mm-yyyy.xls(x)
+    regex = re.compile(r"^Reviews_\d{2}-\d{2}-\d{4}\.xls(x)?$", re.IGNORECASE)
+    results = DRIVE.files().list(
+        q=f"'{DRIVE_FOLDER_ID}' in parents and trashed=false",
+        fields="files(id,name,modifiedTime)",
+        pageSize=1000
+    ).execute()
+    items = results.get("files", [])
+    items = [(i["id"], i["name"], parse_date_from_name(i["name"])) for i in items if regex.match(i["name"])]
+    if not items:
+        raise RuntimeError("В папке нет файлов вида Reviews_dd-mm-yyyy.xls(x). Проверьте имя и расположение файла.")
+    items.sort(key=lambda t: t[2], reverse=True)
+    return items[0]  # id, name, date
+
 
 def download_file(file_id: str) -> bytes:
     request = DRIVE.files().get_media(fileId=file_id)
