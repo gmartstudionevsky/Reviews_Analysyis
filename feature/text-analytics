@@ -1,0 +1,6 @@
+git checkout -b feature/text-analytics
+# Обнови/создай файлы из блоков ниже (или git apply патч, если удобно)
+git add .
+git commit -m "Weekly agent: topics, keywords, sentiment, by-channel, charts"
+git push -u origin feature/text-analytics
+# затем открой Pull Request в GitHub
