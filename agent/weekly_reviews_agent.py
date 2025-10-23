@@ -1,4 +1,6 @@
+# agent/weekly_reviews_agent.py
 import os, re, io, json, math, datetime as dt
+from datetime import date
 import numpy as np
 import pandas as pd
 from dateutil.relativedelta import relativedelta
@@ -16,7 +18,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-# --- Google clients ---
+# --- Google clients / env ---
 SCOPES = [
     "https://www.googleapis.com/auth/drive.readonly",
     "https://www.googleapis.com/auth/spreadsheets",
@@ -33,7 +35,7 @@ RECIPIENTS = [e.strip() for e in os.environ["RECIPIENTS"].split(",") if e.strip(
 HISTORY_TAB = os.environ.get("HISTORY_TAB", "history")
 TOPICS_TAB  = os.environ.get("TOPICS_TAB", "topics_history")
 
-# --- Patterns/lexicons ---
+# --- Темы/лексиконы ---
 TOPIC_PATTERNS = {
     "Локация":        [r"расположен", r"расположение", r"рядом", r"вокзал", r"невск"],
     "Персонал":       [r"персонал", r"сотрудник", r"администрат", r"ресепшен|ресепшн", r"менеджер"],
@@ -52,18 +54,15 @@ NEG_CUES = re.compile(
     re.IGNORECASE
 )
 POS_LEX = re.compile(r"отличн|прекрасн|замечат|идеальн|классн|любезн|комфортн|удобн|чисто|тихо|вкусн|быстро", re.IGNORECASE)
-NEG_LEX = re.compile(r"ужасн|плох|грязн|громк|холодн|жарко|слаб|плохо|долго|скучн|бедн|мало|дорог", re.IGNORECASE)
+NEG_LEX = re.compile(r"ужасн|плох|грязн|громк|холодн|жарко|слаб|плохо|долго|скучн|бедн|мало|дорог|проблем", re.IGNORECASE)
 
 TOKEN_RE = re.compile(r"[A-Za-zА-Яа-яЁё0-9\-]{3,}")
 RU_STOP = set('и или для что это эта этот эти также там тут как при по на из от до во со бы ли был была были уже еще есть нет да мы вы они она он в за к с у о а но же то тд др очень всего более менее'.split())
 
 EXPECTED = ["Дата","Рейтинг","Источник","Автор","Код языка","Текст отзыва","Наличие ответа"]
-RENAMES = {
-    "Дата": "Дата", "Рейтинг":"Рейтинг", "Источник":"Источник", "Автор":"Автор",
-    "Код языка":"Код языка", "Текст отзыва":"Текст", "Наличие ответа":"Ответ"
-}
+RENAMES = {"Дата":"Дата","Рейтинг":"Рейтинг","Источник":"Источник","Автор":"Автор","Код языка":"Код языка","Текст отзыва":"Текст","Наличие ответа":"Ответ"}
 
-# --- Helpers ---
+# --- Drive helpers ---
 def parse_date_from_name(name: str):
     m = re.search(r"^Reviews_(\d{2})-(\d{2})-(\d{4})\.xls(x)?$", name, re.IGNORECASE)
     if not m: return None
@@ -82,7 +81,7 @@ def latest_reviews_file():
     if not items:
         raise RuntimeError("В папке нет файлов вида Reviews_dd-mm-yyyy.xls(x).")
     items.sort(key=lambda t: t[2], reverse=True)
-    return items[0]  # id, name, date
+    return items[0]
 
 def download_file(file_id: str) -> bytes:
     request = DRIVE.files().get_media(fileId=file_id)
@@ -93,6 +92,7 @@ def download_file(file_id: str) -> bytes:
         _, done = downloader.next_chunk()
     return buf.getvalue()
 
+# --- General helpers ---
 def normalize_to10(series: pd.Series) -> pd.Series:
     num = pd.to_numeric(
         series.astype(str).str.replace(",", ".", regex=False).str.extract(r"([-+]?\d*\.?\d+)")[0],
@@ -145,6 +145,31 @@ def history_append(rows: pd.DataFrame):
         body={"values": rows.values.tolist()}
     ).execute()
 
+def load_topics_history():
+    try:
+        res = SHEETS.values().get(spreadsheetId=HISTORY_SHEET_ID, range=f"{TOPICS_TAB}!A:G").execute()
+        vals = res.get("values", [])
+        if len(vals) <= 1:
+            return pd.DataFrame(columns=["week_key","topic","mentions","share_pct","avg10","neg_text_share_pct","by_channel_json"])
+        th = pd.DataFrame(vals[1:], columns=vals[0])
+        for c in ["mentions","share_pct","avg10","neg_text_share_pct"]:
+            th[c] = pd.to_numeric(th[c], errors="coerce")
+        return th
+    except Exception:
+        return pd.DataFrame(columns=["week_key","topic","mentions","share_pct","avg10","neg_text_share_pct","by_channel_json"])
+
+def topics_append(week_key: str, df_topics: pd.DataFrame):
+    ensure_tab(HISTORY_SHEET_ID, TOPICS_TAB, ["week_key","topic","mentions","share_pct","avg10","neg_text_share_pct","by_channel_json"])
+    if df_topics.empty: 
+        return
+    rows = df_topics.assign(week_key=week_key)\
+                    [["week_key","topic","mentions","share","avg10","neg_text_share","by_channel_json"]].values.tolist()
+    SHEETS.values().append(spreadsheetId=HISTORY_SHEET_ID,
+                           range=f"{TOPICS_TAB}!A:G",
+                           valueInputOption="RAW",
+                           body={"values": rows}).execute()
+
+# --- Load weekly file ---
 def load_reviews_df(path: str) -> pd.DataFrame:
     df = pd.read_excel(path)  # .xls/.xlsx
     lowmap = {str(c).strip().lower(): c for c in df.columns}
@@ -177,20 +202,11 @@ def classify_topics(text: str):
     return hits
 
 def sentiment_sign(text: str, rating10: float):
-    """
-    Правила:
-    - если много NEG_CUES или NEG_LEX и мало POS → negative
-    - если POS_LEX и нет NEG → positive
-    - иначе fallback по рейтингу: <6 neg, 6–8 neutral, >=8 pos
-    """
-    t = str(text)
-    pos = len(POS_LEX.findall(t))
-    neg = len(NEG_LEX.findall(t)) + len(NEG_CUES.findall(t))
-    if neg - pos >= 2:
-        return "negative"
-    if pos - neg >= 1 and neg == 0:
-        return "positive"
-    if rating10 is not None:
+    pos = len(POS_LEX.findall(str(text)))
+    neg = len(NEG_LEX.findall(str(text))) + len(NEG_CUES.findall(str(text)))
+    if neg - pos >= 2: return "negative"
+    if pos - neg >= 1 and neg == 0: return "positive"
+    if rating10 is not None and not (isinstance(rating10, float) and math.isnan(rating10)):
         if rating10 < 6: return "negative"
         if rating10 >= 8: return "positive"
         return "neutral"
@@ -233,7 +249,6 @@ def summarize_topics(wk_df: pd.DataFrame):
         return pd.DataFrame(columns=["topic","mentions","share","avg10","neg_text_share","by_channel_json"]), quotes_map, []
     tmp = pd.DataFrame(topics_rows)
     total_reviews = len(wk_df)
-    # агрегаты по темам
     agg = (tmp.groupby("topic")
              .agg(mentions=("topic","size"),
                   avg10=("rating10","mean"),
@@ -251,11 +266,10 @@ def summarize_topics(wk_df: pd.DataFrame):
         d = {r["channel"]: {"count": int(r["cnt"]), "avg10": round(float(r["avg10"]),2)} for _, r in sub.iterrows()}
         by_channel_json.append({"topic": tp, "by_channel_json": json.dumps(d, ensure_ascii=False)})
     agg = agg.merge(pd.DataFrame(by_channel_json), on="topic", how="left")
-    # keywords
     keywords = extract_keywords(kw_texts, topn=20)
     return agg.sort_values("mentions", ascending=False), quotes_map, keywords
 
-# --- Core analysis ---
+# --- Week analysis ---
 def analyze_week(df: pd.DataFrame, start: dt.date, end: dt.date):
     df["Дата"] = pd.to_datetime(df["Дата"], errors="coerce", dayfirst=True).dt.date
     wk = df[(df["Дата"]>=start) & (df["Дата"]<=end)].copy()
@@ -268,10 +282,12 @@ def analyze_week(df: pd.DataFrame, start: dt.date, end: dt.date):
         "pos": int((wk["_sent_rule"]=="positive").sum()),
         "neu": int((wk["_sent_rule"]=="neutral").sum()),
         "neg": int((wk["_sent_rule"]=="negative").sum()),
-        "by_channel": wk.groupby("Источник")["_rating10"].agg(["count","mean"]).round(2).sort_values("count", ascending=False).reset_index().to_dict("records")
+        "by_channel": wk.groupby("Источник")["_rating10"].agg(["count","mean"]).round(2)
+                        .sort_values("count", ascending=False).reset_index().to_dict("records")
     }
     return wk, agg
 
+# --- Older trends (prev week, month avg, quarter avg, year avg) ---
 def summarize_trends(hist: pd.DataFrame, week_start: dt.date):
     iso_y, iso_w, _ = week_start.isocalendar()
     def pick(ptype, pkey):
@@ -290,43 +306,95 @@ def summarize_trends(hist: pd.DataFrame, week_start: dt.date):
         "year": pick("year", year_key),
     }
 
-def upsert_history(agg, week_start: dt.date):
-    iso_y, iso_w, _ = week_start.isocalendar()
-    rows = pd.DataFrame([
-        ["week",   f"{iso_y}-W{iso_w}",                   agg["reviews"], agg["avg10"], agg["pos"], agg["neu"], agg["neg"]],
-        ["month",  f"{week_start:%Y-%m}",                 agg["reviews"], agg["avg10"], agg["pos"], agg["neu"], agg["neg"]],
-        ["quarter",f"{week_start.year}-Q{(week_start.month-1)//3 + 1}", agg["reviews"], agg["avg10"], agg["pos"], agg["neu"], agg["neg"]],
-        ["year",   f"{week_start.year}",                  agg["reviews"], agg["avg10"], agg["pos"], agg["neu"], agg["neg"]],
-    ], columns=["period_type","period_key","reviews","avg10","pos","neu","neg"])
-    hist = history_read()
-    if not len(hist[(hist["period_type"]=="week") & (hist["period_key"]==f"{iso_y}-W{iso_w}")]):
-        history_append(rows)
+# --- Build MTD/QTD/YTD from week rows (uses backfill) ---
+def week_key_to_monday(week_key: str) -> date:
+    y, w = week_key.split("-W")
+    return date(int(y), 1, 4).fromisocalendar(int(y), int(w), 1)
 
-# --- Topics history I/O ---
-def topics_append(week_key: str, df_topics: pd.DataFrame):
-    ensure_tab(HISTORY_SHEET_ID, TOPICS_TAB, ["week_key","topic","mentions","share_pct","avg10","neg_text_share_pct","by_channel_json"])
-    if df_topics.empty: 
-        return
-    rows = df_topics.assign(week_key=week_key)\
-                    [["week_key","topic","mentions","share","avg10","neg_text_share","by_channel_json"]].values.tolist()
-    SHEETS.values().append(spreadsheetId=HISTORY_SHEET_ID,
-                           range=f"{TOPICS_TAB}!A:G",
-                           valueInputOption="RAW",
-                           body={"values": rows}).execute()
+def _num(x):
+    try: return float(x)
+    except: return float("nan")
 
-def load_topics_history():
-    try:
-        res = SHEETS.values().get(spreadsheetId=HISTORY_SHEET_ID, range=f"{TOPICS_TAB}!A:G").execute()
-        vals = res.get("values", [])
-        if len(vals) <= 1: 
-            return pd.DataFrame(columns=["week_key","topic","mentions","share_pct","avg10","neg_text_share_pct","by_channel_json"])
-        th = pd.DataFrame(vals[1:], columns=vals[0])
-        # numeric
-        for c in ["mentions","share_pct","avg10","neg_text_share_pct"]:
-            th[c] = pd.to_numeric(th[c], errors="coerce")
-        return th
-    except Exception:
-        return pd.DataFrame(columns=["week_key","topic","mentions","share_pct","avg10","neg_text_share_pct","by_channel_json"])
+def aggregate_weeks(hist_df: pd.DataFrame, start_d: date, end_d: date):
+    if hist_df.empty: 
+        return {"reviews": 0, "avg10": None, "pos": 0, "neu": 0, "neg": 0,
+                "pos_share": None, "neg_share": None}
+    wk = hist_df[hist_df["period_type"]=="week"].copy()
+    if wk.empty:
+        return {"reviews": 0, "avg10": None, "pos": 0, "neu": 0, "neg": 0,
+                "pos_share": None, "neg_share": None}
+    for c in ["reviews","avg10","pos","neu","neg"]:
+        wk[c] = wk[c].apply(_num)
+    def in_range(k):
+        try:
+            md = week_key_to_monday(k)
+            return (md >= start_d) and (md <= end_d)
+        except:
+            return False
+    wk = wk[wk["period_key"].apply(in_range)]
+    if wk.empty:
+        return {"reviews": 0, "avg10": None, "pos": 0, "neu": 0, "neg": 0,
+                "pos_share": None, "neg_share": None}
+    n = wk["reviews"].sum()
+    if n <= 0:
+        return {"reviews": 0, "avg10": None, "pos": 0, "neu": 0, "neg": 0,
+                "pos_share": None, "neg_share": None}
+    avg10 = (wk["avg10"] * wk["reviews"]).sum() / n
+    pos = wk["pos"].sum(); neu = wk["neu"].sum(); neg = wk["neg"].sum()
+    pos_share = 100.0 * pos / n
+    neg_share = 100.0 * neg / n
+    return {"reviews": int(n), "avg10": round(float(avg10),2),
+            "pos": int(pos), "neu": int(neu), "neg": int(neg),
+            "pos_share": round(float(pos_share),1),
+            "neg_share": round(float(neg_share),1)}
+
+def month_range_for_week(week_start: date):
+    start = week_start.replace(day=1)
+    end = week_start + dt.timedelta(days=6)
+    return start, end
+
+def quarter_of(d: date):
+    return (d.month - 1)//3 + 1
+
+def quarter_range_for_week(week_start: date):
+    q = quarter_of(week_start)
+    q_start_month = (q-1)*3 + 1
+    start = date(week_start.year, q_start_month, 1)
+    end = week_start + dt.timedelta(days=6)
+    return start, end
+
+def ytd_range_for_week(week_start: date):
+    start = date(week_start.year, 1, 1)
+    end = week_start + dt.timedelta(days=6)
+    return start, end
+
+def build_period_trends_from_weeks(hist_df: pd.DataFrame, week_start: date, week_agg: dict):
+    m_start, m_end = month_range_for_week(week_start)
+    q_start, q_end = quarter_range_for_week(week_start)
+    y_start, y_end = ytd_range_for_week(week_start)
+
+    mtd = aggregate_weeks(hist_df, m_start, m_end)
+    qtd = aggregate_weeks(hist_df, q_start, q_end)
+    ytd = aggregate_weeks(hist_df, y_start, y_end)
+
+    def dd(cur, ref):
+        if cur is None or ref is None: return None
+        return round(float(cur) - float(ref), 2)
+
+    def deltas(p):
+        week_pos_share = (100.0*week_agg["pos"]/week_agg["reviews"]) if week_agg["reviews"] else None
+        week_neg_share = (100.0*week_agg["neg"]/week_agg["reviews"]) if week_agg["reviews"] else None
+        return {
+            "avg10_delta": dd(week_agg["avg10"], p.get("avg10")),
+            "pos_delta_pp": dd(week_pos_share, p.get("pos_share")),
+            "neg_delta_pp": dd(week_neg_share, p.get("neg_share")),
+        }
+
+    return {
+        "mtd": {"agg": mtd, "delta": deltas(mtd)},
+        "qtd": {"agg": qtd, "delta": deltas(qtd)},
+        "ytd": {"agg": ytd, "delta": deltas(ytd)},
+    }
 
 # --- Charts ---
 def plot_topics_bar(df_topics, out_path):
@@ -341,11 +409,9 @@ def plot_topics_bar(df_topics, out_path):
     plt.savefig(out_path); plt.close()
     return out_path
 
-def plot_trends(topics_hist, history_df, out_path):
-    # последние 8 недель, топ-5 тем по сумме упоминаний
+def plot_topics_trends(topics_hist, out_path):
     if topics_hist.empty:
         return None
-    # week_key вида YYYY-Wxx → сортируем
     def week_order(k):
         try:
             y, w = k.split("-W"); return int(y)*100 + int(w)
@@ -353,14 +419,63 @@ def plot_trends(topics_hist, history_df, out_path):
     recent_weeks = sorted(topics_hist["week_key"].unique(), key=week_order)[-8:]
     th = topics_hist[topics_hist["week_key"].isin(recent_weeks)].copy()
     top_topics = (th.groupby("topic")["mentions"].sum().sort_values(ascending=False).head(5).index.tolist())
+    if not top_topics:
+        return None
     pv = th[th["topic"].isin(top_topics)].pivot_table(index="week_key", columns="topic", values="mentions", aggfunc="sum").fillna(0)
-    # строим
     plt.figure(figsize=(9,5))
     for col in pv.columns:
         plt.plot(pv.index, pv[col], marker="o", label=col)
     plt.xticks(rotation=45)
     plt.title("Тренды тем (последние 8 недель)")
     plt.ylabel("Упоминания")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(out_path); plt.close()
+    return out_path
+
+def plot_avg_trend(history_df, out_path, weeks=12):
+    if history_df.empty: return None
+    wk = history_df[history_df["period_type"]=="week"].copy()
+    if wk.empty: return None
+    # сортировка по ключу 'YYYY-Wxx'
+    def wkey_sort(k):
+        try:
+            y, w = k.split("-W"); return int(y)*100 + int(w)
+        except: return 0
+    wk = wk.sort_values(key=lambda s: s.map(wkey_sort), by="period_key")
+    wk["avg10"] = wk["avg10"].apply(lambda x: float(x) if str(x).strip() not in ("", "None") else np.nan)
+    tail = wk.tail(weeks)
+    if tail.empty: return None
+    plt.figure(figsize=(9,4.2))
+    plt.plot(tail["period_key"], tail["avg10"], marker="o")
+    plt.xticks(rotation=45)
+    plt.title(f"Средняя оценка /10 — последние {min(weeks, len(tail))} недель")
+    plt.ylabel("Средняя /10")
+    plt.tight_layout()
+    plt.savefig(out_path); plt.close()
+    return out_path
+
+def plot_sentiment_trend(history_df, out_path, weeks=12):
+    if history_df.empty: return None
+    wk = history_df[history_df["period_type"]=="week"].copy()
+    if wk.empty: return None
+    def wkey_sort(k):
+        try:
+            y, w = k.split("-W"); return int(y)*100 + int(w)
+        except: return 0
+    for c in ["reviews","pos","neu","neg"]:
+        wk[c] = wk[c].apply(_num)
+    wk = wk.sort_values(key=lambda s: s.map(wkey_sort), by="period_key").tail(weeks)
+    if wk.empty or wk["reviews"].sum() == 0:
+        return None
+    pos_share = 100.0 * wk["pos"] / wk["reviews"]
+    neg_share = 100.0 * wk["neg"] / wk["reviews"]
+    plt.figure(figsize=(9,4.2))
+    plt.plot(wk["period_key"], pos_share, marker="o", label="Позитив, %")
+    plt.plot(wk["period_key"], neg_share, marker="o", label="Негатив, %")
+    plt.xticks(rotation=45)
+    plt.title(f"Позитив/негатив — последние {min(weeks, len(wk))} недель")
+    plt.ylabel("% от отзывов")
     plt.legend()
     plt.tight_layout()
     plt.savefig(out_path); plt.close()
@@ -380,42 +495,23 @@ def attach_file(msg, path):
         part.add_header('Content-Disposition', 'attachment', filename=os.path.basename(path))
         msg.attach(part)
 
-# --- HTML ---
-def html_report(agg, trends, topics_tbl_html, quotes_html, keywords):
-    s, e = agg["start"], agg["end"]
-    def pct(x, tot): return f"{x} ({round(100*x/tot,1)}%)" if tot else "—"
-    def delta(cur, ref):
-        try:
-            d = float(cur) - float(ref); return f"{'+' if d>=0 else ''}{round(d,2)} п.п."
-        except Exception: return "—"
-    body = f"""
-    <h2>Еженедельный отчёт по отзывам ({s:%d.%m.%Y}–{e:%d.%m.%Y})</h2>
-    <p><b>Итого за неделю:</b> {agg['reviews']} отзывов; средняя <b>{agg['avg10']}/10</b>; 
-    позитив {pct(agg['pos'], agg['reviews'])}, нейтраль {pct(agg['neu'], agg['reviews'])}, негатив {pct(agg['neg'], agg['reviews'])}.</p>
-    """
-    if trends.get("prev_week"): body += f"<p>К прошлой неделе: {delta(agg['avg10'], trends['prev_week']['avg10'])}; объём {agg['reviews']} vs {trends['prev_week']['reviews']}.</p>"
-    if trends.get("month"):     body += f"<p>К среднему по месяцу: {delta(agg['avg10'], trends['month']['avg10'])}.</p>"
-    if trends.get("quarter"):   body += f"<p>К среднему по кварталу: {delta(agg['avg10'], trends['quarter']['avg10'])}.</p>"
-    if trends.get("year"):      body += f"<p>К среднему по году (YTD): {delta(agg['avg10'], trends['year']['avg10'])}.</p>"
-    body += topics_tbl_html
-    if keywords:
-        kw = ", ".join([w for w,_ in keywords[:20]])
-        body += f"<p><b>Ключевые слова недели:</b> {kw}</p>"
-    body += quotes_html
-    body += "<p><i>История и сравнения ведутся в Google Sheet (листы <b>history</b> и <b>topics_history</b>). PNG-графики во вложениях.</i></p>"
-    return body
+# --- HTML helpers ---
+def fmt_pp(x):
+    if x is None or (isinstance(x, float) and math.isnan(x)): return "—"
+    return f"{x:+.2f} п.п."
+
+def fmt_avg(x):
+    return "—" if x is None or (isinstance(x, float) and math.isnan(x)) else f"{x:.2f}"
 
 def topics_table_html(topics_df, prev_df=None):
     if topics_df.empty:
         return "<h3>Темы недели</h3><p>Нет данных</p>"
-    # дельты к предыдущей неделе (если есть)
     prev = None
     if prev_df is not None and not prev_df.empty:
         prev = prev_df.set_index("topic")
     rows=[]
     for _, r in topics_df.head(10).iterrows():
-        d_m = ""
-        d_n = ""
+        d_m = d_n = ""
         if prev is not None and r["topic"] in prev.index:
             dm = int(r["mentions"] - prev.loc[r["topic"], "mentions"])
             dn = float(r["neg_text_share"] - prev.loc[r["topic"], "neg_text_share"])
@@ -435,6 +531,57 @@ def topics_table_html(topics_df, prev_df=None):
         + "".join(rows) + "</table>"
     )
 
+def periods_table(periods):
+    rows = []
+    for title, key in [("Месяц (MTD)", "mtd"), ("Квартал (QTD)", "qtd"), ("Год (YTD)", "ytd")]:
+        a = periods[key]["agg"]; d = periods[key]["delta"]
+        pos = f"{a['pos_share']}%" if a['pos_share'] is not None else "—"
+        neg = f"{a['neg_share']}%" if a['neg_share'] is not None else "—"
+        rows.append(
+            f"<tr><td>{title}</td>"
+            f"<td>{a['reviews']}</td>"
+            f"<td>{fmt_avg(a['avg10'])}</td>"
+            f"<td>{pos}</td>"
+            f"<td>{neg}</td>"
+            f"<td>{fmt_pp(d['avg10_delta'])}</td>"
+            f"<td>{fmt_pp(d['pos_delta_pp'])}</td>"
+            f"<td>{fmt_pp(d['neg_delta_pp'])}</td></tr>"
+        )
+    return (
+        "<h3>Динамика к MTD/QTD/YTD</h3>"
+        "<table border='1' cellspacing='0' cellpadding='6'>"
+        "<tr><th>Период</th><th>Отзывы</th><th>Средняя /10</th>"
+        "<th>Позитив, %</th><th>Негатив, %</th>"
+        "<th>Δ Ср./10 к неделе</th><th>Δ Позитив, п.п.</th><th>Δ Негатив, п.п.</th></tr>"
+        + "".join(rows) + "</table>"
+    )
+
+def html_report(agg, trends, topics_tbl_html, quotes_html, keywords, periods_html):
+    s, e = agg["start"], agg["end"]
+    def pct(x, tot): return f"{x} ({round(100*x/tot,1)}%)" if tot else "—"
+    def delta(cur, ref):
+        try:
+            d = float(cur) - float(ref); return f"{'+' if d>=0 else ''}{round(d,2)} п.п."
+        except Exception: return "—"
+    body = f"""
+    <h2>Еженедельный отчёт по отзывам ({s:%d.%m.%Y}–{e:%d.%m.%Y})</h2>
+    <p><b>Итого за неделю:</b> {agg['reviews']} отзывов; средняя <b>{agg['avg10']}/10</b>; 
+    позитив {pct(agg['pos'], agg['reviews'])}, нейтраль {pct(agg['neu'], agg['reviews'])}, негатив {pct(agg['neg'], agg['reviews'])}.</p>
+    """
+    if trends.get("prev_week"): body += f"<p>К прошлой неделе: {delta(agg['avg10'], trends['prev_week']['avg10'])}; объём {agg['reviews']} vs {trends['prev_week']['reviews']}.</p>"
+    if trends.get("month"):     body += f"<p>К среднему по месяцу: {delta(agg['avg10'], trends['month']['avg10'])}.</p>"
+    if trends.get("quarter"):   body += f"<p>К среднему по кварталу: {delta(agg['avg10'], trends['quarter']['avg10'])}.</p>"
+    if trends.get("year"):      body += f"<p>К среднему по году (YTD): {delta(agg['avg10'], trends['year']['avg10'])}.</p>"
+
+    body += topics_tbl_html
+    if keywords:
+        kw = ", ".join([w for w,_ in keywords[:20]])
+        body += f"<p><b>Ключевые слова недели:</b> {kw}</p>"
+    body += quotes_html
+    body += periods_html
+    body += "<p><i>История и сравнения ведутся в Google Sheet (листы <b>history</b> и <b>topics_history</b>). PNG-графики во вложениях.</i></p>"
+    return body
+
 # --- Mail ---
 def send_email(subject, html_body, attachments=None):
     msg = MIMEMultipart("mixed")
@@ -452,64 +599,3 @@ def send_email(subject, html_body, attachments=None):
         s.login(os.environ["SMTP_USER"], os.environ["SMTP_PASS"])
         s.sendmail(msg["From"], RECIPIENTS, msg.as_string())
 
-# --- Main ---
-def main():
-    file_id, name, fdate = latest_reviews_file()
-    blob = download_file(file_id)
-    tmp = "/tmp/reviews.xls"
-    with open(tmp, "wb") as f: f.write(blob)
-
-    today = dt.date.today()
-    w_start, w_end = last_week_range(today)
-    ensure_history_sheet()
-
-    df = load_reviews_df(tmp)
-    wk, agg = analyze_week(df, w_start, w_end)
-    upsert_history(agg, w_start)
-    hist = history_read()
-    trends = summarize_trends(hist, w_start)
-
-    # Темы/цитаты/ключевые слова
-    topics_df, quotes, keywords = summarize_topics(wk)
-
-    # предыдущая неделя для дельт в таблице
-    prev_topics = pd.DataFrame()
-    try:
-        th = load_topics_history()
-        iso_y, iso_w, _ = w_start.isocalendar()
-        prev_week_key = f"{iso_y}-W{iso_w-1}" if iso_w>1 else None
-        if prev_week_key and not th.empty:
-            prev_topics = (th[th["week_key"]==prev_week_key]
-                           .rename(columns={"share_pct":"share","neg_text_share_pct":"neg_text_share"})
-                           [["topic","mentions","share","avg10","neg_text_share"]])
-    except Exception:
-        pass
-
-    # сохраняем историю тем + by_channel_json
-    wk_key = f"{w_start.isocalendar()[0]}-W{w_start.isocalendar()[1]}"
-    topics_append(wk_key, topics_df)
-
-    # таблица по темам + цитаты
-    topics_html = topics_table_html(topics_df, prev_topics)
-    quotes_html_parts=[]
-    for tp, q in quotes.items():
-        parts=[]
-        if q.get("pos"): parts.append(f"<b>+</b> «{q['pos']}»")
-        if q.get("neg"): parts.append(f"<b>–</b> «{q['neg']}»")
-        if parts:
-            quotes_html_parts.append(f"<p><b>{tp}:</b> " + " / ".join(parts) + "</p>")
-    quotes_html = ("<h3>Цитаты</h3>" + "".join(quotes_html_parts)) if quotes_html_parts else ""
-
-    # графики
-    charts = []
-    topics_hist = load_topics_history()
-    p1 = "/tmp/topics_week.png";  plot_topics_bar(topics_df, p1); charts.append(p1)
-    p2 = "/tmp/topics_trends.png"; plot_trends(topics_hist, hist, p2); charts.append(p2)
-    charts = [p for p in charts if os.path.exists(p)]
-
-    subject = f"ARTSTUDIO Nevsky. Анализ отзывов за неделю {w_start:%d.%m}–{w_end:%d.%m}"
-    html = html_report(agg, trends, topics_html, quotes_html, keywords)
-    send_email(subject, html, attachments=charts)
-
-if __name__ == "__main__":
-    main()
