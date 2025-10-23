@@ -6,5 +6,5 @@
  xlrd
  openpyxl
  python-dateutil
-+numpy
-+matplotlib
+ numpy
+ matplotlib
