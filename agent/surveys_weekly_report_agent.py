@@ -1,5 +1,6 @@
 # agent/surveys_weekly_report_agent.py
 # Еженедельный отчёт по анкетам TL: Marketing (отдельно от отзывов)
+# Требует: surveys_core.py (с row-wise фоллбэком overall) и metrics_core.py (форматы периодов/лейблы)
 
 import os, io, re, sys, json, math, datetime as dt
 from datetime import date
@@ -49,6 +50,7 @@ SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
 ]
 
+# поддержка двух способов: файл (GOOGLE_SERVICE_ACCOUNT_JSON) или прямой контент (GOOGLE_SERVICE_ACCOUNT_JSON_CONTENT)
 SA_PATH    = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
 SA_CONTENT = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON_CONTENT")
 
@@ -70,52 +72,6 @@ SMTP_PASS         = os.environ.get("SMTP_PASS")
 SMTP_FROM         = os.environ.get("SMTP_FROM", SMTP_USER or "")
 SMTP_HOST         = os.environ.get("SMTP_HOST", "smtp.gmail.com")
 SMTP_PORT         = int(os.environ.get("SMTP_PORT", 587))
-
-# ================
-# Sheets helpers
-# ================
-def ensure_tab(spreadsheet_id: str, tab_name: str, header: list[str]):
-    meta = SHEETS.get(spreadsheetId=spreadsheet_id).execute()
-    tabs = [s["properties"]["title"] for s in meta.get("sheets", [])]
-    if tab_name not in tabs:
-        SHEETS.batchUpdate(
-            spreadsheetId=spreadsheet_id,
-            body={"requests":[{"addSheet":{"properties":{"title":tab_name}}}]}
-        ).execute()
-        SHEETS.values().update(
-            spreadsheetId=spreadsheet_id,
-            range=f"{tab_name}!A1:{chr(64+len(header))}1",
-            valueInputOption="RAW",
-            body={"values":[header]}
-        ).execute()
-
-def gs_get_df(tab: str, a1: str) -> pd.DataFrame:
-    try:
-        res = SHEETS.values().get(spreadsheetId=HISTORY_SHEET_ID, range=f"{tab}!{a1}").execute()
-        vals = res.get("values", [])
-        if len(vals) <= 1:
-            return pd.DataFrame()
-        df = pd.DataFrame(vals[1:], columns=vals[0])
-        
-        # Конвертация: ',' → '.', '' → NaN, to_numeric
-        numeric_cols = ['responses', 'avg5', 'avg10', 'promoters', 'detractors', 'nps']
-        for col in numeric_cols:
-            if col in df.columns:
-                df[col] = df[col].astype(str).str.replace(',', '.').replace('', np.nan).replace('nan', np.nan, case=False)
-                df[col] = pd.to_numeric(df[col], errors='coerce')
-        
-        return df
-    except Exception:
-        return pd.DataFrame()
-
-def gs_append(tab: str, a1: str, rows: list[list]):
-    if not rows: return
-    SHEETS.values().append(
-        spreadsheetId=HISTORY_SHEET_ID,
-        range=f"{tab}!{a1}",
-        valueInputOption="RAW",
-        body={"values": rows}
-    ).execute()
 
 # =========================
 # Drive helpers
@@ -149,295 +105,422 @@ def drive_download(file_id: str) -> bytes:
         _, done = dl.next_chunk()
     return buf.getvalue()
 
-# ==================
-# Core functions
-# ==================
-HEADER = ["week_key","param","responses","avg5","avg10","promoters","detractors","nps"]
+# =========================
+# Sheets helpers
+# =========================
+def ensure_tab(spreadsheet_id: str, tab_name: str, header: list[str]):
+    meta = SHEETS.get(spreadsheetId=spreadsheet_id).execute()
+    tabs = [s["properties"]["title"] for s in meta.get("sheets", [])]
+    if tab_name not in tabs:
+        SHEETS.batchUpdate(spreadsheetId=spreadsheet_id,
+                           body={"requests":[{"addSheet":{"properties":{"title":tab_name}}}]}).execute()
+        SHEETS.values().update(spreadsheetId=spreadsheet_id,
+                               range=f"{tab_name}!A1:{chr(64+len(header))}1",
+                               valueInputOption="RAW",
+                               body={"values":[header]}).execute()
 
-def load_existing_keys() -> set[tuple[str,str]]:
-    df = gs_get_df(SURVEYS_TAB, "A:H")
-    if df.empty: return set()
-    return set(zip(df.get("week_key",[]), df.get("param",[])))
+def gs_get_df(tab: str, a1: str) -> pd.DataFrame:
+    try:
+        res = SHEETS.values().get(spreadsheetId=HISTORY_SHEET_ID, range=f"{tab}!{a1}").execute()
+        vals = res.get("values", [])
+        return pd.DataFrame(vals[1:], columns=vals[0]) if len(vals)>1 else pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
+
+def gs_append(tab: str, a1: str, rows: list[list]):
+    if not rows: return
+    SHEETS.values().append(spreadsheetId=HISTORY_SHEET_ID,
+                           range=f"{tab}!{a1}",
+                           valueInputOption="RAW",
+                           body={"values": rows}).execute()
+
+SURVEYS_HEADER = ["week_key","param","responses","avg5","avg10","promoters","detractors","nps"]
 
 def rows_from_agg(df: pd.DataFrame) -> list[list]:
-    rows = []
+    out=[]
     for _, r in df.iterrows():
-        def get_float(val):
-            if pd.isna(val) or (isinstance(val, str) and val.strip() == ''):
-                return None
-            try:
-                str_val = str(val).replace(',', '.').lower()
-                if 'nan' in str_val:
-                    return None
-                f = float(str_val)
-                if math.isnan(f):
-                    return None
-                return f
-            except ValueError:
-                return None
+        out.append([
+            str(r["week_key"]), str(r["param"]),
+            int(r["responses"]) if pd.notna(r["responses"]) else 0,
+            (None if pd.isna(r["avg5"])  else float(r["avg5"])),
+            (None if pd.isna(r["avg10"]) else float(r["avg10"])),
+            (None if "promoters"  not in r or pd.isna(r["promoters"])  else int(r["promoters"])),
+            (None if "detractors" not in r or pd.isna(r["detractors"]) else int(r["detractors"])),
+            (None if "nps"        not in r or pd.isna(r["nps"])        else float(r["nps"])),
+        ])
+    return out
 
-        def get_int(val):
-            if pd.isna(val) or (isinstance(val, str) and val.strip() == ''):
-                return None
-            try:
-                str_val = str(val).replace(',', '.').lower()
-                if 'nan' in str_val:
-                    return None
-                return int(float(str_val))
-            except ValueError:
-                return None
-
-        row = [
-            str(r["week_key"]),
-            str(r["param"]),
-            get_int(r["responses"]) or 0,
-            get_float(r["avg5"]),
-            get_float(r["avg10"]),
-            get_int(r["promoters"]),
-            get_int(r["detractors"]),
-            get_float(r["nps"]),
-        ]
-        rows.append(row)
-    return rows
-
-def append_week_if_needed(agg_week: pd.DataFrame) -> int:
-    ensure_tab(HISTORY_SHEET_ID, SURVEYS_TAB, HEADER)
-    existing = load_existing_keys()
-    need = []
-    for _, r in agg_week.iterrows():
-        k = (str(r["week_key"]), str(r["param"]))
-        if k not in existing:
-            need.append(r)
-    if not need:
+def upsert_week(agg_week_df: pd.DataFrame) -> int:
+    """
+    Полная перезапись строк текущей недели в surveys_history:
+    - читаем весь лист
+    - выкидываем строки с week_key этой недели
+    - дописываем новые агрегаты недели (avg5/avg10 уже корректные)
+    """
+    if agg_week_df.empty:
         return 0
-    rows = rows_from_agg(pd.DataFrame(need))
-    gs_append(SURVEYS_TAB, "A2", rows)
-    return len(rows)
+    ensure_tab(HISTORY_SHEET_ID, SURVEYS_TAB, SURVEYS_HEADER)
 
-def surveys_aggregate_period(df: pd.DataFrame, start: date, end: date) -> dict:
+    wk = str(agg_week_df["week_key"].iloc[0])
+
+    # текущая история
+    hist = gs_get_df(SURVEYS_TAB, "A:H")
+    keep = hist[hist.get("week_key","") != wk] if not hist.empty else pd.DataFrame(columns=SURVEYS_HEADER)
+
+    # очищаем диапазон значений (оставляя заголовок)
+    SHEETS.values().clear(spreadsheetId=HISTORY_SHEET_ID, range=f"{SURVEYS_TAB}!A2:H").execute()
+
+    # собираем итоговые строки: прежние + новые
+    rows_keep = keep[SURVEYS_HEADER].values.tolist() if not keep.empty else []
+    rows_new  = rows_from_agg(agg_week_df)
+    rows_all  = rows_keep + rows_new
+    if rows_all:
+        SHEETS.values().append(
+            spreadsheetId=HISTORY_SHEET_ID,
+            range=f"{SURVEYS_TAB}!A2",
+            valueInputOption="RAW",
+            body={"values": rows_all}
+        ).execute()
+    return len(rows_new)
+
+# =========================
+# Aggregation over periods
+# =========================
+def week_monday_from_key(week_key: str) -> date:
+    # week_key = 'YYYY-W##'
+    return iso_week_monday(week_key)
+
+def surveys_aggregate_period(history_df: pd.DataFrame, start: date, end: date) -> dict:
     """
-    Aggregate survey data for a given period from historical DataFrame.
-    
-    Filters weeks where the Monday is between start and end (inclusive).
-    Then groups by param and computes:
-    - sum(responses)
-    - weighted avg for avg5 and avg10 (weighted by responses)
-    - For NPS: sum(promoters), sum(detractors), compute nps = (prom - det) / total_resp * 100
-    
-    Returns dict with:
-    - 'by_param': pd.DataFrame with columns ['param', 'responses', 'avg5', 'avg10', 'promoters', 'detractors', 'nps']
-    - 'totals': dict with 'responses' (from overall), 'avg5', 'avg10', 'nps'
+    Взвешенная агрегация по параметрам в календарном интервале [start; end].
+    Возвращает:
+      {
+        'by_param': DataFrame[param,responses,avg5,avg10,promoters,detractors,nps],
+        'totals': {'responses': int, 'overall5': float|None, 'nps': float|None}
+      }
+    ВАЖНО:
+      - totals['responses'] = число анкет (responses по param=='overall')
+      - средние по параметрам взвешиваются по responses этого параметра
+      - NPS = %P − %D, где P/D суммируются по неделям
     """
+    if history_df.empty:
+        return {"by_param": pd.DataFrame(columns=["param","responses","avg5","avg10","promoters","detractors","nps"]),
+                "totals": {"responses": 0, "overall5": None, "nps": None}}
+
+    df = history_df.copy()
+    for c in ["responses","avg5","avg10","promoters","detractors","nps"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    # фильтр по датам
+    df["monday"] = df["week_key"].map(week_monday_from_key)
+    df = df[(df["monday"] >= start) & (df["monday"] <= end)].copy()
     if df.empty:
-        empty_df = pd.DataFrame(columns=['param', 'responses', 'avg5', 'avg10', 'promoters', 'detractors', 'nps'])
-        return {
-            'by_param': empty_df,
-            'totals': {
-                'responses': 0,
-                'avg5': np.nan,
-                'avg10': np.nan,
-                'nps': np.nan
-            }
-        }
-    
-    # Copy and ensure numeric types
-    df = df.copy()
-    numeric_cols = ['responses', 'avg5', 'avg10', 'promoters', 'detractors', 'nps']
-    for col in numeric_cols:
-        if col in df.columns:
-            df[col] = df[col].astype(str).str.replace(',', '.').replace('', np.nan)
-            df[col] = pd.to_numeric(df[col], errors='coerce')
-    
-    # Filter weeks in period
-    df['monday'] = df['week_key'].map(iso_week_monday)
-    filtered = df[(df['monday'] >= start) & (df['monday'] <= end)].drop(columns=['monday'])
-    
-    if filtered.empty:
-        empty_df = pd.DataFrame(columns=['param', 'responses', 'avg5', 'avg10', 'promoters', 'detractors', 'nps'])
-        return {
-            'by_param': empty_df,
-            'totals': {
-                'responses': 0,
-                'avg5': np.nan,
-                'avg10': np.nan,
-                'nps': np.nan
-            }
-        }
-    
-    # Separate nps and other params
-    nps_df = filtered[filtered['param'] == 'nps']
-    params_df = filtered[filtered['param'] != 'nps']
-    
-    # Aggregate params
-    if not params_df.empty:
-        params_agg = params_df.groupby('param', group_keys=False).apply(
-            lambda g: pd.Series({
-                'responses': g['responses'].sum(),
-                'avg5': np.average(g['avg5'], weights=g['responses']) if g['responses'].sum() > 0 else np.nan,
-                'avg10': np.average(g['avg10'], weights=g['responses']) if g['responses'].sum() > 0 else np.nan,
-                'promoters': np.nan,
-                'detractors': np.nan,
-                'nps': np.nan
-            }),
-            include_groups=False
-        ).reset_index()
-    else:
-        params_agg = pd.DataFrame(columns=['param', 'responses', 'avg5', 'avg10', 'promoters', 'detractors', 'nps'])
-    
-    # Aggregate nps
-    if not nps_df.empty:
-        total_resp = nps_df['responses'].sum()
-        promoters = nps_df['promoters'].sum()
-        detractors = nps_df['detractors'].sum()
-        nps = ((promoters - detractors) / total_resp * 100) if total_resp > 0 else np.nan
-        nps_row = pd.DataFrame([{
-            'param': 'nps',
-            'responses': total_resp,
-            'avg5': np.nan,
-            'avg10': np.nan,
-            'promoters': promoters,
-            'detractors': detractors,
-            'nps': nps
-        }])
-    else:
-        nps_row = pd.DataFrame([{
-            'param': 'nps',
-            'responses': 0,
-            'avg5': np.nan,
-            'avg10': np.nan,
-            'promoters': np.nan,
-            'detractors': np.nan,
-            'nps': np.nan
-        }])
-    
-    # Combine
-    by_param = pd.concat([params_agg, nps_row], ignore_index=True)
-    
-    # Extract totals
-    overall_row = by_param[by_param['param'] == 'overall']
-    responses = int(overall_row['responses'].iloc[0]) if not overall_row.empty else 0
-    avg5 = overall_row['avg5'].iloc[0] if not overall_row.empty else np.nan
-    avg10 = overall_row['avg10'].iloc[0] if not overall_row.empty else np.nan
-    nps_value = nps_row['nps'].iloc[0]
-    
-    # Order params as per PARAM_ORDER + 'nps'
-    from agent.surveys_core import PARAM_ORDER  # Assuming available
-    order = [p for p in PARAM_ORDER if p != 'nps_1_5'] + ['nps']
-    by_param['param'] = pd.Categorical(by_param['param'], categories=order, ordered=True)
-    by_param = by_param.sort_values('param').reset_index(drop=True)
-    
-    return {
-        'by_param': by_param,
-        'totals': {
-            'responses': responses,
-            'avg5': avg5,
-            'avg10': avg10,
-            'nps': nps_value
-        }
+        return {"by_param": pd.DataFrame(columns=["param","responses","avg5","avg10","promoters","detractors","nps"]),
+                "totals": {"responses": 0, "overall5": None, "nps": None}}
+
+    rows = []
+    for param, grp in df.groupby("param"):
+        resp = int(grp["responses"].fillna(0).sum())
+        if param == "nps":
+            prom = int(grp["promoters"].fillna(0).sum())
+            detr = int(grp["detractors"].fillna(0).sum())
+            nps  = ((prom/(resp or 1)) - (detr/(resp or 1))) * 100.0 if resp > 0 else np.nan
+            rows.append([param, resp, np.nan, np.nan, prom, detr, (None if np.isnan(nps) else round(float(nps),1))])
+            continue
+
+        # взвешенная средняя по /5 и /10 только по валидным строкам
+        sub5  = grp[pd.notna(grp["avg5"]) & pd.notna(grp["responses"])]
+        avg5  = (sub5["avg5"]  * sub5["responses"]).sum() / sub5["responses"].sum() if not sub5.empty else np.nan
+        sub10 = grp[pd.notna(grp["avg10"]) & pd.notna(grp["responses"])]
+        avg10 = (sub10["avg10"] * sub10["responses"]).sum() / sub10["responses"].sum() if not sub10.empty else np.nan
+
+        rows.append([
+            param, resp,
+            (None if (isinstance(avg5, float) and np.isnan(avg5)) else round(float(avg5), 2)),
+            (None if (isinstance(avg10, float) and np.isnan(avg10)) else round(float(avg10), 2)),
+            None, None, None
+        ])
+
+    by_param = pd.DataFrame(rows, columns=["param","responses","avg5","avg10","promoters","detractors","nps"]).sort_values("param")
+
+    # Итоги: число анкет берём ТОЛЬКО из overall (это и есть анкеты в неделях)
+    ov = by_param[by_param["param"]=="overall"]
+    totals = {
+        "responses": int(ov["responses"].sum()) if not ov.empty else 0,
+        "overall5": (None if ov.empty or pd.isna(ov.iloc[0]["avg5"]) else float(ov.iloc[0]["avg5"])),
+        "nps":      (None if by_param[by_param["param"]=="nps"].empty
+                     or pd.isna(by_param[by_param["param"]=="nps"].iloc[0]["nps"])
+                     else float(by_param[by_param["param"]=="nps"].iloc[0]["nps"])),
     }
+    return {"by_param": by_param, "totals": totals}
 
-# ==================
-# Report blocks
-# ==================
-def fmt_int(x: int) -> str:
-    return f"{x:,}".replace(",", " ")
+# =========================
+# Текст/HTML
+# =========================
+PARAM_TITLES = {
+    "overall": "Итоговая оценка",
+    "fo_checkin": "СПиР при заезде",
+    "clean_checkin": "Чистота при заезде",
+    "room_comfort": "Комфорт и оснащение",
+    "fo_stay": "СПиР в проживании",
+    "its_service": "ИТС (техслужба)",
+    "hsk_stay": "Уборка в проживании",
+    "breakfast": "Завтраки",
+    "atmosphere": "Атмосфера",
+    "location": "Расположение",
+    "value": "Цена/качество",
+    "would_return": "Готовность вернуться",
+    "nps": "NPS (1–5)",
+}
 
-def fmt_avg5(x: float) -> str:
-    if math.isnan(x):
-        return "—"
-    return f"{x:.2f} /5"
+def fmt_avg5(x):   return "—" if x is None or (isinstance(x,float) and np.isnan(x)) else f"{x:.2f} /5"
+def fmt_int(x):    return "—" if x is None or (isinstance(x,float) and np.isnan(x)) else str(int(x))
+def fmt_plain(x):  return "—" if x is None or (isinstance(x,float) and np.isnan(x)) else f"{x:.2f}"
 
-def fmt_nps(x: float) -> str:
-    if math.isnan(x):
-        return "—"
-    return f"{x:.2f}"
-
-def header_block(w_start: date, w_end: date, W: dict, M: dict, Q: dict, Y: dict) -> str:
-    wl = week_label(w_start)
-    ml = month_label(w_start)
-    ql = quarter_label(w_start)
-    yl = year_label(w_start)
-    return (
-        f"<h3>ARTSTUDIO Nevsky — Анкеты за неделю {w_start:%d–%m.%Y}</h3>"
-        f"<p>Неделя: <b>{wl}</b>; анкет: <b>{fmt_int(W['totals']['responses'])}</b>; "
-        f"итоговая: <b>{fmt_avg5(W['totals']['avg5'])}</b>; NPS: <b>{fmt_nps(W['totals']['nps'])}</b>.</p>"
-        f"<p>Текущий месяц ({ml}): анкет {fmt_int(M['totals']['responses'])}, итоговая {fmt_avg5(M['totals']['avg5'])}, NPS {fmt_nps(M['totals']['nps'])};</p>"
-        f"<p>Текущий квартал ({ql}): анкет {fmt_int(Q['totals']['responses'])}, итоговая {fmt_avg5(Q['totals']['avg5'])}, NPS {fmt_nps(Q['totals']['nps'])};</p>"
-        f"<p>Текущий год ({yl}): анкет {fmt_int(Y['totals']['responses'])}, итоговая {fmt_avg5(Y['totals']['avg5'])}, NPS {fmt_nps(Y['totals']['nps'])}.</p>"
+def header_block(week_start: date, week_end: date, W: dict, M: dict, Q: dict, Y: dict):
+    wl = week_label(week_start, week_end)
+    parts = []
+    parts.append(f"<h2>ARTSTUDIO Nevsky — Анкеты за неделю {wl}</h2>")
+    parts.append(
+        "<p><b>Неделя:</b> "
+        f"{wl}; анкет: <b>{fmt_int(W['totals']['responses'])}</b>; "
+        f"итоговая: <b>{fmt_avg5(W['totals']['overall5'])}</b>; "
+        f"NPS: <b>{fmt_plain(W['totals']['nps'])}</b>.</p>"
     )
+    def one_line(name, D):
+        return (f"<b>{name}:</b> анкет {fmt_int(D['totals']['responses'])}, "
+                f"итоговая {fmt_avg5(D['totals']['overall5'])}, "
+                f"NPS {fmt_plain(D['totals']['nps'])}")
+    parts.append("<p>" +
+        one_line(f"Текущий месяц ({month_label(week_start)})", M) + ";<br>" +
+        one_line(f"Текущий квартал ({quarter_label(week_start)})", Q) + ";<br>" +
+        one_line(f"Текущий год ({year_label(week_start)})", Y) + ".</p>"
+    )
+    return "\n".join(parts)
 
-def table_params_block(W: pd.DataFrame, M: pd.DataFrame, Q: pd.DataFrame, Y: pd.DataFrame) -> str:
-    # Assume PARAM_ORDER from surveys_core
-    from agent.surveys_core import PARAM_ORDER
-    params = [p for p in PARAM_ORDER if p != 'nps_1_5'] + ['nps']
-    html = "<table><tr><th>Параметр</th><th>Неделя</th><th>Месяц</th><th>Квартал</th><th>Год</th></tr>"
-    html += "<tr><th></th><th>Ср. / Ответы</th><th>Ср. / Ответы</th><th>Ср. / Ответы</th><th>Ср. / Ответы</th></tr>"
-    for p in params:
-        w_row = W[W['param'] == p].iloc[0] if not W[W['param'] == p].empty else None
-        m_row = M[M['param'] == p].iloc[0] if not M[M['param'] == p].empty else None
-        q_row = Q[Q['param'] == p].iloc[0] if not Q[Q['param'] == p].empty else None
-        y_row = Y[Y['param'] == p].iloc[0] if not Y[Y['param'] == p].empty else None
-        
-        if p == 'nps':
-            w_val = fmt_nps(w_row['nps']) if w_row is not None else '—'
-            m_val = fmt_nps(m_row['nps']) if m_row is not None else '—'
-            q_val = fmt_nps(q_row['nps']) if q_row is not None else '—'
-            y_val = fmt_nps(y_row['nps']) if y_row is not None else '—'
-        else:
-            w_val = fmt_avg5(w_row['avg5']) if w_row is not None else '—'
-            m_val = fmt_avg5(m_row['avg5']) if m_row is not None else '—'
-            q_val = fmt_avg5(q_row['avg5']) if q_row is not None else '—'
-            y_val = fmt_avg5(y_row['avg5']) if y_row is not None else '—'
-        
-        w_resp = fmt_int(w_row['responses']) if w_row is not None else '0'
-        m_resp = fmt_int(m_row['responses']) if m_row is not None else '0'
-        q_resp = fmt_int(q_row['responses']) if q_row is not None else '0'
-        y_resp = fmt_int(y_row['responses']) if y_row is not None else '0'
-        
-        param_name = p.capitalize()  # Customize as needed
-        html += f"<tr><td>{param_name}</td><td>{w_val} / {w_resp}</td><td>{m_val} / {m_resp}</td><td>{q_val} / {q_resp}</td><td>{y_val} / {y_resp}</td></tr>"
-    html += "</table>"
+def table_params_block(W_df: pd.DataFrame, M_df: pd.DataFrame, Q_df: pd.DataFrame, Y_df: pd.DataFrame):
+    order = [
+        "overall","fo_checkin","clean_checkin","room_comfort","fo_stay","its_service","hsk_stay","breakfast",
+        "atmosphere","location","value","would_return","nps"
+    ]
+
+    def to_map(df: pd.DataFrame) -> dict[str, dict]:
+        mp = {}
+        if df is None or df.empty:
+            return mp
+        for _, r in df.iterrows():
+            p = str(r["param"])
+            avg5 = float(r["avg5"]) if "avg5" in r and pd.notna(r["avg5"]) else None
+            resp = int(r["responses"]) if "responses" in r and pd.notna(r["responses"]) else None
+            nps  = float(r["nps"]) if "nps" in r and pd.notna(r["nps"]) else None
+            mp[p] = {"avg5": avg5, "responses": resp, "nps": nps}
+        return mp
+
+    W = to_map(W_df); M = to_map(M_df); Q = to_map(Q_df); Y = to_map(Y_df)
+
+    def cell(mp: dict, param: str) -> str:
+        r = mp.get(param)
+        if r is None:
+            return "<td>—</td><td>—</td>"
+        if param == "nps":
+            return f"<td>{fmt_plain(r['nps'])}</td><td>{fmt_int(r['responses'])}</td>"
+        return f"<td>{fmt_avg5(r['avg5'])}</td><td>{fmt_int(r['responses'])}</td>"
+
+    rows = []
+    for p in order:
+        title = PARAM_TITLES.get(p, p)
+        rows.append(
+            f"<tr><td><b>{title}</b></td>"
+            f"{cell(W,p)}{cell(M,p)}{cell(Q,p)}{cell(Y,p)}</tr>"
+        )
+
+    html = f"""
+    <h3>Параметры (неделя / Текущий месяц / Текущий квартал / Текущий год)</h3>
+    <table border='1' cellspacing='0' cellpadding='6'>
+      <tr>
+        <th rowspan="2">Параметр</th>
+        <th colspan="2">Неделя</th>
+        <th colspan="2">Месяц</th>
+        <th colspan="2">Квартал</th>
+        <th colspan="2">Год</th>
+      </tr>
+      <tr>
+        <th>Ср.</th><th>Ответы</th>
+        <th>Ср.</th><th>Ответы</th>
+        <th>Ср.</th><th>Ответы</th>
+        <th>Ср.</th><th>Ответы</th>
+      </tr>
+      {''.join(rows)}
+    </table>
+    """
     return html
 
-def footnote_block() -> str:
-    return "<p><small>Данные из анкет TL: Marketing. NPS рассчитан по шкале 1-5 (5: promoters, 1-2: detractors).</small></p>"
+def footnote_block():
+    return """
+    <hr>
+    <p><i>* Все значения по анкетам отображаются в шкале <b>/5</b> и взвешиваются по числу ответов.
+    NPS по шкале 1–5: 1–2 — детракторы, 3–4 — нейтралы, 5 — промоутеры; NPS = %промоутеров − %детракторов.</i></p>
+    """
 
-# ==================
-# Plot functions (stubbed for completeness; customize as needed)
-# ==================
-def plot_radar_params(w_df: pd.DataFrame, m_df: pd.DataFrame, path: str):
-    # Stub: Implement radar chart
-    plt.figure()
-    plt.savefig(path)
-    plt.close()
+# =========================
+# Charts
+# =========================
+def _week_order_key(k):
+    try:
+        y, w = str(k).split("-W")
+        return int(y) * 100 + int(w)
+    except:
+        return 0
 
-def plot_params_heatmap(hist: pd.DataFrame, path: str):
-    # Stub: Implement heatmap
-    plt.figure()
-    plt.savefig(path)
-    plt.close()
+def plot_radar_params(week_df: pd.DataFrame, month_df: pd.DataFrame, path_png: str):
+    """
+    Радар-диаграмма параметров: Неделя vs Текущий месяц (по /5).
+    """
+    if week_df is None or week_df.empty or month_df is None or month_df.empty:
+        return None
 
-def plot_overall_nps_trends(hist: pd.DataFrame, path: str):
-    # Stub: Implement trends
-    plt.figure()
-    plt.savefig(path)
-    plt.close()
+    def to_map(df):
+        mp={}
+        for _, r in df.iterrows():
+            p = str(r["param"])
+            if p == "nps": continue
+            mp[p] = float(r["avg5"]) if pd.notna(r["avg5"]) else np.nan
+        return mp
 
-def attach_file(msg: MIMEMultipart, path: str):
-    if not os.path.exists(path):
-        return
+    W = to_map(week_df)
+    M = to_map(month_df)
+
+    order = [p for p in [
+        "overall","fo_checkin","clean_checkin","room_comfort","fo_stay","its_service","hsk_stay","breakfast",
+        "atmosphere","location","value","would_return"
+    ] if (p in W or p in M)]
+
+    if len(order) < 3:
+        return None
+
+    labels = [PARAM_TITLES.get(p, p) for p in order]
+    wvals  = [W.get(p, np.nan) for p in order]
+    mvals  = [M.get(p, np.nan) for p in order]
+
+    # углы
+    N = len(order)
+    angles = np.linspace(0, 2*np.pi, N, endpoint=False)
+
+    angles_closed = np.concatenate([angles, [angles[0]]])
+    w_closed = np.array(wvals + [wvals[0]])
+    m_closed = np.array(mvals + [mvals[0]])
+
+    fig = plt.figure(figsize=(7.5, 6.5))
+    ax = plt.subplot(111, polar=True)
+    ax.set_theta_offset(np.pi / 2)
+    ax.set_theta_direction(-1)
+    ax.set_thetagrids(np.degrees(angles), labels, fontsize=9)
+    ax.set_rlabel_position(0); ax.set_ylim(0, 5)
+
+    ax.plot(angles_closed, w_closed, marker="o", linewidth=1, label="Неделя")
+    ax.fill(angles_closed, w_closed, alpha=0.1)
+    ax.plot(angles_closed, m_closed, marker="o", linewidth=1, linestyle="--", label="Текущий месяц")
+    ax.fill(angles_closed, m_closed, alpha=0.1)
+
+    ax.set_title("Анкеты: параметры (Неделя vs Текущий месяц), шкала /5")
+    ax.legend(loc="upper right", bbox_to_anchor=(1.25, 1.1))
+    plt.tight_layout(); plt.savefig(path_png); plt.close(); return path_png
+
+def plot_params_heatmap(history_df: pd.DataFrame, path_png: str):
+    """
+    Теплокарта: средняя /5 по параметрам за 8 последних недель.
+    """
+    if history_df is None or history_df.empty:
+        return None
+
+    df = history_df.copy()
+    for c in ["avg5","responses"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    df = df[df["param"]!="nps"].copy()
+    if df.empty: return None
+
+    weeks = sorted(df["week_key"].unique(), key=_week_order_key)[-8:]
+    df = df[df["week_key"].isin(weeks)].copy()
+    if df.empty: return None
+
+    top_params = (df.groupby("param")["responses"].sum()
+                    .sort_values(ascending=False).head(10).index.tolist())
+    df = df[df["param"].isin(top_params)]
+
+    pv = (df.pivot_table(index="param", columns="week_key", values="avg5", aggfunc="mean")
+            .reindex(index=top_params, columns=weeks))
+    if pv.empty: return None
+
+    fig, ax = plt.subplots(figsize=(10, 5.5))
+    im = ax.imshow(pv.values, aspect="auto")
+    ax.set_yticks(range(len(pv.index))); ax.set_yticklabels([PARAM_TITLES.get(p,p) for p in pv.index])
+    ax.set_xticks(range(len(pv.columns))); ax.set_xticklabels(list(pv.columns), rotation=45)
+    ax.set_title("Анкеты: средняя /5 по параметрам (8 последних недель)")
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    plt.tight_layout(); plt.savefig(path_png); plt.close(); return path_png
+
+def plot_overall_nps_trends(history_df: pd.DataFrame, path_png: str):
+    """
+    Тренды: Итоговая /5 и NPS по неделям (12 последних) + 4-нед. скользящее среднее.
+    """
+    if history_df is None or history_df.empty:
+        return None
+
+    df = history_df.copy()
+    for c in ["avg5","nps"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    ov = df[df["param"]=="overall"][["week_key","avg5"]]
+    npv= df[df["param"]=="nps"][["week_key","nps"]]
+
+    weeks = sorted(set(ov["week_key"]).union(set(npv["week_key"])), key=_week_order_key)[-12:]
+    if not weeks:
+        return None
+
+    ov = ov.set_index("week_key").reindex(weeks)
+    npv= npv.set_index("week_key").reindex(weeks)
+
+    ov_roll  = ov["avg5"].rolling(window=4, min_periods=2).mean()
+    nps_roll = npv["nps"].rolling(window=4, min_periods=2).mean()
+
+    fig, ax1 = plt.subplots(figsize=(10, 5.0))
+    ax1.plot(weeks, ov["avg5"].values, marker="o", label="Итоговая /5")
+    ax1.plot(weeks, ov_roll.values, linestyle="--", label="Итоговая /5 (скользящее)")
+    ax1.set_ylim(0, 5); ax1.set_ylabel("Итоговая /5")
+
+    ax2 = ax1.twinx()
+    ax2.plot(weeks, npv["nps"].values, marker="s", label="NPS", alpha=0.8)
+    ax2.plot(weeks, nps_roll.values, linestyle="--", label="NPS (скользящее)", alpha=0.8)
+    ax2.set_ylim(-100, 100); ax2.set_ylabel("NPS, п.п.")
+
+    ax1.set_title("Анкеты: тренды Итоговой /5 и NPS (12 недель)")
+    ax1.set_xticks(range(len(weeks))); ax1.set_xticklabels(weeks, rotation=45)
+
+    lines, labels = [], []
+    for ax in (ax1, ax2):
+        l, lab = ax.get_legend_handles_labels()
+        lines += l; labels += lab
+    ax1.legend(lines, labels, loc="upper left")
+
+    plt.tight_layout(); plt.savefig(path_png); plt.close(); return path_png
+
+# =========================
+# Email helpers
+# =========================
+def attach_file(msg, path):
+    if not path or not os.path.exists(path): return
     ctype, encoding = mimetypes.guess_type(path)
-    if ctype is None or encoding is not None:
-        ctype = 'application/octet-stream'
-    maintype, subtype = ctype.split('/', 1)
-    with open(path, 'rb') as fp:
-        att = MIMEBase(maintype, subtype)
-        att.set_payload(fp.read())
-    encoders.encode_base64(att)
-    att.add_header('Content-Disposition', 'attachment', filename=os.path.basename(path))
-    msg.attach(att)
+    if ctype is None or encoding is not None: ctype='application/octet-stream'
+    maintype, subtype = ctype.split('/',1)
+    with open(path,"rb") as fp:
+        part = MIMEBase(maintype, subtype); part.set_payload(fp.read()); encoders.encode_base64(part)
+        part.add_header('Content-Disposition','attachment', filename=os.path.basename(path)); msg.attach(part)
 
-def send_email(subject: str, html_body: str, attachments: list[str] = None):
+def send_email(subject, html_body, attachments=None):
     if not RECIPIENTS:
         print("[WARN] RECIPIENTS is empty; skip email")
         return
@@ -446,7 +529,7 @@ def send_email(subject: str, html_body: str, attachments: list[str] = None):
     alt = MIMEMultipart("alternative"); alt.attach(MIMEText(html_body, "html", "utf-8")); msg.attach(alt)
     for p in (attachments or []): attach_file(msg, p)
     with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as s:
-        s.starttls(); 
+        s.starttls()
         if SMTP_USER and SMTP_PASS:
             s.login(SMTP_USER, SMTP_PASS)
         s.sendmail(msg["From"], RECIPIENTS, msg.as_string())
@@ -460,47 +543,45 @@ def main():
     blob = drive_download(fid)
     # выберем правильный лист с ответами анкет
     xls = pd.ExcelFile(io.BytesIO(blob))
-    
     def choose_surveys_sheet(xls_file: pd.ExcelFile) -> pd.DataFrame:
         # 1) приоритет по имени
         preferred = ["Оценки гостей", "Оценки", "Ответы", "Анкеты", "Responses"]
-        for name in xls_file.sheet_names:
-            if name.strip().lower() in {p.lower() for p in preferred}:
-                return pd.read_excel(xls_file, name)
-    
+        for nm in xls_file.sheet_names:
+            if nm.strip().lower() in {p.lower() for p in preferred}:
+                return pd.read_excel(xls_file, nm)
         # 2) эвристика по колонкам
         candidates = ["Дата", "Дата анкетирования", "Комментарий", "Средняя оценка", "№ 1", "№ 2", "№ 3"]
         best_name, best_score = None, -1
-        for name in xls_file.sheet_names:
+        for nm in xls_file.sheet_names:
             try:
-                probe = pd.read_excel(xls_file, name, nrows=1)
+                probe = pd.read_excel(xls_file, nm, nrows=1)
                 cols = [str(c) for c in probe.columns]
                 score = sum(any(cand.lower() in c.lower() for cand in candidates) for c in cols)
                 if score > best_score:
-                    best_name, best_score = name, score
+                    best_name, best_score = nm, score
             except Exception:
                 continue
         # 3) fallback — первый лист
         pick = best_name or xls_file.sheet_names[0]
         return pd.read_excel(xls_file, pick)
-    
+
     df_raw = choose_surveys_sheet(xls)
 
-    norm, agg_week = parse_and_aggregate_weekly(df_raw)  # agg_week: week_key|param|responses|avg5|avg10|promoters|detractors|nps
-    added = append_week_if_needed(agg_week)
-    print(f"[INFO] surveys_weekly: appended {added} new rows into {SURVEYS_TAB}")
+    # Нормализация + недельная агрегация (внутри surveys_core — row-wise фоллбэк overall5)
+    norm, agg_week = parse_and_aggregate_weekly(df_raw)  # week_key|param|responses|avg5|avg10|promoters|detractors|nps
+    upserted = upsert_week(agg_week)
+    print(f"[INFO] surveys_weekly: upserted {upserted} rows for {SURVEYS_TAB}")
 
     # 2) История + периоды
     hist = gs_get_df(SURVEYS_TAB, "A:H")
     if hist.empty:
         raise RuntimeError("surveys_history пуст — нечего анализировать.")
-    # определить неделю из agg_week
     wk_key = str(agg_week["week_key"].iloc[0])
     w_start = iso_week_monday(wk_key); w_end = w_start + dt.timedelta(days=6)
 
     ranges = period_ranges_for_week(w_start)  # mtd/qtd/ytd {start,end,label}
 
-    # Агрегации
+    # Агрегации периодов
     W = surveys_aggregate_period(hist, w_start, w_end)
     M = surveys_aggregate_period(hist, ranges["mtd"]["start"], ranges["mtd"]["end"])
     Q = surveys_aggregate_period(hist, ranges["qtd"]["start"], ranges["qtd"]["end"])
@@ -521,7 +602,6 @@ def main():
     # 5) Письмо
     subject = f"ARTSTUDIO Nevsky. Анкеты TL: Marketing — неделя {w_start:%d.%m}–{w_end:%d.%m}"
     send_email(subject, html, attachments=charts)
-
 
 if __name__ == "__main__":
     main()
