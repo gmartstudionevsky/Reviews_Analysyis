@@ -550,11 +550,11 @@ def trends_text_block(history_df: pd.DataFrame, week_agg: dict, w_start: date):
     if wk.empty:
         return ""
 
-    # аккуратно приводим к числам (учитываем '9,05')
+    # приводим к числам, учитывая '9,05'
     wk["reviews"] = pd.to_numeric(wk["reviews"].astype(str).str.replace(",", ".", regex=False), errors="coerce")
     wk["avg10"]   = pd.to_numeric(wk["avg10"].astype(str).str.replace(",", ".", regex=False), errors="coerce")
 
-    # последние 8 недель (включая текущую, если уже есть в history)
+    # последние 8 недель по ключу недели
     def worder(k):
         try:
             y, w = str(k).split("-W")
@@ -563,16 +563,17 @@ def trends_text_block(history_df: pd.DataFrame, week_agg: dict, w_start: date):
             return 0
     wk = wk.sort_values(by="period_key", key=lambda s: s.map(worder)).tail(8)
 
-    base_avg = wk["avg10"].mean(skipna=True)
-    base_cnt = wk["reviews"].mean(skipna=True)
+    # усредняем только ненулевые значения; если нет ни одного — берём текущую недельную как «базу»
+    avg_series = wk["avg10"].dropna()
+    cnt_series = wk["reviews"].dropna()
 
-    delta_avg = None
-    if week_agg.get("avg10") is not None and pd.notna(base_avg):
-        delta_avg = round(float(week_agg["avg10"]) - float(base_avg), 2)
+    base_avg = float(avg_series.mean()) if not avg_series.empty else (float(week_agg["avg10"]) if week_agg.get("avg10") is not None else float("nan"))
+    base_cnt = float(cnt_series.mean()) if not cnt_series.empty else (float(week_agg["reviews"]) if week_agg.get("reviews") is not None else float("nan"))
 
-    delta_cnt = None
-    if week_agg.get("reviews") is not None and pd.notna(base_cnt):
-        delta_cnt = round(float(week_agg["reviews"]) - float(base_cnt), 1)
+    delta_avg = (None if (week_agg.get("avg10") is None or np.isnan(base_avg))
+                 else round(float(week_agg["avg10"]) - base_avg, 2))
+    delta_cnt = (None if (week_agg.get("reviews") is None or np.isnan(base_cnt))
+                 else round(float(week_agg["reviews"]) - base_cnt, 1))
 
     trend = "на уровне" if (delta_avg is None or abs(delta_avg) < 0.01) else ("выше" if delta_avg > 0 else "ниже")
 
@@ -583,6 +584,7 @@ def trends_text_block(history_df: pd.DataFrame, week_agg: dict, w_start: date):
         f"объём отзывов {('выше' if (delta_cnt is not None and delta_cnt>0) else ('ниже' if (delta_cnt is not None and delta_cnt<0) else 'на уровне'))} "
         f"среднего за 8 недель ({fmt_int(base_cnt)}) на {fmt_int(delta_cnt)}.</p>"
     )
+
 
 # ===========
 # Charts
@@ -692,12 +694,9 @@ def main():
 
     df = load_reviews_df(tmp)
     wk_df, week_agg = analyze_week(df, w_start, w_end)
-    # средние по источникам за текущую неделю (ключи нормализованы)
     wk_src_avg_raw = wk_df.groupby("Источник")["_rating10"].mean().round(2).to_dict()
     wk_src_avg = { normalize_source_name(k): float(v) for k, v in wk_src_avg_raw.items() }
-    wk_src_avg = (
-        wk_df.groupby("Источник")["_rating10"].mean().round(2).to_dict()
-    )
+
     week_key = append_history_week(w_start, week_agg)
     append_sources_week(week_key, wk_df)  # обновляем sources_history для недели
 
@@ -731,10 +730,22 @@ def main():
 
     # 4) блоки по источникам
     sources_summ = sources_summary_for_periods(sources_hist, w_start)
+    # --- склеиваем Yandex + Яндекс Путешествия в один источник 'Yandex'
+    for k in ["week","mtd","qtd","ytd","prev_month","prev_quarter","prev_year"]:
+        sources_summ[k] = unify_sources_df(sources_summ[k])
+    
+    # --- добавляем «всё время» как отдельный срез (для последнего столбца таблицы)
+    if not sources_hist.empty:
+        tmp = sources_hist.copy()
+        tmp["mon"] = tmp["week_key"].map(lambda kk: iso_week_monday(str(kk)))
+        all_start, all_end = tmp["mon"].min(), tmp["mon"].max()
+        all_df = aggregate_sources_from_history(sources_hist, all_start, all_end)
+        sources_summ["alltime"] = unify_sources_df(all_df)
+        sources_summ["labels"]["alltime"] = "всё время"
+    else:
+        sources_summ["alltime"] = pd.DataFrame(columns=["source","reviews","avg10","pos_share","neg_share","pos","neu","neg"])
+        sources_summ["labels"]["alltime"] = "всё время"
 
-    # склеиваем Яндекс + Яндекс.Путешествия → Yandex
-for k in ["week","mtd","qtd","ytd","prev_month","prev_quarter","prev_year"]:
-    sources_summ[k] = unify_sources_df(sources_summ[k])
 
 # добавляем «всё время» как последний столбец (для таблицы по источникам)
 if not sources_hist.empty:
