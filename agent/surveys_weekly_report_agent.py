@@ -205,16 +205,37 @@ def surveys_aggregate_period(history_df: pd.DataFrame, start: date, end: date) -
             nps = ( (prom/(resp or 1) - detr/(resp or 1)) * 100.0 ) if resp>0 else np.nan
             rows.append([param, resp, np.nan, np.nan, prom, detr, (None if np.isnan(nps) else round(float(nps),1))])
         else:
-            # взвешенная avg5/avg10
-            w = grp["responses"].fillna(0).values
-            a5 = grp["avg5"].values
-            a10= grp["avg10"].values
-            avg5  = float(np.nansum(a5*w)/np.nansum(w)) if np.nansum(w)>0 else np.nan
-            avg10 = float(np.nansum(a10*w)/np.nansum(w)) if np.nansum(w)>0 else np.nan
-            rows.append([param, resp,
-                         (None if np.isnan(avg5) else round(avg5,2)),
-                         (None if np.isnan(avg10) else round(avg10,2)),
-                         None, None, None])
+            # взвешенная avg5/avg10 только по строкам, где avg не NaN
+            sub = grp.copy()
+            sub = sub[pd.notna(sub["responses"])]
+
+            # avg5
+            if "avg5" in sub.columns:
+                sub5 = sub[pd.notna(sub["avg5"])]
+                if not sub5.empty and sub5["responses"].sum() > 0:
+                    avg5 = (sub5["avg5"] * sub5["responses"]).sum() / sub5["responses"].sum()
+                else:
+                    avg5 = np.nan
+            else:
+                avg5 = np.nan
+
+            # avg10
+            if "avg10" in sub.columns:
+                sub10 = sub[pd.notna(sub["avg10"])]
+                if not sub10.empty and sub10["responses"].sum() > 0:
+                    avg10 = (sub10["avg10"] * sub10["responses"]).sum() / sub10["responses"].sum()
+                else:
+                    avg10 = np.nan
+            else:
+                avg10 = np.nan
+
+            rows.append([
+                param, resp,
+                (None if (isinstance(avg5, float) and np.isnan(avg5)) else round(float(avg5), 2)),
+                (None if (isinstance(avg10, float) and np.isnan(avg10)) else round(float(avg10), 2)),
+                None, None, None
+            ])
+
 
     by_param = pd.DataFrame(rows, columns=["param","responses","avg5","avg10","promoters","detractors","nps"])
 
