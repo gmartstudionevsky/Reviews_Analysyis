@@ -319,43 +319,65 @@ def _week_order_key(k):
         return 0
 
 def plot_radar_params(week_df: pd.DataFrame, month_df: pd.DataFrame, path_png: str):
+    """
+    Радар-диаграмма параметров: Неделя vs Текущий месяц (по /5).
+    """
     if week_df is None or week_df.empty or month_df is None or month_df.empty:
         return None
+
+    _nan = float("nan")
+
+    # собираем значения по параметрам (без NPS)
     def to_map(df):
         mp={}
         for _, r in df.iterrows():
             p = str(r["param"])
-            if p=="nps": continue
-            mp[p] = float(r["avg5"]) if pd.notna(r["avg5"]) else np.nan
+            if p == "nps":
+                continue
+            mp[p] = (float(r["avg5"]) if pd.notna(r["avg5"]) else _nan)
         return mp
-    W = to_map(week_df); M = to_map(month_df)
+
+    W = to_map(week_df)
+    M = to_map(month_df)
+
+    # общий упорядоченный список параметров
     order = [p for p in [
         "overall","fo_checkin","clean_checkin","room_comfort","fo_stay","its_service","hsk_stay","breakfast",
         "atmosphere","location","value","would_return"
     ] if (p in W or p in M)]
-    if len(order)<3: return None
-    labels = [PARAM_TITLES.get(p,p) for p in order]
-    wvals  = [W.get(p, np.nan) for p in order]
-    mvals  = [M.get(p, np.nan) for p in order]
 
-    import numpy as np
-    N=len(order); angles = np.linspace(0, 2*np.pi, N, endpoint=False)
-    angles_closed = np.concatenate([angles,[angles[0]]])
+    if len(order) < 3:
+        return None
+
+    labels = [PARAM_TITLES.get(p, p) for p in order]
+    wvals  = [W.get(p, _nan) for p in order]
+    mvals  = [M.get(p, _nan) for p in order]
+
+    import numpy as np  # локально ОК, но теперь переменных внешнего замыкания нет
+    N = len(order)
+    angles = np.linspace(0, 2*np.pi, N, endpoint=False)
+    angles_closed = np.concatenate([angles, [angles[0]]])
     w_closed = np.array(wvals + [wvals[0]])
     m_closed = np.array(mvals + [mvals[0]])
 
-    fig = plt.figure(figsize=(7.5,6.5))
+    fig = plt.figure(figsize=(7.5, 6.5))
     ax = plt.subplot(111, polar=True)
-    ax.set_theta_offset(np.pi/2); ax.set_theta_direction(-1)
+    ax.set_theta_offset(np.pi / 2)
+    ax.set_theta_direction(-1)
+
     ax.set_thetagrids(np.degrees(angles), labels, fontsize=9)
-    ax.set_rlabel_position(0); ax.set_ylim(0,5)
+    ax.set_rlabel_position(0)
+    ax.set_ylim(0, 5)
+
     ax.plot(angles_closed, w_closed, marker="o", linewidth=1, label="Неделя")
     ax.fill(angles_closed, w_closed, alpha=0.1)
     ax.plot(angles_closed, m_closed, marker="o", linewidth=1, linestyle="--", label="Текущий месяц")
     ax.fill(angles_closed, m_closed, alpha=0.1)
+
     ax.set_title("Анкеты: параметры (Неделя vs Текущий месяц), шкала /5")
-    ax.legend(loc="upper right", bbox_to_anchor=(1.25,1.1))
+    ax.legend(loc="upper right", bbox_to_anchor=(1.25, 1.1))
     plt.tight_layout(); plt.savefig(path_png); plt.close(); return path_png
+
 
 def plot_params_heatmap(history_df: pd.DataFrame, path_png: str):
     if history_df is None or history_df.empty: return None
