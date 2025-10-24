@@ -27,6 +27,7 @@ jobs:
         env:
           GOOGLE_SERVICE_ACCOUNT_JSON_B64: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON_B64 }}
 
+
       - name: Run weekly agent
         env:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ github.workspace }}/sa.json
@@ -37,4 +38,5 @@ jobs:
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
           SMTP_FROM: ${{ secrets.SMTP_FROM }}
         run: |
-          python agent/weekly_report_agent.py
+          python -m agent.weekly_report_agent
+
