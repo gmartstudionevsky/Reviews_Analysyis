@@ -20,6 +20,28 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+try:
+    from agent.metrics_core import (
+        HISTORY_TAB, TOPICS_TAB, SOURCES_TAB, SURVEYS_TAB,
+        iso_week_monday, week_range_for_monday,
+        period_ranges_for_week, prev_period_ranges,
+        aggregate_weeks_from_history, deltas_week_vs_period,
+        role_of_week_in_period, sources_summary_for_periods,
+        week_label, month_label, quarter_label, year_label
+    )
+except ModuleNotFoundError:
+    # fallback, если файл запущен как скрипт и пакет 'agent' не найден
+    import os, sys
+    sys.path.append(os.path.dirname(__file__))
+    from metrics_core import (
+        HISTORY_TAB, TOPICS_TAB, SOURCES_TAB, SURVEYS_TAB,
+        iso_week_monday, week_range_for_monday,
+        period_ranges_for_week, prev_period_ranges,
+        aggregate_weeks_from_history, deltas_week_vs_period,
+        role_of_week_in_period, sources_summary_for_periods,
+        week_label, month_label, quarter_label, year_label
+    )
+
 # --- наше ядро метрик / периодов ---
 from agent.metrics_core import (
     HISTORY_TAB, TOPICS_TAB, SOURCES_TAB, SURVEYS_TAB,
