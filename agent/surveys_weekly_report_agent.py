@@ -16,6 +16,11 @@ from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 
+# Charts (headless)
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
 # --- ядро анкет (нормализация и недельная агрегация) ---
 try:
     from agent.surveys_core import parse_and_aggregate_weekly, SURVEYS_TAB
@@ -319,6 +324,162 @@ def footnote_block():
     <p><i>* Все значения по анкетам отображаются в шкале <b>/5</b>. Внутри расчётов применяется взвешивание по количеству ответов.
     NPS считается по шкале 1–5: 1–2 — детракторы, 3 — нейтрал, 4–5 — промоутеры; NPS = %промоутеров − %детракторов.</i></p>
     """
+# =========================
+# Charts
+# =========================
+
+def _week_order_key(k):
+    try:
+        y, w = str(k).split("-W")
+        return int(y) * 100 + int(w)
+    except:
+        return 0
+
+def plot_radar_params(week_df: pd.DataFrame, month_df: pd.DataFrame, path_png: str):
+    """
+    Радар-диаграмма параметров: Неделя vs Текущий месяц (по /5).
+    """
+    import numpy as np
+    if week_df is None or week_df.empty or month_df is None or month_df.empty:
+        return None
+
+    # собираем значения по параметрам (без NPS)
+    def to_map(df):
+        mp={}
+        for _, r in df.iterrows():
+            p = str(r["param"])
+            if p == "nps": 
+                continue
+            mp[p] = float(r["avg5"]) if pd.notna(r["avg5"]) else np.nan
+        return mp
+
+    W = to_map(week_df)
+    M = to_map(month_df)
+
+    # общий упорядоченный список параметров
+    order = [p for p in [
+        "overall","fo_checkin","clean_checkin","room_comfort","fo_stay","its_service","hsk_stay","breakfast",
+        "atmosphere","location","value","would_return"
+    ] if (p in W or p in M)]
+
+    if not order:
+        return None
+
+    labels = [PARAM_TITLES.get(p, p) for p in order]
+    wvals  = [W.get(p, np.nan) for p in order]
+    mvals  = [M.get(p, np.nan) for p in order]
+
+    # замыкаем круг
+    labels += labels[:1]
+    wvals  += wvals[:1]
+    mvals  += mvals[:1]
+
+    angles = np.linspace(0, 2*np.pi, len(labels), endpoint=False).tolist()
+    angles += angles[:1]
+
+    fig = plt.figure(figsize=(7.5, 6.5))
+    ax = plt.subplot(111, polar=True)
+    ax.set_theta_offset(np.pi / 2)
+    ax.set_theta_direction(-1)
+    ax.set_thetagrids(np.degrees(angles[:-1]), labels, fontsize=9)
+    ax.set_rlabel_position(0)
+    ax.set_ylim(0, 5)
+
+    ax.plot(angles, wvals, marker="o", linewidth=1, label="Неделя")
+    ax.fill(angles, wvals, alpha=0.1)
+    ax.plot(angles, mvals, marker="o", linewidth=1, linestyle="--", label="Текущий месяц")
+    ax.fill(angles, mvals, alpha=0.1)
+    ax.set_title("Анкеты: параметры (Неделя vs Текущий месяц), шкала /5")
+    ax.legend(loc="upper right", bbox_to_anchor=(1.25, 1.1))
+    plt.tight_layout(); plt.savefig(path_png); plt.close(); return path_png
+
+def plot_params_heatmap(history_df: pd.DataFrame, path_png: str):
+    """
+    Теплокарта: средняя /5 по параметрам за 8 последних недель.
+    """
+    if history_df is None or history_df.empty:
+        return None
+
+    df = history_df.copy()
+    for c in ["avg5","responses"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    df = df[df["param"]!="nps"].copy()
+    if df.empty: return None
+
+    # последние 8 недель
+    weeks = sorted(df["week_key"].unique(), key=_week_order_key)[-8:]
+    df = df[df["week_key"].isin(weeks)].copy()
+    if df.empty: return None
+
+    # топ-10 параметров по числу ответов
+    top_params = (df.groupby("param")["responses"].sum()
+                    .sort_values(ascending=False).head(10).index.tolist())
+    df = df[df["param"].isin(top_params)]
+
+    pv = (df.pivot_table(index="param", columns="week_key", values="avg5", aggfunc="mean")
+            .reindex(index=top_params, columns=weeks))
+    if pv.empty: return None
+
+    fig, ax = plt.subplots(figsize=(10, 5.5))
+    im = ax.imshow(pv.values, aspect="auto")
+    ax.set_yticks(range(len(pv.index))); ax.set_yticklabels([PARAM_TITLES.get(p,p) for p in pv.index])
+    ax.set_xticks(range(len(pv.columns))); ax.set_xticklabels(list(pv.columns), rotation=45)
+    ax.set_title("Анкеты: средняя /5 по параметрам (8 последних недель)")
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    plt.tight_layout(); plt.savefig(path_png); plt.close(); return path_png
+
+def plot_overall_nps_trends(history_df: pd.DataFrame, path_png: str):
+    """
+    Тренды: Итоговая /5 и NPS по неделям (12 последних) + 4-нед. скользящее среднее.
+    """
+    if history_df is None or history_df.empty:
+        return None
+
+    df = history_df.copy()
+    for c in ["avg5","nps"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    # фильтруем нужные параметры
+    ov = df[df["param"]=="overall"][["week_key","avg5"]]
+    npv= df[df["param"]=="nps"][["week_key","nps"]]
+
+    # объединяем уникальные недели
+    weeks = sorted(set(ov["week_key"]).union(set(npv["week_key"])), key=_week_order_key)[-12:]
+    if not weeks:
+        return None
+
+    ov = ov.set_index("week_key").reindex(weeks)
+    npv= npv.set_index("week_key").reindex(weeks)
+
+    # скользящие
+    ov_roll  = ov["avg5"].rolling(window=4, min_periods=2).mean()
+    nps_roll = npv["nps"].rolling(window=4, min_periods=2).mean()
+
+    fig, ax1 = plt.subplots(figsize=(10, 5.0))
+    ax1.plot(weeks, ov["avg5"].values, marker="o", label="Итоговая /5")
+    ax1.plot(weeks, ov_roll.values, linestyle="--", label="Итоговая /5 (скользящее)")
+    ax1.set_ylim(0, 5); ax1.set_ylabel("Итоговая /5")
+
+    ax2 = ax1.twinx()
+    ax2.plot(weeks, npv["nps"].values, marker="s", label="NPS", alpha=0.8)
+    ax2.plot(weeks, nps_roll.values, linestyle="--", label="NPS (скользящее)", alpha=0.8)
+    ax2.set_ylim(-100, 100); ax2.set_ylabel("NPS, п.п.")
+
+    ax1.set_title("Анкеты: тренды Итоговой /5 и NPS (12 недель)")
+    ax1.set_xticks(range(len(weeks))); ax1.set_xticklabels(weeks, rotation=45)
+
+    # общая легенда
+    lines, labels = [], []
+    for ax in (ax1, ax2):
+        l, lab = ax.get_legend_handles_labels()
+        lines += l; labels += lab
+    ax1.legend(lines, labels, loc="upper left")
+
+    plt.tight_layout(); plt.savefig(path_png); plt.close(); return path_png
+
 
 # =========================
 # Email helpers
@@ -379,9 +540,17 @@ def main():
     table = table_params_block(W["by_param"], M["by_param"], Q["by_param"], Y["by_param"])
     html = head + table + footnote_block()
 
-    # 4) Письмо
+    # 4) Графики
+    charts = []
+    p1 = "/tmp/surveys_radar.png";     plot_radar_params(W["by_param"], M["by_param"], p1); charts.append(p1)
+    p2 = "/tmp/surveys_heatmap.png";   plot_params_heatmap(hist, p2);                      charts.append(p2)
+    p3 = "/tmp/surveys_trends.png";    plot_overall_nps_trends(hist, p3);                 charts.append(p3)
+    charts = [p for p in charts if p and os.path.exists(p)]
+
+    # 5) Письмо
     subject = f"ARTSTUDIO Nevsky. Анкеты TL: Marketing — неделя {w_start:%d.%m}–{w_end:%d.%m}"
-    send_email(subject, html, attachments=None)
+    send_email(subject, html, attachments=charts)
+
 
 if __name__ == "__main__":
     main()
