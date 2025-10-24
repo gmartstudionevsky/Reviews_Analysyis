@@ -134,33 +134,52 @@ def gs_append(tab: str, a1: str, rows: list[list]):
 
 SURVEYS_HEADER = ["week_key","param","responses","avg5","avg10","promoters","detractors","nps"]
 
-def load_existing_keys() -> set[tuple[str,str]]:
-    df = gs_get_df(SURVEYS_TAB, "A:H")
-    if df.empty: return set()
-    return set(zip(df.get("week_key",[]), df.get("param",[])))
+def rows_from_agg(df: pd.DataFrame) -> list[list]:
+    out=[]
+    for _, r in df.iterrows():
+        out.append([
+            str(r["week_key"]), str(r["param"]),
+            int(r["responses"]) if pd.notna(r["responses"]) else 0,
+            (None if pd.isna(r["avg5"])  else float(r["avg5"])),
+            (None if pd.isna(r["avg10"]) else float(r["avg10"])),
+            (None if "promoters"  not in r or pd.isna(r["promoters"])  else int(r["promoters"])),
+            (None if "detractors" not in r or pd.isna(r["detractors"]) else int(r["detractors"])),
+            (None if "nps"        not in r or pd.isna(r["nps"])        else float(r["nps"])),
+        ])
+    return out
 
-def append_week_if_needed(agg_week_df: pd.DataFrame):
-    """Добавляет строки недели в surveys_history, если их ещё нет."""
-    if agg_week_df.empty: return 0
+def upsert_week(agg_week_df: pd.DataFrame) -> int:
+    """
+    Полная перезапись строк текущей недели в surveys_history:
+    - читаем весь лист
+    - выкидываем строки с week_key этой недели
+    - дописываем новые агрегаты недели (avg5/avg10 уже корректные)
+    """
+    if agg_week_df.empty:
+        return 0
     ensure_tab(HISTORY_SHEET_ID, SURVEYS_TAB, SURVEYS_HEADER)
-    exists = load_existing_keys()
-    need=[]
-    for _, r in agg_week_df.iterrows():
-        k=(str(r["week_key"]), str(r["param"]))
-        if k not in exists:
-            need.append([
-                str(r["week_key"]), str(r["param"]),
-                int(r["responses"]) if pd.notna(r["responses"]) else 0,
-                (None if pd.isna(r["avg5"]) else float(r["avg5"])),
-                (None if pd.isna(r["avg10"]) else float(r["avg10"])),
-                (None if "promoters" not in r or pd.isna(r["promoters"]) else int(r["promoters"])),
-                (None if "detractors" not in r or pd.isna(r["detractors"]) else int(r["detractors"])),
-                (None if "nps" not in r or pd.isna(r["nps"]) else float(r["nps"])),
-            ])
-            exists.add(k)
-    if need:
-        gs_append(SURVEYS_TAB, "A:H", need)
-    return len(need)
+
+    wk = str(agg_week_df["week_key"].iloc[0])
+
+    # текущая история
+    hist = gs_get_df(SURVEYS_TAB, "A:H")
+    keep = hist[hist.get("week_key","") != wk] if not hist.empty else pd.DataFrame(columns=SURVEYS_HEADER)
+
+    # очищаем диапазон значений (оставляя заголовок)
+    SHEETS.values().clear(spreadsheetId=HISTORY_SHEET_ID, range=f"{SURVEYS_TAB}!A2:H").execute()
+
+    # собираем итоговые строки: прежние + новые
+    rows_keep = keep[SURVEYS_HEADER].values.tolist() if not keep.empty else []
+    rows_new  = rows_from_agg(agg_week_df)
+    rows_all  = rows_keep + rows_new
+    if rows_all:
+        SHEETS.values().append(
+            spreadsheetId=HISTORY_SHEET_ID,
+            range=f"{SURVEYS_TAB}!A2",
+            valueInputOption="RAW",
+            body={"values": rows_all}
+        ).execute()
+    return len(rows_new)
 
 # =========================
 # Aggregation over periods
@@ -573,8 +592,8 @@ def main():
     df_raw = choose_surveys_sheet(xls)
 
     norm, agg_week = parse_and_aggregate_weekly(df_raw)  # agg_week: week_key|param|responses|avg5|avg10|promoters|detractors|nps
-    added = append_week_if_needed(agg_week)
-    print(f"[INFO] surveys_weekly: appended {added} new rows into {SURVEYS_TAB}")
+    upserted = upsert_week(agg_week)
+    print(f"[INFO] surveys_weekly: upserted {upserted} rows for {SURVEYS_TAB}")
 
     # 2) История + периоды
     hist = gs_get_df(SURVEYS_TAB, "A:H")
