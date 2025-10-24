@@ -163,6 +163,11 @@ def rows_from_agg(df: pd.DataFrame) -> list[list]:
         ])
     return rows
 
+def load_existing_keys() -> set[tuple[str,str]]:
+    df = gs_get_df(SURVEYS_TAB, "A:H")
+    if df.empty: return set()
+    return set(zip(df.get("week_key",[]), df.get("param",[])))
+
 def append_week_if_needed(agg_week_df: pd.DataFrame):
     """Добавляет строки недели в surveys_history, если их ещё нет."""
     if agg_week_df.empty: return 0
