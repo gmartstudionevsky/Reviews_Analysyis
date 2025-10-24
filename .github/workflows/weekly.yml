@@ -37,4 +37,4 @@ jobs:
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
           SMTP_FROM: ${{ secrets.SMTP_FROM }}
         run: |
-          python agent/weekly_reviews_agent.py
+          python agent/weekly_report_agent.py
