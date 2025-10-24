@@ -136,9 +136,31 @@ def rows_from_agg(df: pd.DataFrame) -> list[list]:
     return rows
 
 def process_excel_bytes(blob: bytes) -> pd.DataFrame:
-    df_raw = pd.read_excel(io.BytesIO(blob))
+    xls = pd.ExcelFile(io.BytesIO(blob))
+
+    def choose_surveys_sheet(xls_file: pd.ExcelFile) -> pd.DataFrame:
+        preferred = ["Оcenки гостей", "Оценки гостей", "Оценки", "Ответы", "Анкеты", "Responses"]
+        for name in xls_file.sheet_names:
+            if name.strip().lower() in {p.lower() for p in preferred}:
+                return pd.read_excel(xls_file, name)
+        candidates = ["Дата", "Дата анкетирования", "Комментарий", "Средняя оценка", "№ 1", "№ 2", "№ 3"]
+        best_name, best_score = None, -1
+        for name in xls_file.sheet_names:
+            try:
+                probe = pd.read_excel(xls_file, name, nrows=1)
+                cols = [str(c) for c in probe.columns]
+                score = sum(any(cand.lower() in c.lower() for cand in candidates) for c in cols)
+                if score > best_score:
+                    best_name, best_score = name, score
+            except Exception:
+                continue
+        pick = best_name or xls_file.sheet_names[0]
+        return pd.read_excel(xls_file, pick)
+
+    df_raw = choose_surveys_sheet(xls)
     _, agg = parse_and_aggregate_weekly(df_raw)
     return agg
+
 
 def main():
     ensure_tab(HISTORY_SHEET_ID, SURVEYS_TAB, HEADER)
