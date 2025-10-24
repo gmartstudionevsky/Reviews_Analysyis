@@ -304,30 +304,49 @@ def append_sources_week(week_key: str, wk_df: pd.DataFrame):
         rows.append([week_key, src, n, avg10, pos, neu, neg])
     gs_append(SOURCES_TAB, "A:G", rows)
 
+
 # =============
-# HTML builders
+# formatters (RU)
 # =============
-def fmt_pct(x):   return "—" if x is None else f"{x:.1f}%"
-def fmt_avg(x):   return "—" if x is None else f"{x:.2f}"
-def fmt_pp(x):    return "—" if x is None else f"{x:+.2f} п.п."
+def _comma_num(x, nd=2):
+    if x is None or (isinstance(x, float) and (pd.isna(x) or np.isnan(x))):
+        return "—"
+    return f"{float(x):.{nd}f}".replace(".", ",")
+
+def fmt_avg(x):   return _comma_num(x, 2)          # 9,05
+def fmt_pct(x):   return "—" if x is None else f"{float(x):.1f}%".replace(".", ",")    # 91,7%
+def fmt_pp(x):    return "—" if x is None else f"{float(x):+.2f} п.п.".replace(".", ",")
 def fmt_int(x):   return "—" if x is None else str(int(x))
 
-def header_block(week_start: date, labels: dict, week_agg: dict, mtd_agg: dict, qtd_agg: dict, ytd_agg: dict, deltas: dict):
+
+def header_human_block(week_start: date, labels: dict, week_agg: dict, mtd_agg: dict, qtd_agg: dict, ytd_agg: dict, deltas: dict):
     s, e = week_start, week_start + dt.timedelta(days=6)
-    return f"""
-    <h2>ARTSTUDIO Nevsky — отзывы за неделю {week_label(s, e)}</h2>
-    <p><b>Неделя:</b> {week_label(s, e)} — {week_agg['reviews']} отзывов; средняя <b>{fmt_avg(week_agg['avg10'])}/10</b>;
-       позитив {fmt_pct(100.0*week_agg['pos']/week_agg['reviews']) if week_agg['reviews'] else '—'},
-       негатив {fmt_pct(100.0*week_agg['neg']/week_agg['reviews']) if week_agg['reviews'] else '—'}.</p>
-    <p><b>Сравнение с периодами (на конец недели):</b><br>
-       MTD ({labels['mtd']}): ср. {fmt_avg(mtd_agg['avg10'])}/10, позитив {fmt_pct(mtd_agg['pos_share'])}, негатив {fmt_pct(mtd_agg['neg_share'])}; 
-       Δнедели → MTD: ср. {fmt_avg(deltas['mtd']['avg10_delta'])}, Δ+ {fmt_pp(deltas['mtd']['pos_delta_pp'])}, Δ− {fmt_pp(deltas['mtd']['neg_delta_pp'])}, вклад недели {fmt_pct(deltas['mtd']['week_share_pct'])}.<br>
-       QTD ({labels['qtd']}): ср. {fmt_avg(qtd_agg['avg10'])}/10, позитив {fmt_pct(qtd_agg['pos_share'])}, негатив {fmt_pct(qtd_agg['neg_share'])};
-       Δнедели → QTD: ср. {fmt_avg(deltas['qtd']['avg10_delta'])}, Δ+ {fmt_pp(deltas['qtd']['pos_delta_pp'])}, Δ− {fmt_pp(deltas['qtd']['neg_delta_pp'])}, вклад {fmt_pct(deltas['qtd']['week_share_pct'])}.<br>
-       YTD ({labels['ytd']}): ср. {fmt_avg(ytd_agg['avg10'])}/10, позитив {fmt_pct(ytd_agg['pos_share'])}, негатив {fmt_pct(ytd_agg['neg_share'])};
-       Δнедели → YTD: ср. {fmt_avg(deltas['ytd']['avg10_delta'])}, Δ+ {fmt_pp(deltas['ytd']['pos_delta_pp'])}, Δ− {fmt_pp(deltas['ytd']['neg_delta_pp'])}, вклад {fmt_pct(deltas['ytd']['week_share_pct'])}.
-    </p>
-    """
+
+    def cmp_line(name_ru, lab, agg, d):
+        return (
+          f"<p><b>{name_ru} — {lab}.</b> "
+          f"Средняя оценка: <b>{fmt_avg(agg['avg10'])}/10</b>; "
+          f"доля позитива: <b>{fmt_pct(agg['pos_share'])}</b>; "
+          f"негатива: <b>{fmt_pct(agg['neg_share'])}</b>."
+          f"<br>Неделя относительно {name_ru.lower()}: "
+          f"{'выше' if d['avg10_delta'] and d['avg10_delta']>0 else ('ниже' if d['avg10_delta'] and d['avg10_delta']<0 else 'на уровне')} по средней ({fmt_avg(d['avg10_delta'])}), "
+          f"изменение позитива {fmt_pp(d['pos_delta_pp'])}, негатива {fmt_pp(d['neg_delta_pp'])}; "
+          f"на долю недели пришлось {fmt_pct(d['week_share_pct'])} отзывов {name_ru.lower()}."
+          f"</p>"
+        )
+
+    html = (
+      f"<h2>ARTSTUDIO Nevsky — отзывы за неделю {week_label(s, e)}</h2>"
+      f"<p><b>Итоги недели:</b> {fmt_int(week_agg['reviews'])} отзывов; "
+      f"средняя <b>{fmt_avg(week_agg['avg10'])}/10</b>; "
+      f"позитив {fmt_pct(100.0*week_agg['pos']/week_agg['reviews']) if week_agg['reviews'] else '—'}, "
+      f"негатив {fmt_pct(100.0*week_agg['neg']/week_agg['reviews']) if week_agg['reviews'] else '—'}."
+      f"</p>"
+      + cmp_line("текущего месяца", labels['mtd'], mtd_agg, deltas['mtd'])
+      + cmp_line("текущего квартала", labels['qtd'], qtd_agg, deltas['qtd'])
+      + cmp_line("текущего года", labels['ytd'], ytd_agg, deltas['ytd'])
+    )
+    return html
 
 def topics_table_html(topics_df: pd.DataFrame, prev_topics_df: pd.DataFrame | None):
     prev = prev_topics_df.set_index("topic") if (prev_topics_df is not None and not prev_topics_df.empty) else None
@@ -359,8 +378,8 @@ def quotes_block(quotes: dict):
         if line: parts.append(f"<p><b>{tp}:</b> " + " / ".join(line) + "</p>")
     return ("<h3>Цитаты</h3>" + "".join(parts)) if parts else ""
 
-def sources_table_block(summ: dict):
-    """Основная таблица по источникам: Неделя/MTD/QTD/YTD (avg/rev/pos%/neg%)."""
+def sources_table_block(summ: dict, wk_src_avg: dict):
+    """Основная таблица по источникам: Неделя/Месяц/Квартал/Год (с фоллбеком средних из текущей недели)."""
     def to_map(df):
         if df is None or (isinstance(df, pd.DataFrame) and df.empty):
             return {}
@@ -380,7 +399,14 @@ def sources_table_block(summ: dict):
     Q = to_map(summ.get("qtd"))
     Y = to_map(summ.get("ytd"))
 
-    # ключи-источники объединяем корректно (множества keys)
+    # если где-то нет avg10, но источник встречается в текущей неделе — подставим недельную среднюю
+    def fill_avg_with_week(d):
+        for k, v in d.items():
+            if (v.get("avg10") is None or (isinstance(v["avg10"], float) and np.isnan(v["avg10"]))) and k in wk_src_avg:
+                v["avg10"] = float(wk_src_avg[k])
+    for D in (W, M, Q, Y):
+        fill_avg_with_week(D)
+
     all_sources = sorted(set(W) | set(M) | set(Q) | set(Y))
 
     def cell(d, src):
@@ -401,14 +427,14 @@ def sources_table_block(summ: dict):
 
     return f"""
     <h3>Источники (по периодам)</h3>
-    <p>Неделя: {summ['labels']['week']} • Месяц (MTD): {summ['labels']['mtd']} • Квартал (QTD): {summ['labels']['qtd']} • Год (YTD): {summ['labels']['ytd']}</p>
+    <p>Неделя: {summ['labels']['week']} • Месяц: {summ['labels']['mtd']} • Квартал: {summ['labels']['qtd']} • Год: {summ['labels']['ytd']}</p>
     <table border='1' cellspacing='0' cellpadding='6'>
       <tr>
         <th rowspan="2">Источник</th>
         <th colspan="4">Неделя</th>
-        <th colspan="4">Месяц (MTD)</th>
-        <th colspan="4">Квартал (QTD)</th>
-        <th colspan="4">Год (YTD)</th>
+        <th colspan="4">Текущий месяц</th>
+        <th colspan="4">Текущий квартал</th>
+        <th colspan="4">Текущий год</th>
       </tr>
       <tr>
         <th>Ср./10</th><th>Отз.</th><th>Позитив</th><th>Негатив</th>
@@ -564,6 +590,9 @@ def main():
 
     df = load_reviews_df(tmp)
     wk_df, week_agg = analyze_week(df, w_start, w_end)
+    wk_src_avg = (
+        wk_df.groupby("Источник")["_rating10"].mean().round(2).to_dict()
+    )
     week_key = append_history_week(w_start, week_agg)
     append_sources_week(week_key, wk_df)  # обновляем sources_history для недели
 
@@ -599,11 +628,11 @@ def main():
     sources_summ = sources_summary_for_periods(sources_hist, w_start)
 
     # 5) собираем HTML
-    head_html   = header_block(w_start, labels, week_agg, mtd_agg, qtd_agg, ytd_agg, deltas)
+    head_html   = header_human_block(w_start, labels, week_agg, mtd_agg, qtd_agg, ytd_agg, deltas)
     topics_html = topics_table_html(topics_df, prev_topics_df)
     quotes_html = quotes_block(quotes)
-    src_tbl     = sources_table_block(sources_summ)
-    src_deltas  = sources_deltas_block(sources_summ)
+    src_tbl     = sources_table_block(sources_summ, wk_src_avg)
+    src_deltas  = sources_deltas_block(sources_summ, wk_src_avg)
 
     html = head_html + topics_html + quotes_html + src_tbl + src_deltas
     html += "<p><i>История и сравнения: листы <b>history</b>, <b>sources_history</b>, <b>topics_history</b>. Графики — во вложениях.</i></p>"
