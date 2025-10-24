@@ -148,15 +148,19 @@ def to_5_scale(x) -> float:
     return np.nan
 
 def compute_nps_from_1to5(series: pd.Series) -> Tuple[int, int, float | np.nan]:
-    """1–2 = детракторы, 3 = нейтралы, 4–5 = промоутеры. Возвращает (P, D, NPS%)."""
+    """
+    Новое правило: 1–2 = детракторы, 3–4 = нейтралы, 5 = промоутеры.
+    Возвращает (P, D, NPS%).
+    """
     s = pd.to_numeric(series, errors="coerce").dropna()
     if s.empty:
         return 0, 0, np.nan
-    promoters  = int((s >= 4.0).sum())
+    promoters  = int((s >= 5.0).sum())
     detractors = int((s <= 2.0).sum())
     total      = int(len(s))
     nps = ((promoters / total) - (detractors / total)) * 100.0
     return promoters, detractors, round(float(nps), 1)
+
 
 def iso_week_key(d: date) -> str:
     iso = d.isocalendar()
