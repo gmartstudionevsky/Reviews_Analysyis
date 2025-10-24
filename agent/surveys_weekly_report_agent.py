@@ -171,81 +171,69 @@ def week_monday_from_key(week_key: str) -> date:
 
 def surveys_aggregate_period(history_df: pd.DataFrame, start: date, end: date) -> dict:
     """
-    Взвешенная агрегация по параметрам: суммы ответов, ср./5 (и /10) и NPS (по суммам P и D).
-    Возвращает dict:
+    Взвешенная агрегация по параметрам в календарном интервале [start; end].
+    Возвращает:
       {
         'by_param': DataFrame[param,responses,avg5,avg10,promoters,detractors,nps],
         'totals': {'responses': int, 'overall5': float|None, 'nps': float|None}
       }
+    ВАЖНО: totals['responses'] = количество анкет (responses по param=='overall').
     """
     if history_df.empty:
         return {"by_param": pd.DataFrame(columns=["param","responses","avg5","avg10","promoters","detractors","nps"]),
                 "totals": {"responses": 0, "overall5": None, "nps": None}}
 
     df = history_df.copy()
-    # привести числа
     for c in ["responses","avg5","avg10","promoters","detractors","nps"]:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
 
-    # фильтр по календарному интервалу
+    # отфильтруем недели по календарю
     df["monday"] = df["week_key"].map(week_monday_from_key)
-    df = df[(df["monday"]>=start) & (df["monday"]<=end)].copy()
+    df = df[(df["monday"] >= start) & (df["monday"] <= end)].copy()
     if df.empty:
         return {"by_param": pd.DataFrame(columns=["param","responses","avg5","avg10","promoters","detractors","nps"]),
                 "totals": {"responses": 0, "overall5": None, "nps": None}}
 
-    # взвешенная средняя по avg5/avg10: вес = responses
-    rows=[]
+    rows = []
     for param, grp in df.groupby("param"):
         resp = int(grp["responses"].fillna(0).sum())
+
         if param == "nps":
             prom = int(grp["promoters"].fillna(0).sum())
             detr = int(grp["detractors"].fillna(0).sum())
-            nps = ( (prom/(resp or 1) - detr/(resp or 1)) * 100.0 ) if resp>0 else np.nan
-            rows.append([param, resp, np.nan, np.nan, prom, detr, (None if np.isnan(nps) else round(float(nps),1))])
-        else:
-            # взвешенная avg5/avg10 только по строкам, где avg не NaN
-            sub = grp.copy()
-            sub = sub[pd.notna(sub["responses"])]
+            nps  = ( (prom / (resp or 1)) - (detr / (resp or 1)) ) * 100.0 if resp > 0 else np.nan
+            rows.append([param, resp, np.nan, np.nan, prom, detr, (None if np.isnan(nps) else round(float(nps), 1))])
+            continue
 
-            # avg5
-            if "avg5" in sub.columns:
-                sub5 = sub[pd.notna(sub["avg5"])]
-                if not sub5.empty and sub5["responses"].sum() > 0:
-                    avg5 = (sub5["avg5"] * sub5["responses"]).sum() / sub5["responses"].sum()
-                else:
-                    avg5 = np.nan
-            else:
-                avg5 = np.nan
+        # взвешенные средние по /5 и /10 только по строкам, где средние заданы
+        sub5  = grp[pd.notna(grp["avg5"]) & pd.notna(grp["responses"])]
+        avg5  = (sub5["avg5"]  * sub5["responses"]).sum() / sub5["responses"].sum() if not sub5.empty else np.nan
+        sub10 = grp[pd.notna(grp["avg10"]) & pd.notna(grp["responses"])]
+        avg10 = (sub10["avg10"] * sub10["responses"]).sum() / sub10["responses"].sum() if not sub10.empty else np.nan
 
-            # avg10
-            if "avg10" in sub.columns:
-                sub10 = sub[pd.notna(sub["avg10"])]
-                if not sub10.empty and sub10["responses"].sum() > 0:
-                    avg10 = (sub10["avg10"] * sub10["responses"]).sum() / sub10["responses"].sum()
-                else:
-                    avg10 = np.nan
-            else:
-                avg10 = np.nan
+        rows.append([
+            param, resp,
+            (None if (isinstance(avg5, float) and np.isnan(avg5)) else round(float(avg5), 2)),
+            (None if (isinstance(avg10, float) and np.isnan(avg10)) else round(float(avg10), 2)),
+            None, None, None
+        ])
 
-            rows.append([
-                param, resp,
-                (None if (isinstance(avg5, float) and np.isnan(avg5)) else round(float(avg5), 2)),
-                (None if (isinstance(avg10, float) and np.isnan(avg10)) else round(float(avg10), 2)),
-                None, None, None
-            ])
+    by_param = pd.DataFrame(rows, columns=["param","responses","avg5","avg10","promoters","detractors","nps"]).sort_values("param")
 
+    # Итоги: число анкет берём ТОЛЬКО из overall (это корректно).
+    ov = by_param[by_param["param"] == "overall"]
+    totals_responses = int(ov["responses"].sum()) if not ov.empty else 0
 
-    by_param = pd.DataFrame(rows, columns=["param","responses","avg5","avg10","promoters","detractors","nps"])
+    totals = {
+        "responses": totals_responses,
+        "overall5":  (None if ov.empty or pd.isna(ov.iloc[0]["avg5"]) else float(ov.iloc[0]["avg5"])),
+        "nps":       (None if by_param[by_param["param"]=="nps"].empty
+                      or pd.isna(by_param[by_param["param"]=="nps"].iloc[0]["nps"])
+                      else float(by_param[by_param["param"]=="nps"].iloc[0]["nps"]))
+    }
+    return {"by_param": by_param, "totals": totals}
 
-    # итого по overall и nps
-    totals = {"responses": int(by_param["responses"].fillna(0).sum())}
-    ov = by_param[by_param["param"]=="overall"]
-    totals["overall5"] = (None if ov.empty or pd.isna(ov.iloc[0]["avg5"]) else float(ov.iloc[0]["avg5"]))
-    nps_row = by_param[by_param["param"]=="nps"]
-    totals["nps"] = (None if nps_row.empty or pd.isna(nps_row.iloc[0]["nps"]) else float(nps_row.iloc[0]["nps"]))
-    return {"by_param": by_param.sort_values("param"), "totals": totals}
 
 # =========================
 # Текст/HTML
