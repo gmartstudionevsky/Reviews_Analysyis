@@ -6,15 +6,15 @@ on:
       file_name:
         description: "Имя файла на Drive (в папке folderId)"
         required: true
-        default: "Reviews_2024-25.xls"
+        default: "Reviews_2019-25.xls"
       start_date:
         description: "Дата начала (YYYY-MM-DD)"
         required: true
-        default: "2024-10-19"
+        default: "2019-12-19"
       end_date:
         description: "Дата конца (YYYY-MM-DD)"
         required: true
-        default: "2025-10-19"
+        default: "2025-10-23"
 
 jobs:
   run:
@@ -44,4 +44,4 @@ jobs:
           START_DATE: ${{ github.event.inputs.start_date }}
           END_DATE: ${{ github.event.inputs.end_date }}
         run: |
-          python agent/backfill_reviews_agent.py
+          python agent/backfill_full_history.py
