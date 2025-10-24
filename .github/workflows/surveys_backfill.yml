@@ -1,29 +1,52 @@
-- name: Run surveys backfill
-  env:
-    GOOGLE_SERVICE_ACCOUNT_JSON_CONTENT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}  # <- сам JSON целиком
-    DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
-    SHEETS_HISTORY_ID: ${{ secrets.SHEETS_HISTORY_ID }}
-  run: |
-    python -m agent.surveys_backfill_agent
+name: Surveys Backfill
+
+on:
+  workflow_dispatch: {}   # запуск вручную из вкладки Actions
+
+concurrency:
+  group: surveys-backfill
+  cancel-in-progress: true
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - name: Install deps
+
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pandas google-api-python-client google-auth google-auth-oauthlib google-auth-httplib2 openpyxl
+          pip install pandas numpy google-api-python-client google-auth google-auth-httplib2 openpyxl
+
+      # Быстрая проверка, что секрет с ключом действительно содержит JSON
+      - name: Validate service account JSON secret
+        env:
+          GOOGLE_SERVICE_ACCOUNT_JSON_CONTENT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+        run: |
+          python - <<'PY'
+          import os, sys, json
+          data = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON_CONTENT","").strip()
+          if not data or not data.lstrip().startswith("{"):
+              print("::error:: Secret GOOGLE_SERVICE_ACCOUNT_JSON пустой/некорректный. Вставь СОДЕРЖИМОЕ JSON ключа целиком.")
+              sys.exit(1)
+          json.loads(data)  # попытка распарсить
+          print("Service account JSON — OK")
+          PY
+
       - name: Run surveys backfill
         env:
-          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ github.workspace }}/sa.json
+          # сам JSON ключ целиком (как текст) — берём из секрета
+          GOOGLE_SERVICE_ACCOUNT_JSON_CONTENT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          # id папки на Google Drive (та же, что для отзывов)
           DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
+          # id Google Sheet с историей
           SHEETS_HISTORY_ID: ${{ secrets.SHEETS_HISTORY_ID }}
         run: |
-          # Сервисный ключ (как делали ранее)
-          cat << 'JSON' > "$GOOGLE_SERVICE_ACCOUNT_JSON"
-          ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
-          JSON
           python -m agent.surveys_backfill_agent
