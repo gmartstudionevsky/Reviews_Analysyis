@@ -256,17 +256,23 @@ def last_week_range(today: date):
     return start, end
 
 def analyze_week(df: pd.DataFrame, start: date, end: date):
--    df["Дата"] = pd.to_datetime(df["Дата"], errors="coerce").dt.date
-+    df["Дата"] = pd.to_datetime(df["Дата"], errors="coerce", dayfirst=True).dt.date
-    wk = df[(df["Дата"]>=start) & (df["Дата"]<=end)].copy()
+    # даты в файле: ДД.ММ.ГГГГ
+    df["Дата"] = pd.to_datetime(df["Дата"], errors="coerce", dayfirst=True).dt.date
+
+    # срез прошлой недели
+    wk = df[(df["Дата"] >= start) & (df["Дата"] <= end)].copy()
+
+    # нормализуем рейтинг и считаем сентимент
     wk["_rating10"] = normalize_to10(wk["Рейтинг"])
     wk["_sent"] = wk.apply(lambda r: sentiment_sign(r["Текст"], r["_rating10"]), axis=1)
+
+    # агрегаты недели
     agg = {
-        "reviews": len(wk),
-        "avg10": round(wk["_rating10"].mean(),2) if len(wk) else None,
-        "pos": int((wk["_sent"]=="positive").sum()),
-        "neu": int((wk["_sent"]=="neutral").sum()),
-        "neg": int((wk["_sent"]=="negative").sum()),
+        "reviews": int(len(wk)),
+        "avg10": round(float(wk["_rating10"].mean()), 2) if len(wk) else None,
+        "pos": int((wk["_sent"] == "positive").sum()),
+        "neu": int((wk["_sent"] == "neutral").sum()),
+        "neg": int((wk["_sent"] == "negative").sum()),
     }
     return wk, agg
 
