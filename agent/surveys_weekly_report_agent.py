@@ -6,10 +6,12 @@ from datetime import date
 import pandas as pd
 import numpy as np
 
+
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
 from email import encoders
+from agent.metrics_core import iso_week_monday  # Assuming this is available as per context
 import smtplib, mimetypes
 
 from google.oauth2.service_account import Credentials
@@ -121,7 +123,18 @@ def gs_get_df(tab: str, a1: str) -> pd.DataFrame:
     try:
         res = SHEETS.values().get(spreadsheetId=HISTORY_SHEET_ID, range=f"{tab}!{a1}").execute()
         vals = res.get("values", [])
-        return pd.DataFrame(vals[1:], columns=vals[0]) if len(vals)>1 else pd.DataFrame()
+        if len(vals) <= 1:
+            return pd.DataFrame()
+        df = pd.DataFrame(vals[1:], columns=vals[0])
+        
+        # Конвертация numeric колонок: replace ',' -> '.', to_numeric
+        numeric_cols = ['responses', 'avg5', 'avg10', 'promoters', 'detractors', 'nps']
+        for col in numeric_cols:
+            if col in df.columns:
+                df[col] = df[col].astype(str).str.replace(',', '.').replace('', np.nan)  # '' -> NaN
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+        
+        return df
     except Exception:
         return pd.DataFrame()
 
@@ -188,70 +201,123 @@ def week_monday_from_key(week_key: str) -> date:
     # week_key = 'YYYY-W##'
     return iso_week_monday(week_key)
 
-def surveys_aggregate_period(history_df: pd.DataFrame, start: date, end: date) -> dict:
+def surveys_aggregate_period(df: pd.DataFrame, start: date, end: date) -> dict:
     """
-    Взвешенная агрегация по параметрам в календарном интервале [start; end].
-    Возвращает:
-      {
-        'by_param': DataFrame[param,responses,avg5,avg10,promoters,detractors,nps],
-        'totals': {'responses': int, 'overall5': float|None, 'nps': float|None}
-      }
-    ВАЖНО:
-      - totals['responses'] = число анкет (responses по param=='overall')
-      - средние по параметрам взвешиваются по responses этого параметра
-      - NPS собирается из суммы по неделям, правило 1–2 D / 3–4 N / 5 P
+    Aggregate survey data for a given period from historical DataFrame.
+    
+    Filters weeks where the Monday is between start and end (inclusive).
+    Then groups by param and computes:
+    - sum(responses)
+    - weighted avg for avg5 and avg10 (weighted by responses)
+    - For NPS: sum(promoters), sum(detractors), compute nps = (prom - det) / total_resp * 100
+    
+    Returns dict with:
+    - 'by_param': pd.DataFrame with columns ['param', 'responses', 'avg5', 'avg10', 'promoters', 'detractors', 'nps']
+    - 'total_surveys': int (from overall responses)
+    - 'overall_avg5': float or np.nan
+    - 'overall_avg10': float or np.nan
+    - 'nps': float or np.nan
     """
-    if history_df.empty:
-        return {"by_param": pd.DataFrame(columns=["param","responses","avg5","avg10","promoters","detractors","nps"]),
-                "totals": {"responses": 0, "overall5": None, "nps": None}}
-
-    df = history_df.copy()
-    for c in ["responses","avg5","avg10","promoters","detractors","nps"]:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-
-    # фильтр по датам
-    df["monday"] = df["week_key"].map(week_monday_from_key)
-    df = df[(df["monday"] >= start) & (df["monday"] <= end)].copy()
     if df.empty:
-        return {"by_param": pd.DataFrame(columns=["param","responses","avg5","avg10","promoters","detractors","nps"]),
-                "totals": {"responses": 0, "overall5": None, "nps": None}}
-
-    rows = []
-    for param, grp in df.groupby("param"):
-        resp = int(grp["responses"].fillna(0).sum())
-        if param == "nps":
-            prom = int(grp["promoters"].fillna(0).sum())
-            detr = int(grp["detractors"].fillna(0).sum())
-            nps  = ((prom/(resp or 1)) - (detr/(resp or 1))) * 100.0 if resp > 0 else np.nan
-            rows.append([param, resp, np.nan, np.nan, prom, detr, (None if np.isnan(nps) else round(float(nps),1))])
-            continue
-
-        # взвешенная средняя по /5 и /10 только по валидным строкам
-        sub5  = grp[pd.notna(grp["avg5"]) & pd.notna(grp["responses"])]
-        avg5  = (sub5["avg5"]  * sub5["responses"]).sum() / sub5["responses"].sum() if not sub5.empty else np.nan
-        sub10 = grp[pd.notna(grp["avg10"]) & pd.notna(grp["responses"])]
-        avg10 = (sub10["avg10"] * sub10["responses"]).sum() / sub10["responses"].sum() if not sub10.empty else np.nan
-
-        rows.append([
-            param, resp,
-            (None if (isinstance(avg5, float) and np.isnan(avg5)) else round(float(avg5), 2)),
-            (None if (isinstance(avg10, float) and np.isnan(avg10)) else round(float(avg10), 2)),
-            None, None, None
-        ])
-
-    by_param = pd.DataFrame(rows, columns=["param","responses","avg5","avg10","promoters","detractors","nps"]).sort_values("param")
-
-    # Итоги: число анкет берём ТОЛЬКО из overall (это и есть анкеты в неделях)
-    ov = by_param[by_param["param"]=="overall"]
-    totals = {
-        "responses": int(ov["responses"].sum()) if not ov.empty else 0,
-        "overall5": (None if ov.empty or pd.isna(ov.iloc[0]["avg5"]) else float(ov.iloc[0]["avg5"])),
-        "nps":      (None if by_param[by_param["param"]=="nps"].empty
-                     or pd.isna(by_param[by_param["param"]=="nps"].iloc[0]["nps"])
-                     else float(by_param[by_param["param"]=="nps"].iloc[0]["nps"]))
+        empty_df = pd.DataFrame(columns=['param', 'responses', 'avg5', 'avg10', 'promoters', 'detractors', 'nps'])
+        return {
+            'by_param': empty_df,
+            'total_surveys': 0,
+            'overall_avg5': np.nan,
+            'overall_avg10': np.nan,
+            'nps': np.nan
+        }
+    
+    # Copy and ensure numeric types
+    df = df.copy()
+    numeric_cols = ['responses', 'avg5', 'avg10', 'promoters', 'detractors', 'nps']
+    for col in numeric_cols:
+        if col in df.columns:
+            df[col] = df[col].astype(str).str.replace(',', '.').replace('', np.nan)
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+    
+    # Filter weeks in period
+    df['monday'] = df['week_key'].map(iso_week_monday)
+    filtered = df[(df['monday'] >= start) & (df['monday'] <= end)].drop(columns=['monday'])
+    
+    if filtered.empty:
+        empty_df = pd.DataFrame(columns=['param', 'responses', 'avg5', 'avg10', 'promoters', 'detractors', 'nps'])
+        return {
+            'by_param': empty_df,
+            'total_surveys': 0,
+            'overall_avg5': np.nan,
+            'overall_avg10': np.nan,
+            'nps': np.nan
+        }
+    
+    # Separate nps and other params
+    nps_df = filtered[filtered['param'] == 'nps']
+    params_df = filtered[filtered['param'] != 'nps']
+    
+    # Aggregate params
+    if not params_df.empty:
+        params_agg = params_df.groupby('param').apply(
+            lambda g: pd.Series({
+                'responses': g['responses'].sum(),
+                'avg5': np.average(g['avg5'], weights=g['responses']) if g['responses'].sum() > 0 else np.nan,
+                'avg10': np.average(g['avg10'], weights=g['responses']) if g['responses'].sum() > 0 else np.nan,
+                'promoters': np.nan,
+                'detractors': np.nan,
+                'nps': np.nan
+            })
+        ).reset_index()
+    else:
+        params_agg = pd.DataFrame(columns=['param', 'responses', 'avg5', 'avg10', 'promoters', 'detractors', 'nps'])
+    
+    # Aggregate nps
+    if not nps_df.empty:
+        total_resp = nps_df['responses'].sum()
+        promoters = nps_df['promoters'].sum()
+        detractors = nps_df['detractors'].sum()
+        nps = ((promoters - detractors) / total_resp * 100) if total_resp > 0 else np.nan
+        nps_row = pd.DataFrame([{
+            'param': 'nps',
+            'responses': total_resp,
+            'avg5': np.nan,
+            'avg10': np.nan,
+            'promoters': promoters,
+            'detractors': detractors,
+            'nps': nps
+        }])
+    else:
+        nps_row = pd.DataFrame([{
+            'param': 'nps',
+            'responses': 0,
+            'avg5': np.nan,
+            'avg10': np.nan,
+            'promoters': np.nan,
+            'detractors': np.nan,
+            'nps': np.nan
+        }])
+    
+    # Combine
+    by_param = pd.concat([params_agg, nps_row], ignore_index=True)
+    
+    # Extract totals
+    overall_row = by_param[by_param['param'] == 'overall']
+    total_surveys = int(overall_row['responses'].iloc[0]) if not overall_row.empty else 0
+    overall_avg5 = overall_row['avg5'].iloc[0] if not overall_row.empty else np.nan
+    overall_avg10 = overall_row['avg10'].iloc[0] if not overall_row.empty else np.nan
+    nps_value = nps_row['nps'].iloc[0]
+    
+    # Order params as per PARAM_ORDER + 'nps'
+    from agent.surveys_core import PARAM_ORDER  # Assuming available
+    order = [p for p in PARAM_ORDER if p != 'nps_1_5'] + ['nps']
+    by_param['param'] = pd.Categorical(by_param['param'], categories=order, ordered=True)
+    by_param = by_param.sort_values('param').reset_index(drop=True)
+    
+    return {
+        'by_param': by_param,
+        'total_surveys': total_surveys,
+        'overall_avg5': overall_avg5,
+        'overall_avg10': overall_avg10,
+        'nps': nps_value
     }
-    return {"by_param": by_param, "totals": totals}
 
 
 
