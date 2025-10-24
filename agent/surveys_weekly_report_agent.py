@@ -272,30 +272,43 @@ def header_block(week_start: date, week_end: date, W: dict, M: dict, Q: dict, Y:
     return "\n".join(parts)
 
 def table_params_block(W_df: pd.DataFrame, M_df: pd.DataFrame, Q_df: pd.DataFrame, Y_df: pd.DataFrame):
-    # делаем объединённый список параметров в нужном порядке
-    order = [p for p in [
+    # упорядоченный список параметров
+    order = [
         "overall","fo_checkin","clean_checkin","room_comfort","fo_stay","its_service","hsk_stay","breakfast",
         "atmosphere","location","value","would_return","nps"
-    ]]
-    def to_map(df):
-        mp={}
-        if df is None or df.empty: return mp
-        for _, r in df.iterrows():
-            mp[str(r["param"])] = r
-        return mp
-    W, M, Q, Y = map(to_map, [W_df, M_df, Q_df, Y_df])
+    ]
 
-    rows=[]
+    def to_map(df: pd.DataFrame) -> dict[str, dict]:
+        """Переводим df -> dict[param] = {'avg5': float|None, 'responses': int|None, 'nps': float|None}"""
+        mp = {}
+        if df is None or df.empty:
+            return mp
+        for _, r in df.iterrows():
+            p = str(r["param"])
+            # аккуратно берём поля (могут быть NaN/отсутствовать)
+            avg5 = float(r["avg5"]) if "avg5" in r and pd.notna(r["avg5"]) else None
+            resp = int(r["responses"]) if "responses" in r and pd.notna(r["responses"]) else None
+            nps  = float(r["nps"]) if "nps" in r and pd.notna(r["nps"]) else None
+            mp[p] = {"avg5": avg5, "responses": resp, "nps": nps}
+        return mp
+
+    W = to_map(W_df); M = to_map(M_df); Q = to_map(Q_df); Y = to_map(Y_df)
+
+    def cell(mp: dict, param: str) -> str:
+        r = mp.get(param)
+        if r is None:
+            return "<td>—</td><td>—</td>"
+        if param == "nps":
+            return f"<td>{fmt_plain(r['nps'])}</td><td>{fmt_int(r['responses'])}</td>"
+        return f"<td>{fmt_avg5(r['avg5'])}</td><td>{fmt_int(r['responses'])}</td>"
+
+    rows = []
     for p in order:
-        t = PARAM_TITLES.get(p, p)
-        def cell(mp):
-            r = mp.get(p)
-            if not r: 
-                return "<td>—</td><td>—</td>"
-            if p == "nps":
-                return f"<td>{fmt_plain(r['nps'])}</td><td>{fmt_int(r['responses'])}</td>"
-            return f"<td>{fmt_avg5(r['avg5'])}</td><td>{fmt_int(r['responses'])}</td>"
-        rows.append(f"<tr><td><b>{t}</b></td>{cell(W)}{cell(M)}{cell(Q)}{cell(Y)}</tr>")
+        title = PARAM_TITLES.get(p, p)
+        rows.append(
+            f"<tr><td><b>{title}</b></td>"
+            f"{cell(W,p)}{cell(M,p)}{cell(Q,p)}{cell(Y,p)}</tr>"
+        )
 
     html = f"""
     <h3>Параметры (неделя / Текущий месяц / Текущий квартал / Текущий год)</h3>
@@ -317,6 +330,7 @@ def table_params_block(W_df: pd.DataFrame, M_df: pd.DataFrame, Q_df: pd.DataFram
     </table>
     """
     return html
+
 
 def footnote_block():
     return """
