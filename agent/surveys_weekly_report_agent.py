@@ -465,41 +465,65 @@ def plot_params_heatmap(history_df: pd.DataFrame, path_png: str):
 def plot_overall_nps_trends(history_df: pd.DataFrame, path_png: str):
     """
     Тренды: Итоговая /5 и NPS по неделям (12 последних) + 4-нед. скользящее среднее.
+    УСТОЙЧИВО К ДУБЛЯМ week_key: сначала группируем по неделе.
     """
     if history_df is None or history_df.empty:
         return None
 
     df = history_df.copy()
-    for c in ["avg5","nps"]:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
+    # приведение типов
+    if "avg5" in df.columns:
+        df["avg5"] = pd.to_numeric(df["avg5"], errors="coerce")
+    if "nps" in df.columns:
+        df["nps"]  = pd.to_numeric(df["nps"], errors="coerce")
 
-    ov = df[df["param"]=="overall"][["week_key","avg5"]]
-    npv= df[df["param"]=="nps"][["week_key","nps"]]
+    # берём только нужные параметры
+    ov = df[df["param"] == "overall"][["week_key", "avg5"]].dropna(subset=["week_key"])
+    npv = df[df["param"] == "nps"][["week_key", "nps"]].dropna(subset=["week_key"])
 
-    weeks = sorted(set(ov["week_key"]).union(set(npv["week_key"])), key=_week_order_key)[-12:]
+    if ov.empty and npv.empty:
+        return None
+
+    # ВАЖНО: агрегируем по неделе, чтобы убрать дубли week_key
+    if not ov.empty:
+        ov = (ov.groupby("week_key", as_index=False)["avg5"].mean())
+    if not npv.empty:
+        npv = (npv.groupby("week_key", as_index=False)["nps"].mean())
+
+    # последние 12 недель, объединённый список
+    weeks = sorted(set(ov["week_key"].tolist() if not ov.empty else [])
+                   | set(npv["week_key"].tolist() if not npv.empty else []),
+                   key=_week_order_key)[-12:]
     if not weeks:
         return None
 
-    ov = ov.set_index("week_key").reindex(weeks)
-    npv= npv.set_index("week_key").reindex(weeks)
+    # reindex уже по уникальным неделям
+    ov = ov.set_index("week_key").reindex(weeks) if not ov.empty else pd.DataFrame(index=weeks, data={"avg5": np.nan})
+    npv = npv.set_index("week_key").reindex(weeks) if not npv.empty else pd.DataFrame(index=weeks, data={"nps": np.nan})
 
+    # проверка, что есть хоть какие-то значения
+    if ov["avg5"].notna().sum() + npv["nps"].notna().sum() == 0:
+        return None
+
+    # скользящие средние (4 недели) по непустым
     ov_roll  = ov["avg5"].rolling(window=4, min_periods=2).mean()
     nps_roll = npv["nps"].rolling(window=4, min_periods=2).mean()
 
+    # построение
     fig, ax1 = plt.subplots(figsize=(10, 5.0))
     ax1.plot(weeks, ov["avg5"].values, marker="o", label="Итоговая /5")
     ax1.plot(weeks, ov_roll.values, linestyle="--", label="Итоговая /5 (скользящее)")
     ax1.set_ylim(0, 5); ax1.set_ylabel("Итоговая /5")
 
     ax2 = ax1.twinx()
-    ax2.plot(weeks, npv["nps"].values, marker="s", label="NPS", alpha=0.8)
-    ax2.plot(weeks, nps_roll.values, linestyle="--", label="NPS (скользящее)", alpha=0.8)
+    ax2.plot(weeks, npv["nps"].values, marker="s", label="NPS", alpha=0.85)
+    ax2.plot(weeks, nps_roll.values, linestyle="--", label="NPS (скользящее)", alpha=0.85)
     ax2.set_ylim(-100, 100); ax2.set_ylabel("NPS, п.п.")
 
     ax1.set_title("Анкеты: тренды Итоговой /5 и NPS (12 недель)")
-    ax1.set_xticks(range(len(weeks))); ax1.set_xticklabels(weeks, rotation=45)
+    ax1.set_xticks(range(len(weeks))); ax1.set_xticklabels(weeks, rotation=45, ha="right")
 
+    # общая легенда
     lines, labels = [], []
     for ax in (ax1, ax2):
         l, lab = ax.get_legend_handles_labels()
@@ -507,6 +531,7 @@ def plot_overall_nps_trends(history_df: pd.DataFrame, path_png: str):
     ax1.legend(lines, labels, loc="upper left")
 
     plt.tight_layout(); plt.savefig(path_png); plt.close(); return path_png
+
 
 # =========================
 # Email helpers
