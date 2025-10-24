@@ -420,22 +420,33 @@ def sources_table_block(summ: dict):
     </table>
     """
 def sources_deltas_block(summ: dict):
-    """Отдельная компактная таблица дельт по средним: MTD vs prev_month, QTD vs prev_quarter, YTD vs prev_year."""
-    prevM = summ["prev_month"]; prevQ = summ["prev_quarter"]; prevY = summ["prev_year"]
+    """Компактная таблица дельт по средним /10: MTD vs prev_month, QTD vs prev_quarter, YTD vs prev_year."""
+    prevM = summ.get("prev_month"); prevQ = summ.get("prev_quarter"); prevY = summ.get("prev_year")
+
     def to_map(df):
-        return {r["source"]: r["avg10"] for _, r in (df if df is not None else pd.DataFrame(columns=["source"])).iterrows()}
-    M, PM = to_map(summ["mtd"]), to_map(prevM)
-    Q, PQ = to_map(summ["qtd"]), to_map(prevQ)
-    Y, PY = to_map(summ["ytd"]), to_map(prevY)
-    all_sources = sorted(set(list(M.keys())|set(PM.keys())|list(Q.keys())|set(PQ.keys())|list(Y.keys())|set(PY.keys())))
-    def dd(a,b):
-        if a is None or (isinstance(a,float) and math.isnan(a)) or b is None or (isinstance(b,float) and math.isnan(b)):
+        if df is None or (isinstance(df, pd.DataFrame) and df.empty):
+            return {}
+        return {str(r["source"]): (float(r["avg10"]) if pd.notna(r["avg10"]) else None)
+                for _, r in df.iterrows()}
+
+    M, PM = to_map(summ.get("mtd")),  to_map(prevM)
+    Q, PQ = to_map(summ.get("qtd")),  to_map(prevQ)
+    Y, PY = to_map(summ.get("ytd")),  to_map(prevY)
+
+    # ключи объединяем корректно: только множества
+    all_sources = sorted(set(M) | set(PM) | set(Q) | set(PQ) | set(Y) | set(PY))
+
+    def dd(a, b):
+        if a is None or b is None or (isinstance(a, float) and math.isnan(a)) or (isinstance(b, float) and math.isnan(b)):
             return "—"
-        d = float(a) - float(b)
-        return f"{d:+.2f}"
-    rows=[]
-    for s in all_sources:
-        rows.append(f"<tr><td><b>{s}</b></td><td>{dd(M.get(s), PM.get(s))}</td><td>{dd(Q.get(s), PQ.get(s))}</td><td>{dd(Y.get(s), PY.get(s))}</td></tr>")
+        return f"{(float(a) - float(b)):+.2f}"
+
+    rows = [
+        f"<tr><td><b>{s}</b></td><td>{dd(M.get(s), PM.get(s))}</td>"
+        f"<td>{dd(Q.get(s), PQ.get(s))}</td><td>{dd(Y.get(s), PY.get(s))}</td></tr>"
+        for s in all_sources
+    ]
+
     return f"""
     <h3>Дельты по источникам</h3>
     <p>Сравнение средних /10: MTD vs {summ['labels']['prev_month']}, QTD vs {summ['labels']['prev_quarter']}, YTD vs {summ['labels']['prev_year']}.</p>
