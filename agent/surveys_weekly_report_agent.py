@@ -514,7 +514,34 @@ def main():
     # 1) Подтянем последний Report_*.xlsx и при необходимости допишем неделю в surveys_history
     fid, name, fdate = latest_report_from_drive()
     blob = drive_download(fid)
-    df_raw = pd.read_excel(io.BytesIO(blob))
+    # выберем правильный лист с ответами анкет
+    xls = pd.ExcelFile(io.BytesIO(blob))
+    
+    def choose_surveys_sheet(xls_file: pd.ExcelFile) -> pd.DataFrame:
+        # 1) приоритет по имени
+        preferred = ["Оценки гостей", "Оценки", "Ответы", "Анкеты", "Responses"]
+        for name in xls_file.sheet_names:
+            if name.strip().lower() in {p.lower() for p in preferred}:
+                return pd.read_excel(xls_file, name)
+    
+        # 2) эвристика по колонкам
+        candidates = ["Дата", "Дата анкетирования", "Комментарий", "Средняя оценка", "№ 1", "№ 2", "№ 3"]
+        best_name, best_score = None, -1
+        for name in xls_file.sheet_names:
+            try:
+                probe = pd.read_excel(xls_file, name, nrows=1)
+                cols = [str(c) for c in probe.columns]
+                score = sum(any(cand.lower() in c.lower() for cand in candidates) for c in cols)
+                if score > best_score:
+                    best_name, best_score = name, score
+            except Exception:
+                continue
+        # 3) fallback — первый лист
+        pick = best_name or xls_file.sheet_names[0]
+        return pd.read_excel(xls_file, pick)
+    
+    df_raw = choose_surveys_sheet(xls)
+
     norm, agg_week = parse_and_aggregate_weekly(df_raw)  # agg_week: week_key|param|responses|avg5|avg10|promoters|detractors|nps
     added = append_week_if_needed(agg_week)
     print(f"[INFO] surveys_weekly: appended {added} new rows into {SURVEYS_TAB}")
