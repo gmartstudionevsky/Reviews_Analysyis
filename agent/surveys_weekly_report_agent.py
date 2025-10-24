@@ -198,6 +198,11 @@ def week_monday_from_key(week_key: str) -> date:
     # week_key = 'YYYY-W##'
     return iso_week_monday(week_key)
 
+from datetime import date
+import pandas as pd
+import numpy as np
+from agent.metrics_core import iso_week_monday  # Assuming this is available as per context
+
 def surveys_aggregate_period(df: pd.DataFrame, start: date, end: date) -> dict:
     """
     Aggregate survey data for a given period from historical DataFrame.
@@ -210,19 +215,18 @@ def surveys_aggregate_period(df: pd.DataFrame, start: date, end: date) -> dict:
     
     Returns dict with:
     - 'by_param': pd.DataFrame with columns ['param', 'responses', 'avg5', 'avg10', 'promoters', 'detractors', 'nps']
-    - 'total_surveys': int (from overall responses)
-    - 'overall_avg5': float or np.nan
-    - 'overall_avg10': float or np.nan
-    - 'nps': float or np.nan
+    - 'totals': dict with 'responses' (from overall), 'avg5', 'avg10', 'nps'
     """
     if df.empty:
         empty_df = pd.DataFrame(columns=['param', 'responses', 'avg5', 'avg10', 'promoters', 'detractors', 'nps'])
         return {
             'by_param': empty_df,
-            'total_surveys': 0,
-            'overall_avg5': np.nan,
-            'overall_avg10': np.nan,
-            'nps': np.nan
+            'totals': {
+                'responses': 0,
+                'avg5': np.nan,
+                'avg10': np.nan,
+                'nps': np.nan
+            }
         }
     
     # Copy and ensure numeric types
@@ -241,10 +245,12 @@ def surveys_aggregate_period(df: pd.DataFrame, start: date, end: date) -> dict:
         empty_df = pd.DataFrame(columns=['param', 'responses', 'avg5', 'avg10', 'promoters', 'detractors', 'nps'])
         return {
             'by_param': empty_df,
-            'total_surveys': 0,
-            'overall_avg5': np.nan,
-            'overall_avg10': np.nan,
-            'nps': np.nan
+            'totals': {
+                'responses': 0,
+                'avg5': np.nan,
+                'avg10': np.nan,
+                'nps': np.nan
+            }
         }
     
     # Separate nps and other params
@@ -253,7 +259,7 @@ def surveys_aggregate_period(df: pd.DataFrame, start: date, end: date) -> dict:
     
     # Aggregate params
     if not params_df.empty:
-        params_agg = params_df.groupby('param').apply(
+        params_agg = params_df.groupby('param', group_keys=False).apply(
             lambda g: pd.Series({
                 'responses': g['responses'].sum(),
                 'avg5': np.average(g['avg5'], weights=g['responses']) if g['responses'].sum() > 0 else np.nan,
@@ -261,7 +267,8 @@ def surveys_aggregate_period(df: pd.DataFrame, start: date, end: date) -> dict:
                 'promoters': np.nan,
                 'detractors': np.nan,
                 'nps': np.nan
-            })
+            }),
+            include_groups=False
         ).reset_index()
     else:
         params_agg = pd.DataFrame(columns=['param', 'responses', 'avg5', 'avg10', 'promoters', 'detractors', 'nps'])
@@ -297,9 +304,9 @@ def surveys_aggregate_period(df: pd.DataFrame, start: date, end: date) -> dict:
     
     # Extract totals
     overall_row = by_param[by_param['param'] == 'overall']
-    total_surveys = int(overall_row['responses'].iloc[0]) if not overall_row.empty else 0
-    overall_avg5 = overall_row['avg5'].iloc[0] if not overall_row.empty else np.nan
-    overall_avg10 = overall_row['avg10'].iloc[0] if not overall_row.empty else np.nan
+    responses = int(overall_row['responses'].iloc[0]) if not overall_row.empty else 0
+    avg5 = overall_row['avg5'].iloc[0] if not overall_row.empty else np.nan
+    avg10 = overall_row['avg10'].iloc[0] if not overall_row.empty else np.nan
     nps_value = nps_row['nps'].iloc[0]
     
     # Order params as per PARAM_ORDER + 'nps'
@@ -310,10 +317,12 @@ def surveys_aggregate_period(df: pd.DataFrame, start: date, end: date) -> dict:
     
     return {
         'by_param': by_param,
-        'total_surveys': total_surveys,
-        'overall_avg5': overall_avg5,
-        'overall_avg10': overall_avg10,
-        'nps': nps_value
+        'totals': {
+            'responses': responses,
+            'avg5': avg5,
+            'avg10': avg10,
+            'nps': nps_value
+        }
     }
 
 
