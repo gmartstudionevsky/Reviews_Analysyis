@@ -68,10 +68,18 @@ def year_label(d: date) -> str:
 
 # --- Безопасные касты и операции
 def _num(x):
-    try: 
-        if x is None: return float("nan")
+    """Надёжно приводит к float, понимает '9,05', пустые, тире и т.п."""
+    try:
+        if x is None:
+            return float("nan")
+        if isinstance(x, str):
+            s = x.strip()
+            if s in ("", "—", "-", "–"):
+                return float("nan")
+            s = s.replace(",", ".")
+            return float(s)
         return float(x)
-    except: 
+    except:
         return float("nan")
 
 def _safe_pct(a: float, b: float) -> float | None:
@@ -108,7 +116,7 @@ def aggregate_weeks_from_history(history_df: pd.DataFrame, start_d: date, end_d:
 
     # числовые
     for c in ["reviews","avg10","pos","neu","neg"]:
-        wk[c] = wk[c].apply(_num)
+    wk[c] = pd.to_numeric(wk[c].astype(str).str.replace(",", ".", regex=False), errors="coerce")
 
     # фильтр по дате понедельника
     def in_range(k):
@@ -158,7 +166,8 @@ def aggregate_sources_from_history(sources_df: pd.DataFrame, start_d: date, end_
         return pd.DataFrame(columns=["source","reviews","avg10","pos_share","neg_share","pos","neu","neg"])
 
     for c in ["reviews","avg10","pos","neu","neg"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df[c] = pd.to_numeric(df[c].astype(str).str.replace(",", ".", regex=False), errors="coerce")
+
 
     def agg_fn(g: pd.DataFrame):
         n = int(g["reviews"].sum())
