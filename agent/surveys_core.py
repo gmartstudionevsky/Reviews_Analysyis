@@ -226,7 +226,7 @@ def normalize_surveys_df(df0: pd.DataFrame) -> pd.DataFrame:
         best, best_hits, n = None, 0, len(df)
         for c in df.columns:
             try:
-                parsed = pd.to_datetime(cast(pd.Series, df[c]), errors="coerce", dayfirst=True)
+                parsed = pd.to_datetime(df[c], errors="coerce", dayfirst=True)
                 hits = int(parsed.notna().sum())
                 if hits > best_hits and hits >= max(5, int(0.5 * n)):
                     best, best_hits = c, hits
@@ -244,7 +244,7 @@ def normalize_surveys_df(df0: pd.DataFrame) -> pd.DataFrame:
     for k in ("comment", "fio", "booking", "phone", "email"):
         out[k] = df[cols[k]].astype(str) if k in cols else ""
 
-    # 3) параметрические поля → /5 и /10, плюс NPS (в /5 шкале для вычисления)
+    # 3) параметрические поля → /5 и /10, плюс NPS (в /5 шкале)
     for p in PARAM_ORDER:
         if p == "nps_1_5":
             col = cols.get(p)
@@ -252,25 +252,29 @@ def normalize_surveys_df(df0: pd.DataFrame) -> pd.DataFrame:
             continue
         col = cols.get(p)
         v5 = df[col].map(to_5_scale) if col else np.nan
-        out[f"{p}5"] = v5
+        out[f"{p}5"]  = v5
         out[f"{p}10"] = v5 * 2.0
 
-    # 4) ФОЛБЭК ДЛЯ overall5: заполняем ПОСТРОЧНО средним по доступным параметрам,
-    #    если явное значение пустое (или колонки overall5 не было вовсе).
+    # 4) ФОЛБЭК ДЛЯ overall5: если пусто — среднее по доступным параметрам строки
     if "overall5" not in out.columns:
         out["overall5"] = np.nan
-        out["overall10"] = np.nan
     value_cols5 = [c for c in out.columns if c.endswith("5") and c not in ("nps5", "overall5")]
-    if value_cols5:
-        row_mean5 = pd.to_numeric(out[value_cols5], errors="coerce").mean(axis=1)
-        out["overall5"] = pd.to_numeric(out["overall5"], errors="coerce")
-        out["overall5"] = out["overall5"].where(out["overall5"].notna(), row_mean5)
 
+    # приводим к числам и считаем построчное среднее
+    if value_cols5:
+        vals = out[value_cols5].apply(pd.to_numeric, errors="coerce")
+        row_mean5 = vals.mean(axis=1)
+    else:
+        row_mean5 = pd.Series([np.nan] * len(out), index=out.index)
+
+    out["overall5"] = pd.to_numeric(out["overall5"], errors="coerce")
+    out["overall5"] = out["overall5"].where(out["overall5"].notna(), row_mean5)
     out["overall10"] = out["overall5"] * 2.0
 
     # 5) выбрасываем строки без даты
     out = out[pd.notna(out["date"])].reset_index(drop=True)
     return out
+
 
 
 # =======================
