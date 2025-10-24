@@ -28,7 +28,8 @@ try:
         aggregate_weeks_from_history, deltas_week_vs_period,
         role_of_week_in_period, sources_summary_for_periods,
         week_label, month_label, quarter_label, year_label,
-        _weighted_avg, _safe_pct,   # <<< добавили
+        _weighted_avg, _safe_pct,
+        aggregate_sources_from_history,
     )
 except ModuleNotFoundError:
     # fallback, если файл запущен как скрипт и пакет 'agent' не найден
@@ -41,7 +42,8 @@ except ModuleNotFoundError:
         aggregate_weeks_from_history, deltas_week_vs_period,
         role_of_week_in_period, sources_summary_for_periods,
         week_label, month_label, quarter_label, year_label,
-        _weighted_avg, _safe_pct,   # <<< добавили
+        _weighted_avg, _safe_pct,
+        aggregate_sources_from_history,
     )
 
 # ======================================
@@ -730,10 +732,11 @@ def main():
 
     # 4) блоки по источникам
     sources_summ = sources_summary_for_periods(sources_hist, w_start)
+
     # --- склеиваем Yandex + Яндекс Путешествия в один источник 'Yandex'
     for k in ["week","mtd","qtd","ytd","prev_month","prev_quarter","prev_year"]:
         sources_summ[k] = unify_sources_df(sources_summ[k])
-    
+
     # --- добавляем «всё время» как отдельный срез (для последнего столбца таблицы)
     if not sources_hist.empty:
         tmp = sources_hist.copy()
@@ -741,38 +744,29 @@ def main():
         all_start, all_end = tmp["mon"].min(), tmp["mon"].max()
         all_df = aggregate_sources_from_history(sources_hist, all_start, all_end)
         sources_summ["alltime"] = unify_sources_df(all_df)
-        sources_summ["labels"]["alltime"] = "всё время"
     else:
         sources_summ["alltime"] = pd.DataFrame(columns=["source","reviews","avg10","pos_share","neg_share","pos","neu","neg"])
-        sources_summ["labels"]["alltime"] = "всё время"
-
-
-# добавляем «всё время» как последний столбец (для таблицы по источникам)
-if not sources_hist.empty:
-    tmp = sources_hist.copy()
-    tmp["mon"] = tmp["week_key"].map(lambda k: iso_week_monday(str(k)))
-    all_start, all_end = tmp["mon"].min(), tmp["mon"].max()
-    all_df = aggregate_sources_from_history(sources_hist, all_start, all_end)
-    sources_summ["alltime"] = unify_sources_df(all_df)
-    sources_summ["labels"]["alltime"] = "всё время"
-else:
-    sources_summ["alltime"] = pd.DataFrame(columns=["source","reviews","avg10","pos_share","neg_share","pos","neu","neg"])
+    sources_summ.setdefault("labels", {})
     sources_summ["labels"]["alltime"] = "всё время"
 
-    
     # 5) собираем HTML
     head_html   = header_human_block(w_start, labels, week_agg, mtd_agg, qtd_agg, ytd_agg, deltas)
+    trend_html  = trends_text_block(hist_df, week_agg, w_start)
     topics_html = topics_table_html(topics_df, prev_topics_df)
     quotes_html = quotes_block(quotes)
     src_tbl     = sources_table_block(sources_summ, wk_src_avg)
     src_deltas  = sources_deltas_block(sources_summ, wk_src_avg)
 
-    html = head_html + topics_html + quotes_html + src_tbl + src_deltas
-    html += "<p><i>История и сравнения: листы <b>history</b>, <b>sources_history</b>, <b>topics_history</b>. Графики — во вложениях.</i></p>"
+    html = (
+        head_html + trend_html + topics_html + quotes_html + src_tbl + src_deltas +
+        "<p><i>История и сравнения: листы <b>history</b>, <b>sources_history</b>, <b>topics_history</b>. Графики — во вложениях.</i></p>"
+        + """
+<hr>
+<p><i>* Средняя /10 — средневзвешенная оценка по всем отзывам периода. Позитив/негатив — доля отзывов с положительной/отрицательной тональностью по тексту (и/или по оценке, если текст нейтрален). Δ — разница недели к соответствующему периоду; п.п. — процентные пункты. «На долю недели пришлось …» — вклад текущей недели в объём отзывов месяца/квартала/года.</i></p>
+<p><i>** В таблице по источникам оценки для TL: Marketing, Yandex (объединяет Яндекс и Яндекс Путешествия), TripAdvisor, 2GIS, Google, Trip.com показаны в 5-балльной шкале; для остальных — в 10-балльной. Расчёты выполняются в 10-балльной шкале, конвертация в 5-балльную — только для отображения.</i></p>
+"""
+    )
 
-    trend_html = trends_text_block(hist_df, week_agg, w_start)
-    html = head_html + trend_html + topics_html + quotes_html + src_tbl + src_deltas
-    
     # 6) графики
     charts = []
     p1 = "/tmp/ratings_trend.png"
@@ -791,6 +785,7 @@ else:
     # 7) письмо
     subject = f"ARTSTUDIO Nevsky. Анализ отзывов за неделю {w_start:%d.%m}–{w_end:%d.%m}"
     send_email(subject, html, attachments=charts)
+
 
 
 if __name__ == "__main__":
