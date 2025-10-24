@@ -182,6 +182,61 @@ def upsert_week(agg_week_df: pd.DataFrame) -> int:
             body={"values": rows_all}
         ).execute()
     return len(rows_new)
+def dedupe_surveys_history(hist_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Убираем дубли по (week_key,param):
+    - для param!='nps': weighted avg по avg5/avg10 (веса = responses), responses = MAX по дублям
+    - для param=='nps': promoters/detractors суммируем; responses = MAX; nps пересчитываем
+    """
+    if hist_df is None or hist_df.empty:
+        return hist_df
+
+    df = hist_df.copy()
+    # нормализация типов
+    for c in ["responses", "avg5", "avg10", "promoters", "detractors", "nps"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    def combine(grp: pd.DataFrame) -> pd.Series:
+        param = str(grp["param"].iloc[0])
+
+        if param == "nps":
+            prom = grp["promoters"].fillna(0).sum()
+            detr = grp["detractors"].fillna(0).sum()
+            resp = grp["responses"].fillna(0).max()  # не суммируем, чтобы не раздувать
+            nps_val = ((prom / resp) - (detr / resp)) * 100.0 if resp and resp > 0 else np.nan
+            return pd.Series({
+                "week_key": grp["week_key"].iloc[0],
+                "param": param,
+                "responses": resp if not np.isnan(resp) else None,
+                "avg5": None,
+                "avg10": None,
+                "promoters": int(prom),
+                "detractors": int(detr),
+                "nps": (None if np.isnan(nps_val) else float(round(nps_val, 1))),
+            })
+
+        # параметры: взвешенная средняя, responses = MAX
+        weights = grp["responses"].fillna(0)
+        wsum = float(weights.sum())
+        avg5 = float((grp["avg5"] * weights).sum() / wsum) if wsum > 0 else np.nan
+        avg10 = float((grp["avg10"] * weights).sum() / wsum) if wsum > 0 else np.nan
+        resp = float(weights.max())
+        return pd.Series({
+            "week_key": grp["week_key"].iloc[0],
+            "param": param,
+            "responses": (None if np.isnan(resp) else resp),
+            "avg5": (None if np.isnan(avg5) else round(avg5, 2)),
+            "avg10": (None if np.isnan(avg10) else round(avg10, 2)),
+            "promoters": None,
+            "detractors": None,
+            "nps": None,
+        })
+
+    out = (df.groupby(["week_key", "param"], as_index=False)
+             .apply(combine)
+             .reset_index(drop=True))
+    return out
 
 # =========================
 # Aggregation over periods
@@ -599,6 +654,7 @@ def main():
 
     # 2) История + периоды
     hist = gs_get_df(SURVEYS_TAB, "A:H")
+    hist = dedupe_surveys_history(hist)
     if hist.empty:
         raise RuntimeError("surveys_history пуст — нечего анализировать.")
     wk_key = str(agg_week["week_key"].iloc[0])
