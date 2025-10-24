@@ -60,7 +60,18 @@ def gs_get_df(tab: str, a1: str) -> pd.DataFrame:
     try:
         res = SHEETS.values().get(spreadsheetId=HISTORY_SHEET_ID, range=f"{tab}!{a1}").execute()
         vals = res.get("values", [])
-        return pd.DataFrame(vals[1:], columns=vals[0]) if len(vals)>1 else pd.DataFrame()
+        if len(vals) <= 1:
+            return pd.DataFrame()
+        df = pd.DataFrame(vals[1:], columns=vals[0])
+        
+        # Конвертация numeric колонок: replace ',' -> '.', to_numeric
+        numeric_cols = ['responses', 'avg5', 'avg10', 'promoters', 'detractors', 'nps']
+        for col in numeric_cols:
+            if col in df.columns:
+                df[col] = df[col].astype(str).str.replace(',', '.').replace('', np.nan)  # '' -> NaN
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+        
+        return df
     except Exception:
         return pd.DataFrame()
 
