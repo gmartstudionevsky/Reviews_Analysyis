@@ -196,7 +196,10 @@ def surveys_aggregate_period(history_df: pd.DataFrame, start: date, end: date) -
         'by_param': DataFrame[param,responses,avg5,avg10,promoters,detractors,nps],
         'totals': {'responses': int, 'overall5': float|None, 'nps': float|None}
       }
-    ВАЖНО: totals['responses'] = количество анкет (responses по param=='overall').
+    ВАЖНО:
+      - totals['responses'] = число анкет (responses по param=='overall')
+      - средние по параметрам взвешиваются по responses этого параметра
+      - NPS собирается из суммы по неделям, правило 1–2 D / 3–4 N / 5 P
     """
     if history_df.empty:
         return {"by_param": pd.DataFrame(columns=["param","responses","avg5","avg10","promoters","detractors","nps"]),
@@ -207,7 +210,7 @@ def surveys_aggregate_period(history_df: pd.DataFrame, start: date, end: date) -
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
 
-    # отфильтруем недели по календарю
+    # фильтр по датам
     df["monday"] = df["week_key"].map(week_monday_from_key)
     df = df[(df["monday"] >= start) & (df["monday"] <= end)].copy()
     if df.empty:
@@ -217,15 +220,14 @@ def surveys_aggregate_period(history_df: pd.DataFrame, start: date, end: date) -
     rows = []
     for param, grp in df.groupby("param"):
         resp = int(grp["responses"].fillna(0).sum())
-
         if param == "nps":
             prom = int(grp["promoters"].fillna(0).sum())
             detr = int(grp["detractors"].fillna(0).sum())
-            nps  = ( (prom / (resp or 1)) - (detr / (resp or 1)) ) * 100.0 if resp > 0 else np.nan
-            rows.append([param, resp, np.nan, np.nan, prom, detr, (None if np.isnan(nps) else round(float(nps), 1))])
+            nps  = ((prom/(resp or 1)) - (detr/(resp or 1))) * 100.0 if resp > 0 else np.nan
+            rows.append([param, resp, np.nan, np.nan, prom, detr, (None if np.isnan(nps) else round(float(nps),1))])
             continue
 
-        # взвешенные средние по /5 и /10 только по строкам, где средние заданы
+        # взвешенная средняя по /5 и /10 только по валидным строкам
         sub5  = grp[pd.notna(grp["avg5"]) & pd.notna(grp["responses"])]
         avg5  = (sub5["avg5"]  * sub5["responses"]).sum() / sub5["responses"].sum() if not sub5.empty else np.nan
         sub10 = grp[pd.notna(grp["avg10"]) & pd.notna(grp["responses"])]
@@ -240,18 +242,17 @@ def surveys_aggregate_period(history_df: pd.DataFrame, start: date, end: date) -
 
     by_param = pd.DataFrame(rows, columns=["param","responses","avg5","avg10","promoters","detractors","nps"]).sort_values("param")
 
-    # Итоги: число анкет берём ТОЛЬКО из overall (это корректно).
-    ov = by_param[by_param["param"] == "overall"]
-    totals_responses = int(ov["responses"].sum()) if not ov.empty else 0
-
+    # Итоги: число анкет берём ТОЛЬКО из overall (это и есть анкеты в неделях)
+    ov = by_param[by_param["param"]=="overall"]
     totals = {
-        "responses": totals_responses,
-        "overall5":  (None if ov.empty or pd.isna(ov.iloc[0]["avg5"]) else float(ov.iloc[0]["avg5"])),
-        "nps":       (None if by_param[by_param["param"]=="nps"].empty
-                      or pd.isna(by_param[by_param["param"]=="nps"].iloc[0]["nps"])
-                      else float(by_param[by_param["param"]=="nps"].iloc[0]["nps"]))
+        "responses": int(ov["responses"].sum()) if not ov.empty else 0,
+        "overall5": (None if ov.empty or pd.isna(ov.iloc[0]["avg5"]) else float(ov.iloc[0]["avg5"])),
+        "nps":      (None if by_param[by_param["param"]=="nps"].empty
+                     or pd.isna(by_param[by_param["param"]=="nps"].iloc[0]["nps"])
+                     else float(by_param[by_param["param"]=="nps"].iloc[0]["nps"]))
     }
     return {"by_param": by_param, "totals": totals}
+
 
 
 # =========================
