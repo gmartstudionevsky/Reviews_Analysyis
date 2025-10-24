@@ -162,17 +162,20 @@ def aggregate_sources_from_history(sources_df: pd.DataFrame, start_d: date, end_
 
     def agg_fn(g: pd.DataFrame):
         n = int(g["reviews"].sum())
+        pos = int(g["pos"].sum()); neu = int(g["neu"].sum()); neg = int(g["neg"].sum())
         return pd.Series({
             "reviews": n,
             "avg10": _weighted_avg(g["avg10"], g["reviews"]),
-            "pos": int(g["pos"].sum()),
-            "neu": int(g["neu"].sum()),
-            "neg": int(g["neg"].sum()),
-            "pos_share": _safe_pct(int(g["pos"].sum()), n),
-            "neg_share": _safe_pct(int(g["neg"].sum()), n),
+            "pos": pos, "neu": neu, "neg": neg,
+            "pos_share": _safe_pct(pos, n),
+            "neg_share": _safe_pct(neg, n),
         })
 
-    out = df.groupby("source", as_index=False).apply(agg_fn).reset_index(drop=True)
+    out = (
+        df.groupby("source", group_keys=False)  # без лишнего предупреждения
+          .apply(agg_fn)
+          .reset_index()
+    )
     return out.sort_values(["reviews","avg10"], ascending=[False, False])
 
 # --- Диапазоны «MTD/QTD/YTD» от недели + подписи
