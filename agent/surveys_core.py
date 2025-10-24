@@ -284,54 +284,82 @@ def dedupe_surveys_history(hist_df: pd.DataFrame) -> pd.DataFrame:
               .apply(combine).reset_index(drop=True))
 
 # ----------------- Аггрегирование периода (неделя/месяц/квартал/год) -----------------
-def surveys_aggregate_period(history_df: pd.DataFrame, start: date, end: date, iso_week_monday_fn) -> dict:
+def surveys_aggregate_period(history_df: pd.DataFrame, start: date, end: date) -> dict:
     """
-    Взвешенная агрегация по параметрам в [start; end].
-    Возвращает {'by_param': DF, 'totals': {...}}
+    Взвешенная агрегация по параметрам в календарном интервале [start; end].
+    Сначала coalesce дубликатов (week_key,param) -> одна строка с макс. responses,
+    потом периодное агрегирование.
     """
-    if history_df is None or history_df.empty:
+    if history_df.empty:
         return {"by_param": pd.DataFrame(columns=["param","responses","avg5","avg10","promoters","detractors","nps"]),
                 "totals": {"responses": 0, "overall5": None, "nps": None}}
 
     df = history_df.copy()
+    # приводим числовые
     for c in ["responses","avg5","avg10","promoters","detractors","nps"]:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
 
-    df["monday"] = df["week_key"].map(iso_week_monday_fn)
-    df = df[(df["monday"]>=start) & (df["monday"]<=end)].copy()
+    # фильтр по датам: map week_key -> monday
+    df["monday"] = df["week_key"].map(week_monday_from_key)
+    df = df[(df["monday"] >= start) & (df["monday"] <= end)].copy()
     if df.empty:
         return {"by_param": pd.DataFrame(columns=["param","responses","avg5","avg10","promoters","detractors","nps"]),
                 "totals": {"responses": 0, "overall5": None, "nps": None}}
 
-    rows=[]
-    for param, grp in df.groupby("param"):
-        resp = int(grp["responses"].fillna(0).sum())
+    # --- COALESCE: одна строка на (week_key,param)
+    def pick_rep(g: pd.DataFrame) -> pd.Series:
+        # берём строку с максимальным responses как «эталон» недели
+        g = g.copy()
+        g["responses"] = pd.to_numeric(g["responses"], errors="coerce")
+        idx = g["responses"].fillna(0).astype(float).idxmax()
+        row = g.loc[idx, ["week_key","param","responses","avg5","avg10","promoters","detractors","nps"]]
+        return row
+
+    co = (df.groupby(["week_key","param"], as_index=False, group_keys=False)
+            .apply(pick_rep)
+            .reset_index(drop=True))
+
+    rows = []
+    for param, grp in co.groupby("param"):
+        resp_sum = int(grp["responses"].fillna(0).sum())
+
         if param == "nps":
             prom = int(grp["promoters"].fillna(0).sum())
             detr = int(grp["detractors"].fillna(0).sum())
-            nps  = ((prom/(resp or 1)) - (detr/(resp or 1))) * 100.0 if resp>0 else np.nan
-            rows.append([param, resp, np.nan, np.nan, prom, detr, (None if np.isnan(nps) else round(float(nps),1))])
+            nps  = ((prom/(resp_sum or 1)) - (detr/(resp_sum or 1))) * 100.0 if resp_sum > 0 else math.nan
+            rows.append([param, resp_sum, None, None, prom, detr, (None if (nps!=nps) else round(float(nps),1))])
             continue
-        sub5  = grp[pd.notna(grp["avg5"])  & pd.notna(grp["responses"])]
-        sub10 = grp[pd.notna(grp["avg10"]) & pd.notna(grp["responses"])]
-        avg5  = (sub5["avg5"]  * sub5["responses"]).sum()/sub5["responses"].sum() if not sub5.empty else np.nan
-        avg10 = (sub10["avg10"]* sub10["responses"]).sum()/sub10["responses"].sum() if not sub10.empty else np.nan
-        rows.append([param, resp,
-                     (None if (isinstance(avg5,float) and np.isnan(avg5)) else round(float(avg5),2)),
-                     (None if (isinstance(avg10,float)and np.isnan(avg10)) else round(float(avg10),2)),
-                     None,None,None])
 
-    by_param = pd.DataFrame(rows, columns=["param","responses","avg5","avg10","promoters","detractors","nps"]).sort_values("param")
+        # взвешенные средние по /5 и /10
+        sub5  = grp.dropna(subset=["avg5","responses"])
+        if not sub5.empty and sub5["responses"].sum() > 0:
+            avg5  = (sub5["avg5"]  * sub5["responses"]).sum() / sub5["responses"].sum()
+            avg10 = avg5 * 2.0
+        else:
+            avg5 = avg10 = math.nan
+
+        rows.append([
+            param, resp_sum,
+            (None if (isinstance(avg5, float) and math.isnan(avg5)) else round(float(avg5), 2)),
+            (None if (isinstance(avg10, float) and math.isnan(avg10)) else round(float(avg10), 2)),
+            None, None, None
+        ])
+
+    by_param = (pd.DataFrame(rows, columns=["param","responses","avg5","avg10","promoters","detractors","nps"])
+                  .sort_values("param"))
+
+    # Итоги: число анкет берём из overall (это и есть анкеты), NPS из строки nps
     ov = by_param[by_param["param"]=="overall"]
+    nps_row = by_param[by_param["param"]=="nps"]
+
     totals = {
         "responses": int(ov["responses"].sum()) if not ov.empty else 0,
         "overall5": (None if ov.empty or pd.isna(ov.iloc[0]["avg5"]) else float(ov.iloc[0]["avg5"])),
-        "nps":      (None if by_param[by_param["param"]=="nps"].empty
-                     or pd.isna(by_param[by_param["param"]=="nps"].iloc[0]["nps"])
-                     else float(by_param[by_param["param"]=="nps"].iloc[0]["nps"])),
+        "nps":      (None if nps_row.empty or pd.isna(nps_row.iloc[0]["nps"]) else float(nps_row.iloc[0]["nps"]))
     }
     return {"by_param": by_param, "totals": totals}
+
 
 
     # --- Фасад: из сырых данных -> (нормализованный DF, недельные агрегаты) ---
