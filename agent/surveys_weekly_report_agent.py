@@ -148,18 +148,20 @@ def gs_append(tab: str, a1: str, rows: list[list]):
 SURVEYS_HEADER = ["week_key","param","responses","avg5","avg10","promoters","detractors","nps"]
 
 def rows_from_agg(df: pd.DataFrame) -> list[list]:
-    out=[]
+    df = df.replace({np.nan: None})  # Replace np.nan with None to avoid JSON serialization issues
+    rows = []
     for _, r in df.iterrows():
-        out.append([
-            str(r["week_key"]), str(r["param"]),
+        rows.append([
+            str(r["week_key"]),
+            str(r["param"]),
             int(r["responses"]) if pd.notna(r["responses"]) else 0,
-            (None if pd.isna(r["avg5"])  else float(r["avg5"])),
-            (None if pd.isna(r["avg10"]) else float(r["avg10"])),
-            (None if "promoters"  not in r or pd.isna(r["promoters"])  else int(r["promoters"])),
-            (None if "detractors" not in r or pd.isna(r["detractors"]) else int(r["detractors"])),
-            (None if "nps"        not in r or pd.isna(r["nps"])        else float(r["nps"])),
+            None if pd.isna(r["avg5"]) else float(r["avg5"]),
+            None if pd.isna(r["avg10"]) else float(r["avg10"]),
+            None if "promoters" not in r or pd.isna(r["promoters"]) else int(r["promoters"]),
+            None if "detractors" not in r or pd.isna(r["detractors"]) else int(r["detractors"]),
+            None if "nps" not in r or pd.isna(r["nps"]) else float(r["nps"]),
         ])
-    return out
+    return rows
 
 def upsert_week(agg_week_df: pd.DataFrame) -> int:
     """
