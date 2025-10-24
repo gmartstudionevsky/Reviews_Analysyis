@@ -27,30 +27,22 @@ try:
         period_ranges_for_week, prev_period_ranges,
         aggregate_weeks_from_history, deltas_week_vs_period,
         role_of_week_in_period, sources_summary_for_periods,
-        week_label, month_label, quarter_label, year_label
+        week_label, month_label, quarter_label, year_label,
+        _weighted_avg, _safe_pct,   # <<< добавили
     )
 except ModuleNotFoundError:
     # fallback, если файл запущен как скрипт и пакет 'agent' не найден
     import os, sys
     sys.path.append(os.path.dirname(__file__))
     from metrics_core import (
-        HISTORY_TAB, TOPICS_TAB, SOURCES_TAB, SURVEYS_TAB,
+        HISTORY_TAB, TOPICS_TAB, SOURVEYS_TAB, SOURCES_TAB,
         iso_week_monday, week_range_for_monday,
         period_ranges_for_week, prev_period_ranges,
         aggregate_weeks_from_history, deltas_week_vs_period,
         role_of_week_in_period, sources_summary_for_periods,
-        week_label, month_label, quarter_label, year_label
+        week_label, month_label, quarter_label, year_label,
+        _weighted_avg, _safe_pct,   # <<< добавили
     )
-
-# --- наше ядро метрик / периодов ---
-from agent.metrics_core import (
-    HISTORY_TAB, TOPICS_TAB, SOURCES_TAB, SURVEYS_TAB,
-    iso_week_monday, week_range_for_monday,
-    period_ranges_for_week, prev_period_ranges,
-    aggregate_weeks_from_history, deltas_week_vs_period,
-    role_of_week_in_period, sources_summary_for_periods,
-    week_label, month_label, quarter_label, year_label
-)
 
 # ======================================
 # ENV / Google API clients / constants
@@ -700,6 +692,9 @@ def main():
 
     df = load_reviews_df(tmp)
     wk_df, week_agg = analyze_week(df, w_start, w_end)
+    # средние по источникам за текущую неделю (ключи нормализованы)
+    wk_src_avg_raw = wk_df.groupby("Источник")["_rating10"].mean().round(2).to_dict()
+    wk_src_avg = { normalize_source_name(k): float(v) for k, v in wk_src_avg_raw.items() }
     wk_src_avg = (
         wk_df.groupby("Источник")["_rating10"].mean().round(2).to_dict()
     )
@@ -768,25 +763,24 @@ else:
     html = head_html + trend_html + topics_html + quotes_html + src_tbl + src_deltas
     
     # 6) графики
-    charts=[]
-    p1="/tmp/ratings_trend.png"; plot_ratings_reviews_trend(hist_df, p1); charts.append(p1)
-    p2="/tmp/topics_trends.png"; plot_topics_trend(topics_hist, p2);  charts.append(p2)
-    a="/tmp/sources_avg.png"; v="/tmp/sources_vol.png"; 
-    a,v = plot_sources_trends(sources_hist, a, v); 
+    charts = []
+    p1 = "/tmp/ratings_trend.png"
+    plot_ratings_reviews_trend(hist_df, p1); charts.append(p1)
+
+    p2 = "/tmp/topics_trends.png"
+    plot_topics_trend(topics_hist, p2); charts.append(p2)
+
+    a = "/tmp/sources_avg.png"
+    v = "/tmp/sources_vol.png"
+    a, v = plot_sources_trends(sources_hist, a, v)
     if a: charts.append(a)
     if v: charts.append(v)
     charts = [p for p in charts if p and os.path.exists(p)]
 
-html += """
-<hr>
-<p><i>* Средняя /10 — средневзвешенная оценка по всем отзывам периода. Позитив/негатив — доля отзывов с положительной/отрицательной тональностью по тексту (и/или по оценке, если текст нейтрален). Δ — разница недели к соответствующему периоду; п.п. — процентные пункты. «На долю недели пришлось …» — вклад текущей недели в объём отзывов месяца/квартала/года.</i></p>
-<p><i>** В таблице по источникам оценки для TL: Marketing, Yandex (объединяет Яндекс и Яндекс Путешествия), TripAdvisor, 2GIS, Google, Trip.com показаны в 5-балльной шкале; для остальных источников — в 10-балльной. Все расчёты выполняются в 10-балльной шкале, конвертация в 5-балльную — только для отображения.</i></p>
-"""
-
-
     # 7) письмо
     subject = f"ARTSTUDIO Nevsky. Анализ отзывов за неделю {w_start:%d.%m}–{w_end:%d.%m}"
     send_email(subject, html, attachments=charts)
+
 
 if __name__ == "__main__":
     main()
