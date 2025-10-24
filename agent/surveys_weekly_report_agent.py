@@ -362,7 +362,7 @@ def plot_radar_params(week_df: pd.DataFrame, month_df: pd.DataFrame, path_png: s
         mp={}
         for _, r in df.iterrows():
             p = str(r["param"])
-            if p == "nps": 
+            if p == "nps":
                 continue
             mp[p] = float(r["avg5"]) if pd.notna(r["avg5"]) else np.nan
         return mp
@@ -376,36 +376,43 @@ def plot_radar_params(week_df: pd.DataFrame, month_df: pd.DataFrame, path_png: s
         "atmosphere","location","value","would_return"
     ] if (p in W or p in M)]
 
-    if not order:
+    # минимум 3 показателя, иначе радар неинформативен
+    if len(order) < 3:
         return None
 
     labels = [PARAM_TITLES.get(p, p) for p in order]
     wvals  = [W.get(p, np.nan) for p in order]
     mvals  = [M.get(p, np.nan) for p in order]
 
-    # замыкаем круг
-    labels += labels[:1]
-    wvals  += wvals[:1]
-    mvals  += mvals[:1]
+    # углы для N осей
+    N = len(order)
+    angles = np.linspace(0, 2*np.pi, N, endpoint=False)
 
-    angles = np.linspace(0, 2*np.pi, len(labels), endpoint=False).tolist()
-    angles += angles[:1]
+    # замыкаем только линии данных и угол
+    angles_closed = np.concatenate([angles, [angles[0]]])
+    w_closed = np.array(wvals + [wvals[0]])
+    m_closed = np.array(mvals + [mvals[0]])
 
     fig = plt.figure(figsize=(7.5, 6.5))
     ax = plt.subplot(111, polar=True)
     ax.set_theta_offset(np.pi / 2)
     ax.set_theta_direction(-1)
-    ax.set_thetagrids(np.degrees(angles[:-1]), labels, fontsize=9)
+
+    # подписи только для N осей
+    ax.set_thetagrids(np.degrees(angles), labels, fontsize=9)
+
     ax.set_rlabel_position(0)
     ax.set_ylim(0, 5)
 
-    ax.plot(angles, wvals, marker="o", linewidth=1, label="Неделя")
-    ax.fill(angles, wvals, alpha=0.1)
-    ax.plot(angles, mvals, marker="o", linewidth=1, linestyle="--", label="Текущий месяц")
-    ax.fill(angles, mvals, alpha=0.1)
+    ax.plot(angles_closed, w_closed, marker="o", linewidth=1, label="Неделя")
+    ax.fill(angles_closed, w_closed, alpha=0.1)
+    ax.plot(angles_closed, m_closed, marker="o", linewidth=1, linestyle="--", label="Текущий месяц")
+    ax.fill(angles_closed, m_closed, alpha=0.1)
+
     ax.set_title("Анкеты: параметры (Неделя vs Текущий месяц), шкала /5")
     ax.legend(loc="upper right", bbox_to_anchor=(1.25, 1.1))
     plt.tight_layout(); plt.savefig(path_png); plt.close(); return path_png
+
 
 def plot_params_heatmap(history_df: pd.DataFrame, path_png: str):
     """
