@@ -172,10 +172,10 @@ def aggregate_sources_from_history(sources_df: pd.DataFrame, start_d: date, end_
         })
 
     out = (
-        df.groupby("source", group_keys=False)  # без лишнего предупреждения
-          .apply(agg_fn)
+        df.groupby("source", group_keys=False)
+          .apply(agg_fn, include_groups=False)  # подавляем DeprecationWarning
           .reset_index()
-    )
+    )    
     return out.sort_values(["reviews","avg10"], ascending=[False, False])
 
 # --- Диапазоны «MTD/QTD/YTD» от недели + подписи
