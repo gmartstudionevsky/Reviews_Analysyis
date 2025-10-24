@@ -1,4 +1,5 @@
 # agent/surveys_backfill_agent.py
+import json
 import os, io, re, sys, datetime as dt
 from datetime import date
 import pandas as pd
@@ -21,9 +22,16 @@ SCOPES = [
     "https://www.googleapis.com/auth/drive.readonly",
     "https://www.googleapis.com/auth/spreadsheets",
 ]
-CREDS = Credentials.from_service_account_file(
-    os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"], scopes=SCOPES
-)
+
+# поддержка двух способов: файл (GOOGLE_SERVICE_ACCOUNT_JSON) или прямой контент (GOOGLE_SERVICE_ACCOUNT_JSON_CONTENT)
+SA_PATH    = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
+SA_CONTENT = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON_CONTENT")
+
+if SA_CONTENT and SA_CONTENT.strip().startswith("{"):
+    CREDS = Credentials.from_service_account_info(json.loads(SA_CONTENT), scopes=SCOPES)
+else:
+    CREDS = Credentials.from_service_account_file(SA_PATH, scopes=SCOPES)
+
 DRIVE  = build("drive",  "v3", credentials=CREDS)
 SHEETS = build("sheets", "v4", credentials=CREDS).spreadsheets()
 
