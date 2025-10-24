@@ -332,3 +332,15 @@ def surveys_aggregate_period(history_df: pd.DataFrame, start: date, end: date, i
                      else float(by_param[by_param["param"]=="nps"].iloc[0]["nps"])),
     }
     return {"by_param": by_param, "totals": totals}
+
+
+    # --- Фасад: из сырых данных -> (нормализованный DF, недельные агрегаты) ---
+def parse_and_aggregate_weekly(df_raw: pd.DataFrame):
+    """
+    Совместимость со старыми агентами:
+    возвращает (norm_df, weekly_agg_df)
+    """
+    norm = normalize_surveys_df(df_raw)
+    agg  = weekly_aggregate(norm)
+    return norm, agg
+
