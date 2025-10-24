@@ -107,41 +107,44 @@ def aggregate_weeks_from_history(history_df: pd.DataFrame, start_d: date, end_d:
     Берёт лист history, фильтрует строки типа 'week' по диапазону (по понедельникам) и
     возвращает сводку: reviews, avg10 (взвеш.), pos, neu, neg, pos_share, neg_share.
     """
+    empty = {"reviews": 0, "avg10": None, "pos": 0, "neu": 0, "neg": 0, "pos_share": None, "neg_share": None}
     if history_df is None or history_df.empty:
-        return {"reviews":0,"avg10":None,"pos":0,"neu":0,"neg":0,"pos_share":None,"neg_share":None}
+        return empty
 
-    wk = history_df[history_df["period_type"]=="week"].copy()
+    wk = history_df[history_df["period_type"] == "week"].copy()
     if wk.empty:
-        return {"reviews":0,"avg10":None,"pos":0,"neu":0,"neg":0,"pos_share":None,"neg_share":None}
+        return empty
 
-    # числовые
-    for c in ["reviews","avg10","pos","neu","neg"]:
-    wk[c] = pd.to_numeric(wk[c].astype(str).str.replace(",", ".", regex=False), errors="coerce")
+    # числовые: приводим к float, понимаем запятую
+    for c in ["reviews", "avg10", "pos", "neu", "neg"]:
+        wk[c] = pd.to_numeric(wk[c].astype(str).str.replace(",", ".", regex=False), errors="coerce")
 
-    # фильтр по дате понедельника
+    # фильтр по дате понедельника (из period_key 'YYYY-Wxx')
     def in_range(k):
         try:
             mon = iso_week_monday(str(k))
             return (mon >= start_d) and (mon <= end_d)
         except:
             return False
+
     wk = wk[wk["period_key"].apply(in_range)]
     if wk.empty:
-        return {"reviews":0,"avg10":None,"pos":0,"neu":0,"neg":0,"pos_share":None,"neg_share":None}
+        return empty
 
-    n = int(pd.to_numeric(wk["reviews"], errors="coerce").sum())
+    n = int(wk["reviews"].sum())
     avg10 = _weighted_avg(wk["avg10"], wk["reviews"])
-    pos = int(pd.to_numeric(wk["pos"], errors="coerce").sum())
-    neu = int(pd.to_numeric(wk["neu"], errors="coerce").sum())
-    neg = int(pd.to_numeric(wk["neg"], errors="coerce").sum())
+    pos = int(wk["pos"].sum())
+    neu = int(wk["neu"].sum())
+    neg = int(wk["neg"].sum())
     return {
         "reviews": n,
         "avg10": avg10,
-        "pos": pos, "neu": neu, "neg": neg,
+        "pos": pos,
+        "neu": neu,
+        "neg": neg,
         "pos_share": _safe_pct(pos, n),
         "neg_share": _safe_pct(neg, n),
     }
-
 def role_of_week_in_period(week_agg: dict, period_agg: dict) -> float | None:
     """Доля отзывов недели от агрегата периода, %."""
     if not week_agg or not period_agg: 
@@ -154,38 +157,44 @@ def aggregate_sources_from_history(sources_df: pd.DataFrame, start_d: date, end_
     На вход df листа sources_history: week_key | source | reviews | avg10 | pos | neu | neg
     Возвращает df с метриками по каждому источнику за указанный диапазон дат.
     """
-    cols = {"week_key","source","reviews","avg10","pos","neu","neg"}
+    cols = {"week_key", "source", "reviews", "avg10", "pos", "neu", "neg"}
     if sources_df is None or sources_df.empty or not cols.issubset(set(sources_df.columns)):
-        return pd.DataFrame(columns=["source","reviews","avg10","pos_share","neg_share","pos","neu","neg"])
+        return pd.DataFrame(columns=["source", "reviews", "avg10", "pos_share", "neg_share", "pos", "neu", "neg"])
 
     df = sources_df.copy()
+
     # типы и фильтр по датам
     df["mon"] = df["week_key"].map(lambda k: iso_week_monday(str(k)))
-    df = df[(df["mon"]>=start_d) & (df["mon"]<=end_d)].copy()
+    df = df[(df["mon"] >= start_d) & (df["mon"] <= end_d)].copy()
     if df.empty:
-        return pd.DataFrame(columns=["source","reviews","avg10","pos_share","neg_share","pos","neu","neg"])
+        return pd.DataFrame(columns=["source", "reviews", "avg10", "pos_share", "neg_share", "pos", "neu", "neg"])
 
-    for c in ["reviews","avg10","pos","neu","neg"]:
-    df[c] = pd.to_numeric(df[c].astype(str).str.replace(",", ".", regex=False), errors="coerce")
-
+    for c in ["reviews", "avg10", "pos", "neu", "neg"]:
+        df[c] = pd.to_numeric(df[c].astype(str).str.replace(",", ".", regex=False), errors="coerce")
 
     def agg_fn(g: pd.DataFrame):
         n = int(g["reviews"].sum())
-        pos = int(g["pos"].sum()); neu = int(g["neu"].sum()); neg = int(g["neg"].sum())
+        pos = int(g["pos"].sum())
+        neu = int(g["neu"].sum())
+        neg = int(g["neg"].sum())
         return pd.Series({
             "reviews": n,
             "avg10": _weighted_avg(g["avg10"], g["reviews"]),
-            "pos": pos, "neu": neu, "neg": neg,
+            "pos": pos,
+            "neu": neu,
+            "neg": neg,
             "pos_share": _safe_pct(pos, n),
             "neg_share": _safe_pct(neg, n),
         })
 
-    out = (
-        df.groupby("source", group_keys=False)
-          .apply(agg_fn, include_groups=False)  # подавляем DeprecationWarning
-          .reset_index()
-    )    
-    return out.sort_values(["reviews","avg10"], ascending=[False, False])
+    # group_keys=False — чтобы не было лишнего уровня индекса; include_groups=False — подавляет будущий DeprecationWarning (если поддерживается)
+    try:
+        out = df.groupby("source", group_keys=False).apply(agg_fn, include_groups=False).reset_index()
+    except TypeError:
+        # на старой pandas параметр include_groups отсутствует
+        out = df.groupby("source", group_keys=False).apply(agg_fn).reset_index()
+
+    return out.sort_values(["reviews", "avg10"], ascending=[False, False])
 
 # --- Диапазоны «MTD/QTD/YTD» от недели + подписи
 def period_ranges_for_week(week_start: date) -> dict:
