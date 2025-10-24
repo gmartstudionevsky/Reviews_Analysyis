@@ -68,7 +68,10 @@ PARAM_ALIASES: Dict[str, List[str]] = {
         "nps (1-5)",
     ],
     # служебные/контактные
-    "survey_date": ["Дата анкетирования", "Дата опроса", "Дата"],
+    "survey_date": [
+        "Дата анкетирования", "Дата прохождения опроса", "Дата заполнения",
+        "Дата и время", "Дата опроса", "Дата", "Дата анкеты"
+    ],
     "comment": ["Комментарий гостя", "Комментарий", "Отзыв"],
     "fio": ["ФИО", "Имя", "Имя гостя"],
     "booking": ["Номер брони", "Бронь", "Бронирование"],
@@ -87,22 +90,34 @@ PARAM_ORDER: List[str] = [
 
 # ====== Утилиты ======
 def _colkey(s: str) -> str:
-    """нормализуем имя колонки: нижний регистр, убираем лишние пробелы/nbsp"""
-    return re.sub(r"\s+", " ", str(s).replace("\u00a0", " ").strip().lower())
+    """Нормализуем имя колонки: нижний регистр, убираем NBSP/повторы пробелов и лишнюю пунктуацию."""
+    t = str(s).replace("\u00a0", " ").strip().lower()
+    t = re.sub(r"\s+", " ", t)
+    t = re.sub(r"[^\w\sа-яё]", " ", t)  # убираем пунктуацию, оставляем буквы/цифры/пробел
+    t = re.sub(r"\s+", " ", t)
+    return t.strip()
 
 def _find_col(df: pd.DataFrame, aliases: List[str]) -> str | None:
     low = {_colkey(c): c for c in df.columns}
+    # прямые совпадения
     for a in aliases:
         k = _colkey(a)
         if k in low:
             return low[k]
-    # поможем себе «содержанием»
+    # по подстроке (после нормализации)
     for a in aliases:
-        pat = re.escape(_colkey(a))
+        k = _colkey(a)
         for lk, orig in low.items():
-            if re.search(pat, lk):
+            if k and k in lk:
+                return orig
+    # ещё одна попытка: каждое слово из алиаса должно встретиться
+    for a in aliases:
+        words = [w for w in _colkey(a).split() if len(w) > 1]
+        for lk, orig in low.items():
+            if all(w in lk for w in words):
                 return orig
     return None
+
 
 def _num5(x):
     """приводим к шкале /5 (float), понимаем '4,5' и '—'."""
@@ -162,7 +177,26 @@ def normalize_surveys_df(df0: pd.DataFrame) -> pd.DataFrame:
 
     # обязательные поля: дата + хотя бы один параметр
     if "survey_date" not in cols:
-        raise RuntimeError("В файле не найдена колонка с датой анкетирования.")
+        # эвристика: ищем колонку, где >= 50% строк парсятся как дата
+        best = None
+        best_hits = 0
+        n = len(df)
+        for c in df.columns:
+            try:
+                parsed = pd.to_datetime(df[c], errors="coerce", dayfirst=True)
+                hits = int(parsed.notna().sum())
+                if hits > best_hits and hits >= max(5, int(0.5 * n)):
+                    best, best_hits = c, hits
+            except Exception:
+                continue
+        if best:
+            cols["survey_date"] = best
+        else:
+            raise RuntimeError(
+                "В файле не найдена колонка с датой анкетирования. "
+                "Проверьте заголовок столбца с датой (например: «Дата анкетирования»)."
+            )
+
     # формируем результирующий df
     out = pd.DataFrame()
     out["date"] = df[cols["survey_date"]].map(_parse_date_any)
