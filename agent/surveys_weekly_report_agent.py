@@ -651,8 +651,8 @@ def main():
     df_raw = choose_surveys_sheet(xls)
 
     norm, agg_week = parse_and_aggregate_weekly(df_raw)  # agg_week: week_key|param|responses|avg5|avg10|promoters|detractors|nps
-    upserted = upsert_week(agg_week)
-    print(f"[INFO] surveys_weekly: upserted {upserted} rows for {SURVEYS_TAB}")
+    added = append_week_if_needed(agg_week)
+    print(f"[INFO] surveys_weekly: appended {added} new rows into {SURVEYS_TAB}")
 
     # 2) История + периоды
     hist = gs_get_df(SURVEYS_TAB, "A:H")
