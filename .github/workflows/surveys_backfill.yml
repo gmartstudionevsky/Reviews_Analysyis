@@ -1,11 +1,11 @@
-name: Surveys Backfill
+name: Run surveys backfill
+  env:
+    GOOGLE_SERVICE_ACCOUNT_JSON_CONTENT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}  # <- сам JSON целиком
+    DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
+    SHEETS_HISTORY_ID: ${{ secrets.SHEETS_HISTORY_ID }}
+  run: |
+    python -m agent.surveys_backfill_agent
 
-on:
-  workflow_dispatch: {}
-
-jobs:
-  run:
-    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: Setup Python
