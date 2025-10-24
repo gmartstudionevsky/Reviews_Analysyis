@@ -314,7 +314,7 @@ def fmt_int(x):   return "—" if x is None else str(int(x))
 
 # --- источники, которые показываем в 5-балльной шкале (для всех периодов в таблице)
 SOURCES_5PT = {
-    "TL: Marketing", "Yandex", "Яндекс Путешествия", "TripAdvisor", "2GIS", "Google", "Trip.com"
+    "TL: Marketing", "Yandex", "Яндекс Путешествия", "TripAdvisor", "2GIS", "Google", "Trip.com"
 }
 
 def normalize_source_name(s: str) -> str:
@@ -766,21 +766,131 @@ def main():
 <p><i>** В таблице по источникам оценки для TL: Marketing, Yandex (объединяет Яндекс и Яндекс Путешествия), TripAdvisor, 2GIS, Google, Trip.com показаны в 5-балльной шкале; для остальных — в 10-балльной. Расчёты выполняются в 10-балльной шкале, конвертация в 5-балльную — только для отображения.</i></p>
 """
     )
+    
+    # 6) Charts
 
-    # 6) графики
-    charts = []
-    p1 = "/tmp/ratings_trend.png"
-    plot_ratings_reviews_trend(hist_df, p1); charts.append(p1)
+    def _week_order_key(k):
+        try:
+            y, w = str(k).split("-W")
+            return int(y) * 100 + int(w)
+        except:
+            return 0
 
-    p2 = "/tmp/topics_trends.png"
-    plot_topics_trend(topics_hist, p2); charts.append(p2)
+    def plot_weekly_rating_trend_with_benchmarks(history_df, mtd_agg, qtd_agg, ytd_agg, path_png):
+        wk = history_df[history_df["period_type"] == "week"].copy()
+        if wk.empty: return None
+        wk["avg10"]   = pd.to_numeric(wk["avg10"].astype(str).str.replace(",", ".", regex=False), errors="coerce")
+        wk = wk.sort_values(by="period_key", key=lambda s: s.map(_week_order_key)).tail(12)
+        if wk.empty: return None
 
-    a = "/tmp/sources_avg.png"
-    v = "/tmp/sources_vol.png"
-    a, v = plot_sources_trends(sources_hist, a, v)
-    if a: charts.append(a)
-    if v: charts.append(v)
-    charts = [p for p in charts if p and os.path.exists(p)]
+    # 4-недельное скользящее среднее
+    roll = wk["avg10"].rolling(window=4, min_periods=2).mean()
+
+    x = wk["period_key"]
+    y = wk["avg10"]
+
+    fig, ax = plt.subplots(figsize=(10, 4.8))
+    ax.plot(x, y, marker="o", label="Недельная средняя /10")
+    ax.plot(x, roll, linestyle="--", label="Скользящая (4 недели)")
+
+    # бенчмарки периода на конец недели
+    if mtd_agg.get("avg10") is not None:
+        ax.axhline(mtd_agg["avg10"], linewidth=1, linestyle=":", label=f"Текущий месяц: {fmt_avg(mtd_agg['avg10'])}")
+    if qtd_agg.get("avg10") is not None:
+        ax.axhline(qtd_agg["avg10"], linewidth=1, linestyle="--", label=f"Текущий квартал: {fmt_avg(qtd_agg['avg10'])}")
+    if ytd_agg.get("avg10") is not None:
+        ax.axhline(ytd_agg["avg10"], linewidth=1, linestyle="-.", label=f"Текущий год: {fmt_avg(ytd_agg['avg10'])}")
+
+    ax.set_ylabel("Средняя /10"); ax.set_title("Недельная динамика оценки (12 недель)")
+    ax.legend(); plt.xticks(rotation=45); plt.tight_layout()
+    plt.savefig(path_png); plt.close(); return path_png
+
+    def plot_sentiment_share_trend(history_df, path_png):
+        wk = history_df[history_df["period_type"] == "week"].copy()
+        if wk.empty: return None
+        for c in ["pos","neu","neg"]:
+            wk[c] = pd.to_numeric(wk[c].astype(str).str.replace(",", ".", regex=False), errors="coerce")
+        wk["total"] = wk[["pos","neu","neg"]].sum(axis=1)
+        wk = wk.sort_values(by="period_key", key=lambda s: s.map(_week_order_key)).tail(12)
+        if wk.empty: return None
+
+    x = np.arange(len(wk))
+    pos = (wk["pos"] / wk["total"]).fillna(0).values
+    neu = (wk["neu"] / wk["total"]).fillna(0).values
+    neg = (wk["neg"] / wk["total"]).fillna(0).values
+
+    fig, ax = plt.subplots(figsize=(10, 4.8))
+    ax.bar(x, pos, label="Позитив")
+    ax.bar(x, neu, bottom=pos, label="Нейтрал")
+    ax.bar(x, neg, bottom=pos+neu, label="Негатив")
+    ax.set_ylim(0, 1.0); ax.set_yticks([0,0.25,0.5,0.75,1.0]); ax.set_yticklabels(["0%","25%","50%","75%","100%"])
+    ax.set_xticks(x); ax.set_xticklabels(wk["period_key"], rotation=45)
+    ax.set_title("Доли тональностей по неделям (100%)"); ax.legend(); plt.tight_layout()
+    plt.savefig(path_png); plt.close(); return path_png
+
+    def plot_topics_heatmap(topics_hist, path_png):
+        if topics_hist.empty: return None
+        th = topics_hist.rename(columns={"neg_text_share_pct":"neg"}).copy()
+        th["mentions"] = pd.to_numeric(th["mentions"], errors="coerce")
+        th["neg"] = pd.to_numeric(th["neg"], errors="coerce")
+
+    # недавние 8 недель и топ-6 тем по сумме упоминаний
+    weeks = sorted(th["week_key"].unique(), key=_week_order_key)[-8:]
+    th = th[th["week_key"].isin(weeks)]
+    top_topics = (th.groupby("topic")["mentions"].sum().sort_values(ascending=False).head(6).index.tolist())
+    th = th[th["topic"].isin(top_topics)]
+
+    if th.empty: return None
+    weeks = sorted(th["week_key"].unique(), key=_week_order_key)
+    topics = top_topics  # уже в порядке убывания упоминаний
+
+    # матрица "доля негатива по теме, %"
+    mat = np.zeros((len(topics), len(weeks)))
+    for i, tp in enumerate(topics):
+        for j, wk in enumerate(weeks):
+            v = th[(th["topic"]==tp) & (th["week_key"]==wk)]["neg"]
+            mat[i, j] = float(v.iloc[0]) if len(v) else 0.0
+
+    fig, ax = plt.subplots(figsize=(10, 4.8))
+    im = ax.imshow(mat, aspect="auto")
+    ax.set_yticks(np.arange(len(topics))); ax.set_yticklabels(topics)
+    ax.set_xticks(np.arange(len(weeks)));  ax.set_xticklabels(weeks, rotation=45)
+    ax.set_title("Темы: доля негатива по неделям (%)")
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    plt.tight_layout(); plt.savefig(path_png); plt.close(); return path_png
+
+    def plot_sources_bubble_mtd_vs_prev(summ, path_png):
+        M = summ.get("mtd"); PM = summ.get("prev_month")
+        if M is None or M.empty: return None
+        # нормализация
+        for df in (M, PM):
+            if df is not None and not df.empty:
+                for c in ["reviews","avg10"]:
+                    df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    # карта прошлых средних
+    pm = {str(r["source"]): float(r["avg10"]) if pd.notna(r["avg10"]) else np.nan for _, r in (PM.iterrows() if PM is not None else [])}
+    rows = []
+    for _, r in M.iterrows():
+        src = str(r["source"])
+        avg = float(r["avg10"]) if pd.notna(r["avg10"]) else np.nan
+        rev = int(r["reviews"]) if pd.notna(r["reviews"]) else 0
+        delta = avg - pm.get(src, np.nan) if not np.isnan(avg) and not np.isnan(pm.get(src, np.nan)) else np.nan
+        rows.append((src, avg, delta, rev))
+
+    if not rows: return None
+    srcs, y, x, s = zip(*rows)
+    s = np.array(s, dtype=float); s = 200 * (s / (s.max() if s.max() else 1.0))  # масштаб пузырей
+
+    fig, ax = plt.subplots(figsize=(10, 5.2))
+    ax.scatter(x, y, s=s, alpha=0.6)
+    for i, src in enumerate(srcs):
+        ax.annotate(src, (x[i], y[i]), xytext=(5,5), textcoords="offset points", fontsize=9)
+    ax.axvline(0, linestyle=":", linewidth=1)  # раздел: лучше/хуже прошлого месяца
+    ax.set_xlabel("Δ к прошлому месяцу (средняя /10)")
+    ax.set_ylabel("Текущий месяц, средняя /10")
+    ax.set_title("Источники: где мы выиграли/проиграли (размер = объём MTD)")
+    plt.tight_layout(); plt.savefig(path_png); plt.close(); return path_png
 
     # 7) письмо
     subject = f"ARTSTUDIO Nevsky. Анализ отзывов за неделю {w_start:%d.%m}–{w_end:%d.%m}"
