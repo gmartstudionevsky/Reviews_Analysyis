@@ -318,6 +318,49 @@ def fmt_pct(x):   return "—" if x is None else f"{float(x):.1f}%".replace(".",
 def fmt_pp(x):    return "—" if x is None else f"{float(x):+.2f} п.п.".replace(".", ",")
 def fmt_int(x):   return "—" if x is None else str(int(x))
 
+# --- источники, которые показываем в 5-балльной шкале (для всех периодов в таблице)
+SOURCES_5PT = {
+    "TL: Marketing", "Yandex", "Яндекс Путешествия", "TripAdvisor", "2GIS", "Google", "Trip.com"
+}
+
+def normalize_source_name(s: str) -> str:
+    if s is None: return ""
+    t = str(s).strip().lower()
+    if "yandex" in t or "яндекс" in t:   # объединяем все «яндексы»
+        return "Yandex"
+    return str(s).strip()
+
+def unify_sources_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Склеиваем 'Yandex' и 'Яндекс Путешествия' в один источник 'Yandex' с корректной взвешенной средней."""
+    if df is None or df.empty:
+        return df
+    x = df.copy()
+    x["source"] = x["source"].map(normalize_source_name)
+    for c in ["reviews","avg10","pos","neu","neg"]:
+        if c in x.columns:
+            x[c] = pd.to_numeric(x[c], errors="coerce")
+    def ag(g):
+        n = int(g["reviews"].sum())
+        pos = int(g.get("pos",0).sum()); neu = int(g.get("neu",0).sum()); neg = int(g.get("neg",0).sum())
+        avg = _weighted_avg(g["avg10"], g["reviews"])
+        return pd.Series({
+            "reviews": n,
+            "avg10": avg,
+            "pos": pos, "neu": neu, "neg": neg,
+            "pos_share": _safe_pct(pos, n), "neg_share": _safe_pct(neg, n),
+        })
+    out = (x.groupby("source", as_index=False).apply(ag).reset_index(drop=True))
+    # сортируем по объёму → средней
+    return out.sort_values(["reviews","avg10"], ascending=[False, False])
+
+def display_avg_for_source(avg10: float, src: str) -> str:
+    """Для ряда источников отображаем в /5 (для читателя), расчёты остаются в /10."""
+    if avg10 is None or (isinstance(avg10, float) and (pd.isna(avg10) or np.isnan(avg10))):
+        return "—"
+    if normalize_source_name(src) in SOURCES_5PT:
+        return _comma_num(float(avg10)/2.0, 2)  # 10→5
+    return fmt_avg(avg10)
+
 
 def header_human_block(week_start: date, labels: dict, week_agg: dict, mtd_agg: dict, qtd_agg: dict, ytd_agg: dict, deltas: dict):
     s, e = week_start, week_start + dt.timedelta(days=6)
@@ -342,9 +385,9 @@ def header_human_block(week_start: date, labels: dict, week_agg: dict, mtd_agg: 
       f"позитив {fmt_pct(100.0*week_agg['pos']/week_agg['reviews']) if week_agg['reviews'] else '—'}, "
       f"негатив {fmt_pct(100.0*week_agg['neg']/week_agg['reviews']) if week_agg['reviews'] else '—'}."
       f"</p>"
-      + cmp_line("текущего месяца", labels['mtd'], mtd_agg, deltas['mtd'])
-      + cmp_line("текущего квартала", labels['qtd'], qtd_agg, deltas['qtd'])
-      + cmp_line("текущего года", labels['ytd'], ytd_agg, deltas['ytd'])
+      + cmp_line("Текущий месяц",   labels['mtd'], mtd_agg, deltas['mtd'])
+      + cmp_line("Текущий квартал", labels['qtd'], qtd_agg, deltas['qtd'])
+      + cmp_line("Текущий год",     labels['ytd'], ytd_agg, deltas['ytd'])
     )
     return html
 
@@ -379,7 +422,7 @@ def quotes_block(quotes: dict):
     return ("<h3>Цитаты</h3>" + "".join(parts)) if parts else ""
 
 def sources_table_block(summ: dict, wk_src_avg: dict):
-    """Основная таблица по источникам: Неделя/Месяц/Квартал/Год (с фоллбеком средних из текущей недели)."""
+    """Неделя/Месяц/Квартал/Год + Итог за всё время (оценка), с отображением /5 для ряда источников."""
     def to_map(df):
         if df is None or (isinstance(df, pd.DataFrame) and df.empty):
             return {}
@@ -398,8 +441,9 @@ def sources_table_block(summ: dict, wk_src_avg: dict):
     M = to_map(summ.get("mtd"))
     Q = to_map(summ.get("qtd"))
     Y = to_map(summ.get("ytd"))
+    A = to_map(summ.get("alltime"))  # итог за всё время (оценка)
 
-    # если где-то нет avg10, но источник встречается в текущей неделе — подставим недельную среднюю
+    # если где-то нет avg10, но есть недельная средняя — подставим
     def fill_avg_with_week(d):
         for k, v in d.items():
             if (v.get("avg10") is None or (isinstance(v["avg10"], float) and np.isnan(v["avg10"]))) and k in wk_src_avg:
@@ -407,21 +451,25 @@ def sources_table_block(summ: dict, wk_src_avg: dict):
     for D in (W, M, Q, Y):
         fill_avg_with_week(D)
 
-    all_sources = sorted(set(W) | set(M) | set(Q) | set(Y))
+    all_sources = sorted(set(W) | set(M) | set(Q) | set(Y) | set(A))
 
     def cell(d, src):
         if src not in d:
             return "<td>—</td><td>—</td><td>—</td><td>—</td>"
         v = d[src]
         return (
-            f"<td>{fmt_avg(v['avg10'])}</td>"
+            f"<td>{display_avg_for_source(v['avg10'], src)}</td>"
             f"<td>{fmt_int(v['reviews'])}</td>"
             f"<td>{fmt_pct(v['pos'])}</td>"
             f"<td>{fmt_pct(v['neg'])}</td>"
         )
 
+    def cell_all(src):
+        if src not in A: return "<td>—</td>"
+        return f"<td><b>{display_avg_for_source(A[src]['avg10'], src)}</b></td>"
+
     rows = [
-        f"<tr><td><b>{s}</b></td>{cell(W,s)}{cell(M,s)}{cell(Q,s)}{cell(Y,s)}</tr>"
+        f"<tr><td><b>{s}</b></td>{cell(W,s)}{cell(M,s)}{cell(Q,s)}{cell(Y,s)}{cell_all(s)}</tr>"
         for s in all_sources
     ]
 
@@ -435,25 +483,28 @@ def sources_table_block(summ: dict, wk_src_avg: dict):
         <th colspan="4">Текущий месяц</th>
         <th colspan="4">Текущий квартал</th>
         <th colspan="4">Текущий год</th>
+        <th rowspan="2">Итог (всё время)</th>
       </tr>
       <tr>
-        <th>Ср./10</th><th>Отз.</th><th>Позитив</th><th>Негатив</th>
-        <th>Ср./10</th><th>Отз.</th><th>Позитив</th><th>Негатив</th>
-        <th>Ср./10</th><th>Отз.</th><th>Позитив</th><th>Негатив</th>
-        <th>Ср./10</th><th>Отз.</th><th>Позитив</th><th>Негатив</th>
+        <th>Ср.</th><th>Отз.</th><th>Позитив</th><th>Негатив</th>
+        <th>Ср.</th><th>Отз.</th><th>Позитив</th><th>Негатив</th>
+        <th>Ср.</th><th>Отз.</th><th>Позитив</th><th>Негатив</th>
+        <th>Ср.</th><th>Отз.</th><th>Позитив</th><th>Негатив</th>
       </tr>
-      {''.join(rows) if rows else '<tr><td colspan="17">Нет данных</td></tr>'}
+      {''.join(rows) if rows else '<tr><td colspan="21">Нет данных</td></tr>'}
     </table>
     """
+
 def sources_deltas_block(summ: dict, wk_src_avg: dict):
-    """Дельты средних /10 по источникам: месяц/квартал/год против предыдущих периодов."""
+    """Дельты средних /10 по источникам: месяц/квартал/год vs прошлые периоды и vs 'всё время'."""
     prevM = summ.get("prev_month"); prevQ = summ.get("prev_quarter"); prevY = summ.get("prev_year")
+    ALL   = summ.get("alltime")
 
     def to_map(df):
         if df is None or (isinstance(df, pd.DataFrame) and df.empty):
             return {}
-        m = {str(r["source"]): (float(r["avg10"]) if pd.notna(r["avg10"]) else None) for _, r in df.iterrows()}
-        # фоллбек текущей недели, если совсем пусто
+        m = {normalize_source_name(r["source"]): (float(r["avg10"]) if pd.notna(r["avg10"]) else None) for _, r in df.iterrows()}
+        # фоллбек на недельную среднюю, если совсем пусто
         for k, v in m.items():
             if v is None and k in wk_src_avg:
                 m[k] = float(wk_src_avg[k])
@@ -462,51 +513,85 @@ def sources_deltas_block(summ: dict, wk_src_avg: dict):
     M, PM = to_map(summ.get("mtd")),  to_map(prevM)
     Q, PQ = to_map(summ.get("qtd")),  to_map(prevQ)
     Y, PY = to_map(summ.get("ytd")),  to_map(prevY)
+    A     = to_map(ALL)
 
-    all_sources = sorted(set(M) | set(PM) | set(Q) | set(PQ) | set(Y) | set(PY))
+    all_sources = sorted(set(M) | set(PM) | set(Q) | set(PQ) | set(Y) | set(PY) | set(A))
 
     def dd(a, b):
-        if a is None or b is None or (isinstance(a,float) and np.isnan(a)) or (isinstance(b,float) and np.isnan(b)):
+        if a is None or b is None or (isinstance(a, float) and np.isnan(a)) or (isinstance(b, float) and np.isnan(b)):
             return "—"
         return f"{(float(a) - float(b)):+.2f}".replace(".", ",")
 
-    rows = [
-        f"<tr><td><b>{s}</b></td><td>{dd(M.get(s), PM.get(s))}</td>"
-        f"<td>{dd(Q.get(s), PQ.get(s))}</td><td>{dd(Y.get(s), PY.get(s))}</td></tr>"
-        for s in all_sources
-    ]
+    rows = []
+    for s in all_sources:
+        rows.append(
+            "<tr>"
+            f"<td><b>{s}</b></td>"
+            f"<td>{dd(M.get(s), PM.get(s))}</td>"
+            f"<td>{dd(Q.get(s), PQ.get(s))}</td>"
+            f"<td>{dd(Y.get(s), PY.get(s))}</td>"
+            f"<td>{dd(M.get(s), A.get(s))}</td>"
+            f"<td>{dd(Q.get(s), A.get(s))}</td>"
+            f"<td>{dd(Y.get(s), A.get(s))}</td>"
+            "</tr>"
+        )
 
     return f"""
     <h3>Дельты по источникам</h3>
-    <p>Сравнение средних /10: текущий месяц vs {summ['labels']['prev_month']}, текущий квартал vs {summ['labels']['prev_quarter']}, текущий год vs {summ['labels']['prev_year']}.</p>
+    <p>Сравнение средних /10: текущий месяц vs предыдущий месяц; текущий квартал vs предыдущий квартал; текущий год vs предыдущий год; а также каждая величина относительно общей оценки за всё время.</p>
     <table border='1' cellspacing='0' cellpadding='6'>
-      <tr><th>Источник</th><th>Δ месяц</th><th>Δ квартал</th><th>Δ год</th></tr>
-      {''.join(rows) if rows else '<tr><td colspan="4">Нет данных</td></tr>'}
+      <tr>
+        <th rowspan="2">Источник</th>
+        <th colspan="3">Δ к прошлым периодам</th>
+        <th colspan="3">Δ к общей оценке (всё время)</th>
+      </tr>
+      <tr>
+        <th>Месяц</th><th>Квартал</th><th>Год</th>
+        <th>Месяц→Общая</th><th>Квартал→Общая</th><th>Год→Общая</th>
+      </tr>
+      {''.join(rows) if rows else '<tr><td colspan="7">Нет данных</td></tr>'}
     </table>
     """
+
 def trends_text_block(history_df: pd.DataFrame, week_agg: dict, w_start: date):
-    wk = history_df[history_df["period_type"]=="week"].copy()
-    if wk.empty: 
+    wk = history_df[history_df["period_type"] == "week"].copy()
+    if wk.empty:
         return ""
-    for c in ["reviews","avg10"]:
-        wk[c] = pd.to_numeric(wk[c], errors="coerce")
-    # последние 8 недель до текущей (включая текущую, если уже записали)
+
+    # аккуратно приводим к числам (учитываем '9,05')
+    wk["reviews"] = pd.to_numeric(wk["reviews"].astype(str).str.replace(",", ".", regex=False), errors="coerce")
+    wk["avg10"]   = pd.to_numeric(wk["avg10"].astype(str).str.replace(",", ".", regex=False), errors="coerce")
+
+    # последние 8 недель (включая текущую, если уже есть в history)
     def worder(k):
-        try: y,w=str(k).split("-W"); return int(y)*100+int(w)
-        except: return 0
+        try:
+            y, w = str(k).split("-W")
+            return int(y) * 100 + int(w)
+        except:
+            return 0
     wk = wk.sort_values(by="period_key", key=lambda s: s.map(worder)).tail(8)
+
     base_avg = wk["avg10"].mean(skipna=True)
     base_cnt = wk["reviews"].mean(skipna=True)
-    delta_avg = None if pd.isna(base_avg) else round(float(week_agg["avg10"] - base_avg), 2) if week_agg["avg10"] is not None else None
-    delta_cnt = None if pd.isna(base_cnt) else round(float(week_agg["reviews"] - base_cnt), 1)
-    trend = "на уровне" if (delta_avg is None or abs(delta_avg) < 0.01) else ("выше" if delta_avg>0 else "ниже")
+
+    delta_avg = None
+    if week_agg.get("avg10") is not None and pd.notna(base_avg):
+        delta_avg = round(float(week_agg["avg10"]) - float(base_avg), 2)
+
+    delta_cnt = None
+    if week_agg.get("reviews") is not None and pd.notna(base_cnt):
+        delta_cnt = round(float(week_agg["reviews"]) - float(base_cnt), 1)
+
+    trend = "на уровне" if (delta_avg is None or abs(delta_avg) < 0.01) else ("выше" if delta_avg > 0 else "ниже")
+
     return (
         "<h3>Тренды и динамика</h3>"
         f"<p>Средняя оценка недели {trend} средней последних 8 недель "
         f"({fmt_avg(base_avg)}) на {fmt_avg(delta_avg)}; "
-        f"объём отзывов {('выше' if delta_cnt and delta_cnt>0 else ('ниже' if delta_cnt and delta_cnt<0 else 'на уровне'))} "
+        f"объём отзывов {('выше' if (delta_cnt is not None and delta_cnt>0) else ('ниже' if (delta_cnt is not None and delta_cnt<0) else 'на уровне'))} "
         f"среднего за 8 недель ({fmt_int(base_cnt)}) на {fmt_int(delta_cnt)}.</p>"
     )
+
 # ===========
 # Charts
 # ===========
@@ -652,6 +737,23 @@ def main():
     # 4) блоки по источникам
     sources_summ = sources_summary_for_periods(sources_hist, w_start)
 
+    # склеиваем Яндекс + Яндекс.Путешествия → Yandex
+for k in ["week","mtd","qtd","ytd","prev_month","prev_quarter","prev_year"]:
+    sources_summ[k] = unify_sources_df(sources_summ[k])
+
+# добавляем «всё время» как последний столбец (для таблицы по источникам)
+if not sources_hist.empty:
+    tmp = sources_hist.copy()
+    tmp["mon"] = tmp["week_key"].map(lambda k: iso_week_monday(str(k)))
+    all_start, all_end = tmp["mon"].min(), tmp["mon"].max()
+    all_df = aggregate_sources_from_history(sources_hist, all_start, all_end)
+    sources_summ["alltime"] = unify_sources_df(all_df)
+    sources_summ["labels"]["alltime"] = "всё время"
+else:
+    sources_summ["alltime"] = pd.DataFrame(columns=["source","reviews","avg10","pos_share","neg_share","pos","neu","neg"])
+    sources_summ["labels"]["alltime"] = "всё время"
+
+    
     # 5) собираем HTML
     head_html   = header_human_block(w_start, labels, week_agg, mtd_agg, qtd_agg, ytd_agg, deltas)
     topics_html = topics_table_html(topics_df, prev_topics_df)
@@ -675,10 +777,12 @@ def main():
     if v: charts.append(v)
     charts = [p for p in charts if p and os.path.exists(p)]
 
-    html += """
-        <hr>
-        <p><i>* Средняя /10 — средневзвешенная оценка по всем отзывам периода. Позитив/негатив — доля отзывов с положительной/отрицательной тональностью по тексту (и/или по оценке, если текст нейтрален). Δ — разница недели к соответствующему периоду; п.п. — процентные пункты. «На долю недели пришлось …» — вклад текущей недели в объём отзывов месяца/квартала/года.</i></p>
-        """
+html += """
+<hr>
+<p><i>* Средняя /10 — средневзвешенная оценка по всем отзывам периода. Позитив/негатив — доля отзывов с положительной/отрицательной тональностью по тексту (и/или по оценке, если текст нейтрален). Δ — разница недели к соответствующему периоду; п.п. — процентные пункты. «На долю недели пришлось …» — вклад текущей недели в объём отзывов месяца/квартала/года.</i></p>
+<p><i>** В таблице по источникам оценки для TL: Marketing, Yandex (объединяет Яндекс и Яндекс Путешествия), TripAdvisor, 2GIS, Google, Trip.com показаны в 5-балльной шкале; для остальных источников — в 10-балльной. Все расчёты выполняются в 10-балльной шкале, конвертация в 5-балльную — только для отображения.</i></p>
+"""
+
 
     # 7) письмо
     subject = f"ARTSTUDIO Nevsky. Анализ отзывов за неделю {w_start:%d.%m}–{w_end:%d.%m}"
