@@ -256,7 +256,8 @@ def last_week_range(today: date):
     return start, end
 
 def analyze_week(df: pd.DataFrame, start: date, end: date):
-    df["Дата"] = pd.to_datetime(df["Дата"], errors="coerce").dt.date
+-    df["Дата"] = pd.to_datetime(df["Дата"], errors="coerce").dt.date
++    df["Дата"] = pd.to_datetime(df["Дата"], errors="coerce", dayfirst=True).dt.date
     wk = df[(df["Дата"]>=start) & (df["Дата"]<=end)].copy()
     wk["_rating10"] = normalize_to10(wk["Рейтинг"])
     wk["_sent"] = wk.apply(lambda r: sentiment_sign(r["Текст"], r["_rating10"]), axis=1)
@@ -355,21 +356,43 @@ def quotes_block(quotes: dict):
 def sources_table_block(summ: dict):
     """Основная таблица по источникам: Неделя/MTD/QTD/YTD (avg/rev/pos%/neg%)."""
     def to_map(df):
-        return {r["source"]:{
-            "reviews": int(r["reviews"]) if pd.notna(r["reviews"]) else 0,
-            "avg10": r["avg10"],
-            "pos": r.get("pos_share"), "neg": r.get("neg_share")
-        } for _, r in (df if df is not None else pd.DataFrame(columns=["source"])).iterrows()}
-    W = to_map(summ["week"]); M = to_map(summ["mtd"]); Q = to_map(summ["qtd"]); Y = to_map(summ["ytd"])
-    all_sources = sorted(set(list(W.keys())|set(M.keys())|set(Q.keys())|set(Y.keys())))
-    rows=[]
-    for s in all_sources:
-        def cell(d):
-            if s not in d: return "<td>—</td><td>—</td><td>—</td><td>—</td>"
-            v = d[s]; return f"<td>{fmt_avg(v['avg10'])}</td><td>{fmt_int(v['reviews'])}</td><td>{fmt_pct(v['pos'])}</td><td>{fmt_pct(v['neg'])}</td>"
-        rows.append(
-            f"<tr><td><b>{s}</b></td>{cell(W)}{cell(M)}{cell(Q)}{cell(Y)}</tr>"
+        if df is None or (isinstance(df, pd.DataFrame) and df.empty):
+            return {}
+        out = {}
+        for _, r in df.iterrows():
+            src = str(r["source"])
+            out[src] = {
+                "reviews": int(r["reviews"]) if pd.notna(r["reviews"]) else 0,
+                "avg10": float(r["avg10"]) if pd.notna(r["avg10"]) else None,
+                "pos": float(r.get("pos_share")) if pd.notna(r.get("pos_share")) else None,
+                "neg": float(r.get("neg_share")) if pd.notna(r.get("neg_share")) else None,
+            }
+        return out
+
+    W = to_map(summ.get("week"))
+    M = to_map(summ.get("mtd"))
+    Q = to_map(summ.get("qtd"))
+    Y = to_map(summ.get("ytd"))
+
+    # ключи-источники объединяем корректно (множества keys)
+    all_sources = sorted(set(W) | set(M) | set(Q) | set(Y))
+
+    def cell(d, src):
+        if src not in d:
+            return "<td>—</td><td>—</td><td>—</td><td>—</td>"
+        v = d[src]
+        return (
+            f"<td>{fmt_avg(v['avg10'])}</td>"
+            f"<td>{fmt_int(v['reviews'])}</td>"
+            f"<td>{fmt_pct(v['pos'])}</td>"
+            f"<td>{fmt_pct(v['neg'])}</td>"
         )
+
+    rows = [
+        f"<tr><td><b>{s}</b></td>{cell(W,s)}{cell(M,s)}{cell(Q,s)}{cell(Y,s)}</tr>"
+        for s in all_sources
+    ]
+
     return f"""
     <h3>Источники (по периодам)</h3>
     <p>Неделя: {summ['labels']['week']} • Месяц (MTD): {summ['labels']['mtd']} • Квартал (QTD): {summ['labels']['qtd']} • Год (YTD): {summ['labels']['ytd']}</p>
@@ -390,7 +413,6 @@ def sources_table_block(summ: dict):
       {''.join(rows) if rows else '<tr><td colspan="17">Нет данных</td></tr>'}
     </table>
     """
-
 def sources_deltas_block(summ: dict):
     """Отдельная компактная таблица дельт по средним: MTD vs prev_month, QTD vs prev_quarter, YTD vs prev_year."""
     prevM = summ["prev_month"]; prevQ = summ["prev_quarter"]; prevY = summ["prev_year"]
