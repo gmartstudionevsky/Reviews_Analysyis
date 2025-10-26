@@ -12,43 +12,61 @@
 # 4. В таблице SHEETS_HISTORY_ID создаёт лист "surveys_raw", если его нет.
 # 5. Достраивает новые строки без дублей (по survey_id).
 
-import os, io, re, json, sys
-import pandas as pd
-from google.oauth2.service_account import Credentials
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseDownload
+-import json
+-import os, io, re, sys, datetime as dt
++import json
++import base64
++import os, io, re, sys, datetime as dt
+ from datetime import date
+ import pandas as pd
+ 
+ from google.oauth2.service_account import Credentials
+ from googleapiclient.discovery import build
+ from googleapiclient.http import MediaIoBaseDownload
+ 
+@@
+ SCOPES = [
+     "https://www.googleapis.com/auth/drive.readonly",
+     "https://www.googleapis.com/auth/spreadsheets",
+ ]
+ 
+-# поддержка двух способов: файл (GOOGLE_SERVICE_ACCOUNT_JSON) или прямой контент (GOOGLE_SERVICE_ACCOUNT_JSON_CONTENT)
+-SA_PATH    = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
+-SA_CONTENT = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON_CONTENT")
+-
+-if SA_CONTENT and SA_CONTENT.strip().startswith("{"):
+-    CREDS = Credentials.from_service_account_info(json.loads(SA_CONTENT), scopes=SCOPES)
+-else:
+-    CREDS = Credentials.from_service_account_file(SA_PATH, scopes=SCOPES)
++# поддерживаем 3 способа:
++# 1) GOOGLE_SERVICE_ACCOUNT_JSON_B64  (base64 от полного JSON ключа)
++# 2) GOOGLE_SERVICE_ACCOUNT_JSON_CONTENT (сырой JSON как текст)
++# 3) GOOGLE_SERVICE_ACCOUNT_JSON (путь к файлу .json)
++SA_B64     = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON_B64")
++SA_CONTENT = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON_CONTENT")
++SA_PATH    = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
++
++if SA_B64:
++    # декодируем base64 → dict и создаём учётку из него
++    decoded_bytes = base64.b64decode(SA_B64)
++    decoded_str   = decoded_bytes.decode("utf-8")
++    CREDS = Credentials.from_service_account_info(json.loads(decoded_str), scopes=SCOPES)
++elif SA_CONTENT and SA_CONTENT.strip().startswith("{"):
++    CREDS = Credentials.from_service_account_info(json.loads(SA_CONTENT), scopes=SCOPES)
++elif SA_PATH:
++    CREDS = Credentials.from_service_account_file(SA_PATH, scopes=SCOPES)
++else:
++    raise RuntimeError(
++        "Не найден ни один из секретов сервисного аккаунта: "
++        "GOOGLE_SERVICE_ACCOUNT_JSON_B64 / GOOGLE_SERVICE_ACCOUNT_JSON_CONTENT / GOOGLE_SERVICE_ACCOUNT_JSON"
++    )
+ 
+ DRIVE  = build("drive",  "v3", credentials=CREDS)
+ SHEETS = build("sheets", "v4", credentials=CREDS).spreadsheets()
+ 
+ DRIVE_FOLDER_ID  = os.environ["DRIVE_FOLDER_ID"]
+ SHEETS_HISTORY_ID = os.environ["SHEETS_HISTORY_ID"]
 
-# импорт ядра нормализации
-try:
-    from agent.surveys_core import normalize_surveys_file
-except ModuleNotFoundError:
-    sys.path.append(os.path.dirname(__file__))
-    from surveys_core import normalize_surveys_file
-
-
-# -------------------
-# ENV & авторизация
-# -------------------
-SCOPES = [
-    "https://www.googleapis.com/auth/drive.readonly",
-    "https://www.googleapis.com/auth/spreadsheets",
-]
-
-SA_PATH    = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
-SA_CONTENT = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON_CONTENT")
-
-if SA_CONTENT and SA_CONTENT.strip().startswith("{"):
-    CREDS = Credentials.from_service_account_info(json.loads(SA_CONTENT), scopes=SCOPES)
-else:
-    if not SA_PATH:
-        raise RuntimeError("Нет GOOGLE_SERVICE_ACCOUNT_JSON / GOOGLE_SERVICE_ACCOUNT_JSON_CONTENT")
-    CREDS = Credentials.from_service_account_file(SA_PATH, scopes=SCOPES)
-
-DRIVE  = build("drive",  "v3", credentials=CREDS)
-SHEETS = build("sheets", "v4", credentials=CREDS).spreadsheets()
-
-DRIVE_FOLDER_ID   = os.environ["DRIVE_FOLDER_ID"]
-HISTORY_SHEET_ID  = os.environ["SHEETS_HISTORY_ID"]
 
 SURVEYS_SHEET_TAB = "surveys_raw"
 
