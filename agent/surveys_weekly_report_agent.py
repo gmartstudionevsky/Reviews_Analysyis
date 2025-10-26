@@ -23,10 +23,10 @@ import matplotlib.pyplot as plt
 
 # --- ядро анкет (нормализация и недельная агрегация) ---
 try:
-    from agent.surveys_core import parse_and_aggregate_weekly, SURVEYS_TAB
+    from agent.surveys_core import parse_and_aggregate_weekly, SURVEYS_TAB, iso_week_key
 except ModuleNotFoundError:
     sys.path.append(os.path.dirname(__file__))
-    from surveys_core import parse_and_aggregate_weekly, SURVEYS_TAB
+    from surveys_core import parse_and_aggregate_weekly, SURVEYS_TAB, iso_week_key
 
 # --- утилиты периодов и форматирования (берём из metrics_core) ---
 try:
@@ -185,8 +185,7 @@ def surveys_aggregate_period(hist: pd.DataFrame, start: date, end: date) -> dict
     period_df = hist[(hist["week_key"] >= wk_start) & (hist["week_key"] <= wk_end)].copy()
 
     by_param = []
-    for p in PARAM_ORDER + ["nps"]:
-        if p == "nps": continue  # special
+    for p in PARAM_ORDER if p != "nps_1_5":
         pdf = period_df[period_df["param"] == p]
         valid = pd.notna(pdf["avg5"])
         if not valid.any():
@@ -195,7 +194,7 @@ def surveys_aggregate_period(hist: pd.DataFrame, start: date, end: date) -> dict
         else:
             values = pdf["avg5"][valid].astype(float)
             weights = pdf["responses"][valid].astype(int)
-            avg = np.weighted_average(values, weights)
+            avg = np.average(values, weights=weights)
             total_responses = int(weights.sum())
         by_param.append({"param":p, "avg5":round(avg,2) if not np.isnan(avg) else None, "avg10":round(avg*2,2) if not np.isnan(avg) else None, "responses":total_responses, "nps":None})
 
@@ -233,16 +232,22 @@ PARAM_NAMES = {
 }
 
 def header_block(w_start: date, w_end: date, W: dict, M: dict, Q: dict, Y: dict) -> str:
-    w_label = f"{w_start:%d–%m %b %Y}" if w_start.month == w_end.month else f"{w_start:%d %b}–{w_end:%d %b %Y}"
     w_overall = f"{W['overall_avg5']:.2f} /5" if pd.notna(W['overall_avg5']) else "—"
+    m_overall = f"{M['overall_avg5']:.2f} /5" if pd.notna(M['overall_avg5']) else "—"
+    q_overall = f"{Q['overall_avg5']:.2f} /5" if pd.notna(Q['overall_avg5']) else "—"
+    y_overall = f"{Y['overall_avg5']:.2f} /5" if pd.notna(Y['overall_avg5']) else "—"
+    w_nps = f"{W['nps']:.2f}" if pd.notna(W['nps']) else "—"
+    m_nps = f"{M['nps']:.2f}" if pd.notna(M['nps']) else "—"
+    q_nps = f"{Q['nps']:.2f}" if pd.notna(Q['nps']) else "—"
+    y_nps = f"{Y['nps']:.2f}" if pd.notna(Y['nps']) else "—"
     return f"""
 ARTSTUDIO Nevsky — Анкеты за неделю {w_start:%d}–{w_end:%d} окт {w_start.year}
 
-Неделя: {w_start:%d.%m}–{w_end:%d.%m}; анкет: {W['total_surveys']}; итоговая: {w_overall}; NPS: {W['nps'] if pd.notna(W['nps']) else '—'}.
+Неделя: {w_start:%d.%m}–{w_end:%d.%m}; анкет: {W['total_surveys']}; итоговая: {w_overall}; NPS: {w_nps}.
 
-Текущий месяц ({month_label(w_start)}): анкет {M['total_surveys']}, итоговая {M['overall_avg5']:.2f} /5 if pd.notna(M['overall_avg5']) else '—', NPS {M['nps'] if pd.notna(M['nps']) else '—'};
-Текущий квартал ({quarter_label(w_start)}): анкет {Q['total_surveys']}, итоговая {Q['overall_avg5']:.2f} /5 if pd.notna(Q['overall_avg5']) else '—', NPS {Q['nps'] if pd.notna(Q['nps']) else '—'};
-Текущий год ({year_label(w_start)}): анкет {Y['total_surveys']}, итоговая {Y['overall_avg5']:.2f} /5 if pd.notna(Y['overall_avg5']) else '—', NPS {Y['nps'] if pd.notna(Y['nps']) else '—'}.
+Текущий месяц ({month_label(w_start)}): анкет {M['total_surveys']}, итоговая {m_overall}, NPS {m_nps};
+Текущий квартал ({quarter_label(w_start)}): анкет {Q['total_surveys']}, итоговая {q_overall}, NPS {q_nps};
+Текущий год ({year_label(w_start)}): анкет {Y['total_surveys']}, итоговая {y_overall}, NPS {y_nps}.
 
 Параметры (неделя / Текущий месяц / Текущий квартал / Текущий год)
 """
@@ -278,8 +283,8 @@ def footnote_block() -> str:
 # Charts
 # ======================
 def plot_radar_params(w_bp: list, m_bp: list, path: str):
-    # mock or implement as is
-    pass  # Assuming original code for charts is fine, or add if needed
+    # Implement or leave as is (truncated in original)
+    pass
 
 def plot_params_heatmap(hist: pd.DataFrame, path: str):
     pass
