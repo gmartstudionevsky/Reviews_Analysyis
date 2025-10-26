@@ -104,130 +104,55 @@ SMART_REGEX: Dict[str, List[re.Pattern]] = {
                       re.compile(r"\bчистот[аы]\b.*(заезд)")],
     "room_comfort":  [re.compile(r"(№\s*1\.?3\b|1\.?3\b).*?(комфорт|оснащ)"),
                       re.compile(r"(комфорт|оснащ).*номер")],
-    "fo_stay":       [re.compile(r"(№\s*2\.?1\b|2\.?1\b).*?(при[её]м|размещен)"),
-                      re.compile(r"(ресепш|ресепшен|администрат).*?(проживан)")],
-    "its_service":   [re.compile(r"(№\s*2\.?2\b|2\.?2\b).*?(тех|служб)"),
-                      re.compile(r"(техслужб|инженер|ремонт|почин)")],
-    "hsk_stay":      [re.compile(r"(№\s*2\.?3\b|2\.?3\b).*?(уборк)"),
-                      re.compile(r"\bуборк[аи]\b.*(проживан)")],
-    "breakfast":     [re.compile(r"(№\s*2\.?4\b|2\.?4\b).*?(завтрак)"),
-                      re.compile(r"\bзавтрак")],
-    "atmosphere":    [re.compile(r"(№\s*3\.?1\b|3\.?1\b).*?(атмосфер)")],
-    "location":      [re.compile(r"(№\s*3\.?2\b|3\.?2\b).*?(располож)"),
-                      re.compile(r"\bрасполож")],
-    "value":         [re.compile(r"(№\s*3\.?3\b|3\.?3\b).*?(цен|качеств)"),
-                      re.compile(r"(цена|стоимост).*(качест)")],
-    "would_return":  [re.compile(r"(№\s*3\.?4\b|3\.?4\b).*?(верн)"),
-                      re.compile(r"(вернул.*бы|снова при[её]хал)"),
-                     ],
-    "nps_1_5":       [re.compile(r"(№\s*3\.?5\b|3\.?5\b).*?(рекоменд|nps)"),
-                      re.compile(r"\bnps\b")],
+    "fo_stay":       [re.compile(r"(№\s*2\.?1\b|2\.?1\b).*?(при[её]м|размещен|прожив)"),
+                      re.compile(r"(прожив|стей).*?(спир|при[её]м)")],
+    "its_service":   [re.compile(r"(№\s*2\.?2\b|2\.?2\b).*?(техн|служб|инженер|ремонт)"),
+                      re.compile(r"(техн|инженер|ремонт|служб)")],
+    "hsk_stay":      [re.compile(r"(№\s*2\.?3\b|2\.?3\b).*?(уборк|чистот|прожив)"),
+                      re.compile(r"\b(уборк|чистот[аы])\b.*(прожив)")],
+    "breakfast":     [re.compile(r"(№\s*2\.?4\b|2\.?4\b).*?(завтрак|питан)"),
+                      re.compile(r"(завтрак|питан|еда|ресторан)")],
+    "atmosphere":    [re.compile(r"(№\s*3\.?1\b|3\.?1\b).*?(атмосфер|уют|дизайн)"),
+                      re.compile(r"(атмосфер|уют|дизайн)")],
+    "location":      [re.compile(r"(№\s*3\.?2\b|3\.?2\b).*?(располож|локац|местополож)"),
+                      re.compile(r"(располож|локац|местополож|удобств.*мест)")],
+    "value":         [re.compile(r"(№\s*3\.?3\b|3\.?3\b).*?(цен|качеств|value)"),
+                      re.compile(r"(цен|качеств|value)")],
+    "would_return":  [re.compile(r"(№\s*3\.?4\b|3\.?4\b).*?(верн|рекоменд|повтор)"),
+                      re.compile(r"(верн|повтор|снова|хотел.*верн)")],
+    "nps_1_5":       [re.compile(r"(№\s*3\.?5\b|3\.?5\b).*?(рекоменд|nps|друзь|вероятн)"),
+                      re.compile(r"(nps|рекоменд|друзь|вероятн)")],
 }
 
-def _find_col(df: pd.DataFrame, aliases: List[str]) -> str | None:
-    low = {_colkey(c): c for c in df.columns}
-    # точные попадания
-    for a in aliases:
-        k = _colkey(a)
-        if k in low: return low[k]
-    # подстроки
-    for a in aliases:
-        k = _colkey(a)
-        for lk, orig in low.items():
-            if k and k in lk: return orig
-    # все слова из алиаса
-    for a in aliases:
-        words = [w for w in _colkey(a).split() if len(w) > 1]
-        for lk, orig in low.items():
-            if all(w in lk for w in words): return orig
-    return None
-
-def _find_col_smart(df: pd.DataFrame, key: str) -> str | None:
-    pats = SMART_REGEX.get(key, [])
-    if not pats: return None
-    low = {_colkey(c): c for c in df.columns}
-    best = None
-    for lk, orig in low.items():
-        for p in pats:
-            if p.search(lk):
-                best = orig
+def find_columns(df: pd.DataFrame) -> Dict[str, str]:
+    """Находит колонки параметров по алиасам или умным регекспам."""
+    cols = {}
+    headers = {_colkey(h): h for h in df.columns}
+    for p, aliases in PARAM_ALIASES.items():
+        for a in aliases:
+            k = _colkey(a)
+            if k in headers:
+                cols[p] = headers[k]
                 break
-        if best: break
-    return best
-
-# --------- числовая нормализация и NPS ----------
-def to_5_scale(x) -> float:
-    """
-    Приводим значение к шкале /5.
-    Понимаем '4,5', '5 из 5', '9.0' (→ 4.5), '80' (→ 4.0).
-    Вне диапазона 1..5 → NaN.
-    """
-    if x is None: return np.nan
-    s = str(x).strip().replace(",", ".")
-    m = re.search(r"(-?\d+(?:\.\d+)?)", s)
-    if not m: return np.nan
-    v = float(m.group(1))
-    if 0 <= v <= 5:
-        v5 = v
-    elif 0 <= v <= 10:
-        v5 = v / 2.0
-    elif 0 <= v <= 100:
-        v5 = v / 20.0
-    else:
-        return np.nan
-    # фильтруем мусор вроде 0.0 или 5.5
-    return v5 if 1.0 <= v5 <= 5.0 else np.nan
-
-def compute_nps_from_1to5(series: pd.Series) -> Tuple[int, int, float | np.nan]:
-    """
-    Новое правило: 1–2 = детракторы, 3–4 = нейтралы, 5 = промоутеры.
-    """
-    s = pd.to_numeric(series, errors="coerce").dropna()
-    s = s[(s >= 1) & (s <= 5)]
-    if s.empty: return 0, 0, np.nan
-    promoters  = int((s >= 5.0).sum())
-    detractors = int((s <= 2.0).sum())
-    total      = int(len(s))
-    nps = ((promoters / total) - (detractors / total)) * 100.0
-    return promoters, detractors, round(float(nps), 1)
-
-def iso_week_key(d: date) -> str:
-    iso = d.isocalendar()
-    return f"{iso.year}-W{iso.week}"
-
-# =======================
-# Нормализация анкет
-# =======================
-def _parse_date_any(x) -> date | None:
-    try:
-        return pd.to_datetime(x, errors="coerce", dayfirst=True).date()
-    except Exception:
-        return None
-
-def normalize_surveys_df(df0: pd.DataFrame) -> pd.DataFrame:
-    """
-    На вход — сырая таблица (лист с ответами).
-    Выход — DF с колонками:
-      date, comment, fio, booking, phone, email,
-      overall5/10, <param5/10>, nps5
-    """
-    df = df0.copy()
-
-    # 1) находим колонки по алиасам/регэкспам
-    cols: Dict[str, str] = {}
-    for key, aliases in PARAM_ALIASES.items():
-        hit = _find_col(df, aliases)
-        if not hit:
-            hit = _find_col_smart(df, key)
-        if hit:
-            cols[key] = hit
-
+    # для не найденных — умный поиск
+    for p, regexes in SMART_REGEX.items():
+        if p in cols: continue
+        best_score, best_col = 0, None
+        for c in df.columns:
+            ck = _colkey(c)
+            score = sum(bool(r.search(ck)) for r in regexes)
+            if score > best_score:
+                best_score, best_col = score, c
+        if best_score > 0:
+            cols[p] = best_col
+    # дата — обязательна
     if "survey_date" not in cols:
-        # эвристика: колонка, где ≥50% значений — валидные даты
-        best, best_hits, n = None, 0, len(df)
+        candidates = ["Дата", "Дата анкетирования", "Комментарий", "Средняя оценка", "№ 1", "№ 2", "№ 3"]
+        best, best_hits = None, 0
+        n = len(df)
         for c in df.columns:
             try:
-                parsed = pd.to_datetime(df[c], errors="coerce", dayfirst=True)
+                parsed = df[c].map(_parse_date_any)
                 hits = int(parsed.notna().sum())
                 if hits > best_hits and hits >= max(5, int(0.5 * n)):
                     best, best_hits = c, hits
@@ -238,9 +163,41 @@ def normalize_surveys_df(df0: pd.DataFrame) -> pd.DataFrame:
         else:
             raise RuntimeError("В файле не найдена колонка с датой анкетирования.")
 
+    return cols
+
+def _parse_date_any(x) -> date | None:
+    if pd.isna(x): return None
+    try:
+        if isinstance(x, (int, float)):
+            return (dt.datetime(1900, 1, 1) + dt.timedelta(days=int(x) - 2)).date()
+        elif isinstance(x, str):
+            if match := re.match(r"(\d{4})-(\d{2})-(\d{2})", x):
+                return date(*map(int, match.groups()))
+            elif match := re.match(r"(\d{2})\.(\d{2})\.(\d{4})", x):
+                dd, mm, yyyy = map(int, match.groups())
+                return date(yyyy, mm, dd)
+        return pd.to_datetime(x).date()
+    except Exception:
+        return None
+
+def to_5_scale(x):
+    if isinstance(x, str):
+        x = x.replace(',', '.')
+    try:
+        v = float(x)
+        return round(v, 1) if 1 <= v <= 5 else np.nan
+    except:
+        return np.nan
+
+def normalize_surveys_df(df_raw: pd.DataFrame) -> pd.DataFrame:
+    df = df_raw.copy()
+    cols = find_columns(df)
+
+    # 1) дата
     out = pd.DataFrame()
     out["date"] = df[cols["survey_date"]].map(_parse_date_any)
 
+    # сервисные
     for k in ("comment", "fio", "booking", "phone", "email"):
         out[k] = df[cols[k]].astype(str) if k in cols else ""
 
@@ -269,6 +226,18 @@ def normalize_surveys_df(df0: pd.DataFrame) -> pd.DataFrame:
 # =======================
 # Недельная агрегация
 # =======================
+def compute_nps_from_1to5(s: pd.Series) -> Tuple[int,int,float]:
+    valid = s.notna().sum()
+    if valid == 0: return None, None, None
+    prom = int((s ==5).sum())
+    detr = int((s <=2).sum())
+    nps = round(100 * (prom - detr) / valid, 2)
+    return prom, detr, nps
+
+def iso_week_key(d: date) -> str:
+    year, week, _ = d.isocalendar()
+    return f"{year}-W{week:02d}"
+
 def weekly_aggregate(df_norm: pd.DataFrame) -> pd.DataFrame:
     """
     week_key | param | responses | avg5 | avg10 | promoters | detractors | nps
@@ -292,21 +261,25 @@ def weekly_aggregate(df_norm: pd.DataFrame) -> pd.DataFrame:
             s = pd.to_numeric(wdf[f"{p}5"], errors="coerce")
             s = s.where(s.between(1, 5))
             cnt = int(s.notna().sum())
+            if cnt == 0 and p != "overall":
+                continue
             avg5 = float(s.mean()) if cnt > 0 else np.nan
             avg10 = (avg5 * 2.0) if cnt > 0 else np.nan
             responses = total_surveys if p == "overall" else cnt
             rows.append([
                 wk, p, responses,
-                (None if isinstance(avg5,float) and math.isnan(avg5) else round(avg5, 2)),
-                (None if isinstance(avg10,float) and math.isnan(avg10) else round(avg10, 2)),
+                (None if math.isnan(avg5) else round(avg5, 2)),
+                (None if math.isnan(avg10) else round(avg10, 2)),
                 None, None, None
             ])
 
         # NPS (1–5: 1–2 D, 3–4 N, 5 P)
         if "nps5" in wdf.columns:
             v = pd.to_numeric(wdf["nps5"], errors="coerce").where(lambda x: x.between(1, 5))
-            promoters, detractors, nps = compute_nps_from_1to5(v)
-            rows.append([wk, "nps", int(v.notna().sum()), None, None, promoters, detractors, nps])
+            valid_count = int(v.notna().sum())
+            if valid_count > 0:
+                promoters, detractors, nps = compute_nps_from_1to5(v)
+                rows.append([wk, "nps", valid_count, None, None, promoters, detractors, nps])
 
     out = pd.DataFrame(rows, columns=["week_key","param","responses","avg5","avg10","promoters","detractors","nps"])
     order = [p for p in PARAM_ORDER if p != "nps_1_5"] + ["nps"]
