@@ -1,14 +1,14 @@
 name: Surveys Backfill
 
 on:
-  workflow_dispatch: {}   # запуск вручную из Actions
+  workflow_dispatch: {}
 
 concurrency:
   group: surveys-backfill
   cancel-in-progress: true
 
 jobs:
-  backfill:
+  run:
     runs-on: ubuntu-latest
 
     steps:
@@ -23,9 +23,8 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pandas numpy google-api-python-client google-auth google-auth-httplib2 openpyxl
+          pip install pandas numpy google-api-python-client google-auth google-auth-httplib2 openpyxl matplotlib
 
-      # Декодируем сервисный ключ из base64 -> sa.json и экспортируем путь в ENV
       - name: Prepare service account (from b64)
         env:
           GOOGLE_SERVICE_ACCOUNT_JSON_B64: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON_B64 }}
@@ -33,7 +32,6 @@ jobs:
           set -euo pipefail
           export GOOGLE_SERVICE_ACCOUNT_JSON="$GITHUB_WORKSPACE/sa.json"
           echo "$GOOGLE_SERVICE_ACCOUNT_JSON_B64" | base64 -d > "$GOOGLE_SERVICE_ACCOUNT_JSON"
-          # быстрые проверки
           test -s "$GOOGLE_SERVICE_ACCOUNT_JSON"
           head -c 1 "$GOOGLE_SERVICE_ACCOUNT_JSON" | grep -q '{'
           echo "GOOGLE_SERVICE_ACCOUNT_JSON=$GOOGLE_SERVICE_ACCOUNT_JSON" >> "$GITHUB_ENV"
