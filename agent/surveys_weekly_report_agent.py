@@ -569,6 +569,208 @@ def footnote_block():
     «Итого» — накопленные данные с начала сбора анкет.</i></p>
     """
 
+def trends_block(W, Prev, L4):
+    """
+    Формируем аналитический блок "Динамика и точки внимания".
+
+    Аргументы:
+      W    - агрегат текущей недели (dict с ключами "totals", "by_param")
+      Prev - агрегат прошлой недели
+      L4   - агрегат по окну последних 4 недель ДО текущей
+             (то есть baseline, без текущей недели)
+
+    Возвращает:
+      HTML-строку <h3>...</h3><p>...</p> готовую для встраивания в письмо.
+    """
+
+    # --- Вспомогательные форматтеры внутри блока ---
+
+    def fmt_delta(curr, prev, unit):
+        """
+        Возвращает строку вида '+0.12 /5' или '-4.0 п.п.'.
+        Если нет данных, вернёт '—'.
+        unit: '/5' или 'п.п.'
+        """
+        if curr is None or prev is None:
+            return "—"
+        try:
+            d = float(curr) - float(prev)
+        except Exception:
+            return "—"
+        sign = "+" if d >= 0 else ""
+        if unit == "/5":
+            return f"{sign}{d:.2f} {unit}"
+        else:
+            return f"{sign}{d:.1f} {unit}"
+
+    def df_to_map(df):
+        """
+        Превращает DataFrame с by_param в словарь:
+        {
+          "comfort": { "avg5": ..., "answered": ..., ... },
+          ...
+        }
+        Удобно для сравнений по параметрам.
+        """
+        mp = {}
+        if df is None or len(df) == 0:
+            return mp
+        for _, r in df.iterrows():
+            mp[str(r["param"])] = r.to_dict()
+        return mp
+
+    # --- 1. Краткосрочная динамика (неделя vs прошлая неделя) ---
+
+    cur_overall  = W["totals"]["overall5"]
+    prev_overall = Prev["totals"]["overall5"]
+
+    cur_nps   = W["totals"]["nps"]
+    prev_nps  = Prev["totals"]["nps"]
+
+    short_overall_line = (
+        f"Итоговая оценка за неделю: {fmt_avg5(cur_overall)} "
+        f"({fmt_delta(cur_overall, prev_overall, '/5')} к прошлой неделе "
+        f"{fmt_avg5(prev_overall)})."
+    )
+
+    short_nps_line = (
+        f"NPS: {fmt_nps(cur_nps)} "
+        f"({fmt_delta(cur_nps, prev_nps, 'п.п.')} к прошлой неделе "
+        f"{fmt_nps(prev_nps)})."
+    )
+
+    # --- 2. Долгосрочная динамика (неделя vs baseline последних 4 недель) ---
+
+    base_overall = L4["totals"]["overall5"]
+    base_nps     = L4["totals"]["nps"]
+
+    long_overall_line = (
+        "Итоговая оценка сейчас "
+        f"{fmt_avg5(cur_overall)} "
+        f"({fmt_delta(cur_overall, base_overall, '/5')} к среднему за последние 4 недели "
+        f"{fmt_avg5(base_overall)})."
+        if base_overall is not None
+        else "Недостаточно данных для долгосрочного сравнения по итоговой оценке."
+    )
+
+    long_nps_line = (
+        "NPS сейчас "
+        f"{fmt_nps(cur_nps)} "
+        f"({fmt_delta(cur_nps, base_nps, 'п.п.')} к среднему за последние 4 недели "
+        f"{fmt_nps(base_nps)})."
+        if base_nps is not None
+        else "Недостаточно данных для долгосрочного сравнения по NPS."
+    )
+
+    # --- 3. Сильные стороны и зоны риска (по параметрам: Неделя vs baseline L4) ---
+
+    Wmap  = df_to_map(W["by_param"])
+    L4map = df_to_map(L4["by_param"])
+
+    deltas = []
+    for p, wrow in Wmap.items():
+        if p == "nps":
+            continue  # NPS не сравниваем как /5 параметр
+        w_avg = wrow.get("avg5")
+        l4_avg = L4map.get(p, {}).get("avg5")
+        if (
+            w_avg is None or l4_avg is None
+            or (isinstance(w_avg, float) and np.isnan(w_avg))
+            or (isinstance(l4_avg, float) and np.isnan(l4_avg))
+        ):
+            continue
+        try:
+            w_avg_f = float(w_avg)
+            l4_avg_f = float(l4_avg)
+        except Exception:
+            continue
+        delta = w_avg_f - l4_avg_f
+        deltas.append({
+            "param": p,
+            "week_avg": w_avg_f,
+            "base_avg": l4_avg_f,
+            "delta": delta,
+        })
+
+    strengths_html = ""
+    risks_html = ""
+
+    if not deltas:
+        strengths_html = (
+            "<p><b>Сильные стороны недели:</b><br>"
+            "Недостаточно данных для оценки параметров относительно последних 4 недель.</p>"
+        )
+        risks_html = (
+            "<p><b>Зоны риска:</b><br>"
+            "Недостаточно данных для оценки параметров относительно последних 4 недель.</p>"
+        )
+    else:
+        IMPROVE_THRESHOLD = 0.20   # значимое улучшение
+        DECLINE_THRESHOLD = -0.20  # значимое ухудшение
+
+        improved = [d for d in deltas if d["delta"] >= IMPROVE_THRESHOLD]
+        declined = [d for d in deltas if d["delta"] <= DECLINE_THRESHOLD]
+
+        # самые сильные апгрейды вверху
+        improved.sort(key=lambda x: x["delta"], reverse=True)
+        # самые проблемные просадки вверху
+        declined.sort(key=lambda x: x["delta"])
+
+        def fmt_param_line(d):
+            title = PARAM_TITLES.get(d["param"], d["param"])
+            sign = "+" if d["delta"] >= 0 else ""
+            return (
+                f"- {title}: {d['week_avg']:.2f} /5, "
+                f"{sign}{d['delta']:.2f} к среднему за последние 4 недели "
+                f"({d['base_avg']:.2f} /5)"
+            )
+
+        if improved:
+            top_imp = improved[:2]
+            strengths_lines = "<br>".join(fmt_param_line(x) for x in top_imp)
+            strengths_html = (
+                "<p><b>Сильные стороны недели:</b><br>"
+                f"{strengths_lines}</p>"
+            )
+        else:
+            strengths_html = (
+                "<p><b>Сильные стороны недели:</b><br>"
+                "Существенных улучшений относительно среднего за последние 4 недели не зафиксировано.</p>"
+            )
+
+        if declined:
+            top_decl = declined[:2]
+            risks_lines = "<br>".join(fmt_param_line(x) for x in top_decl)
+            risks_html = (
+                "<p><b>Зоны риска:</b><br>"
+                f"{risks_lines}</p>"
+            )
+        else:
+            risks_html = (
+                "<p><b>Зоны риска:</b><br>"
+                "Нет параметров со значимым ухудшением относительно последних 4 недель.</p>"
+            )
+
+    # --- Собираем HTML-блок целиком ---
+    html = f"""
+    <h3>Динамика и точки внимания</h3>
+
+    <p><b>Краткосрочно (текущая неделя vs прошлая неделя):</b><br>
+    {short_overall_line}<br>
+    {short_nps_line}
+    </p>
+
+    <p><b>Долгосрочно (текущая неделя vs среднее за последние 4 недели):</b><br>
+    {long_overall_line}<br>
+    {long_nps_line}
+    </p>
+
+    {strengths_html}
+    {risks_html}
+    """
+    return html
+
+
 # =========================
 # Charts
 # =========================
@@ -849,6 +1051,15 @@ def main():
     w_start = iso_week_monday(wk_key)
     w_end   = w_start + dt.timedelta(days=6)
 
+    prev_start = w_start - dt.timedelta(days=7)
+    prev_end   = prev_start + dt.timedelta(days=6)
+    Prev = surveys_aggregate_period(hist, prev_start, prev_end)
+
+    # предшествующее окно "последние 4 недели до этой"
+    l4_start = w_start - dt.timedelta(days=28)
+    l4_end   = w_start - dt.timedelta(days=1)
+    L4 = surveys_aggregate_period(hist, l4_start, l4_end)
+
     # периоды: неделя / месяц-to-date / квартал-to-date / год-to-date
     ranges = period_ranges_for_week(w_start)
 
@@ -867,7 +1078,8 @@ def main():
     # Тело письма
     head  = header_block(w_start, w_end, W, M, Q, Y, T)
     table = table_params_block(W["by_param"], M["by_param"], Q["by_param"], Y["by_param"], T["by_param"])
-    html  = head + table + footnote_block()
+    trends  = trends_block(W, Prev, L4)
+    html = head + table + trends + footnote_block()
 
     # Построение графиков
     charts = []
