@@ -185,7 +185,7 @@ def surveys_aggregate_period(hist: pd.DataFrame, start: date, end: date) -> dict
     period_df = hist[(hist["week_key"] >= wk_start) & (hist["week_key"] <= wk_end)].copy()
 
     by_param = []
-    for p in PARAM_ORDER if p != "nps_1_5":
+    for p in [p for p in PARAM_ORDER if p != "nps_1_5"]:
         pdf = period_df[period_df["param"] == p]
         valid = pd.notna(pdf["avg5"])
         if not valid.any():
