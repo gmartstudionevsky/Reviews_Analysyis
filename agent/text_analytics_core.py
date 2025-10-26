@@ -876,4 +876,791 @@ def annotate_topics(df: pd.DataFrame) -> pd.DataFrame:
 #
 # Всё это будет использовать df["topics"] и TOPIC_SCHEMA выше.
 
+###############################################################################
+# 6. Вспомогательные метки периодов (неделя, месяц, квартал, год)
+###############################################################################
+
+def iso_year_week(dt: pd.Timestamp) -> str:
+    """
+    Вернёт ключ недели формата '2025-W42'.
+    week = ISO week number (понедельник - первый день недели).
+    """
+    if pd.isna(dt):
+        return ""
+    iso = dt.isocalendar()  # pandas >= 1.1: (year, week, weekday)
+    return f"{iso.year}-W{iso.week:02d}"
+
+
+def quarter_label(dt: pd.Timestamp) -> str:
+    """
+    Вернёт метку квартала для человека и для аналитики:
+    Q1, Q2, Q3, Q4
+    """
+    if pd.isna(dt):
+        return ""
+    q = (dt.month - 1) // 3 + 1
+    return f"Q{q}"
+
+
+def enrich_time_keys(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Добавляет вспомогательные колонки period_key на уровне строки отзыва:
+    - week_key       : '2025-W42'
+    - month_key      : '2025-10'
+    - quarter_key    : '2025-Q4'
+    - year_key       : '2025'
+    Это пригодится и для baseline, и для агрегации периодов.
+    """
+    out = df.copy()
+    out["week_key"] = out["date"].apply(lambda d: iso_year_week(d) if pd.notna(d) else "")
+    out["month_key"] = out["date"].dt.strftime("%Y-%m")
+    out["year_key"] = out["date"].dt.strftime("%Y")
+    out["quarter_key"] = out["date"].apply(
+        lambda d: f"{d.year}-{quarter_label(d)}" if pd.notna(d) else ""
+    )
+    return out
+
+
+###############################################################################
+# 7. Взрыв тем (explode topics)
+###############################################################################
+
+def explode_topics(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    На входе df после annotate_topics (у каждой строки отзывов есть list[TopicHit] в df["topics"]).
+    Разворачиваем в формат "одна строка = одна (отзыв, подтема)".
+
+    Возвращаем датафрейм со столбцами:
+    - idx (индекс исходного отзыва) - чтобы потом джойнить при необходимости
+    - date, week_key, month_key, quarter_key, year_key
+    - source
+    - rating10
+    - sentiment_overall
+    - category, category_display
+    - subtopic, subtopic_display
+    - subtopic_sentiment ('pos'/'neg'/'neu' внутри этой подтемы)
+    - aspects (список аспектов влияния)
+    """
+    rows = []
+
+    for idx, row in df.iterrows():
+        topics: List[TopicHit] = row.get("topics", [])
+        if not topics:
+            continue
+        for hit in topics:
+            rows.append({
+                "idx": idx,
+                "date": row["date"],
+                "week_key": row["week_key"],
+                "month_key": row["month_key"],
+                "quarter_key": row["quarter_key"],
+                "year_key": row["year_key"],
+                "source": row.get("source", ""),
+                "rating10": row.get("rating10", None),
+                "sentiment_overall": row.get("sentiment_overall", "neu"),
+
+                "category": hit.category,
+                "category_display": hit.category_display,
+                "subtopic": hit.subtopic,
+                "subtopic_display": hit.subtopic_display,
+                "subtopic_sentiment": hit.sentiment,   # эвристика по подтеме
+                "aspects": hit.aspects,               # список причинных аспектов
+            })
+
+    if not rows:
+        # Нет попаданий тем вообще
+        return pd.DataFrame(columns=[
+            "idx","date","week_key","month_key","quarter_key","year_key","source","rating10","sentiment_overall",
+            "category","category_display","subtopic","subtopic_display","subtopic_sentiment","aspects"
+        ])
+
+    exploded = pd.DataFrame(rows)
+
+    return exploded
+
+
+###############################################################################
+# 8. Агрегация тем за период
+###############################################################################
+
+@dataclass
+class TopicAggregate:
+    # Это агрегат для одной темы (категории или подтемы) в рамках одного периода.
+    mentions: int                       # сколько отзывов упоминали эту тему
+    share_pct: float                    # какая доля отзывов периода упомянула эту тему, %
+    avg_rating10: Optional[float]       # средний рейтинг10 среди упомянувших (NaN -> None)
+    neg_share_pct: float                # % негативных упоминаний этой темы
+    aspects_counter: Dict[str, int]     # какие аспекты фигурировали и сколько раз (для причин заселения и т.п.)
+
+    # поля для сравнения с baseline
+    trend_importance_pp: Optional[float]    # дельта share_pct vs baseline (в п.п.)
+    trend_quality_diff: Optional[float]     # дельта avg_rating10 vs baseline (в баллах)
+
+
+def _calc_topic_aggregate(
+    df_period: pd.DataFrame,
+    df_total_reviews_in_period: pd.DataFrame,
+    group_cols: List[str],
+) -> pd.DataFrame:
+    """
+    Универсальная вспомогательная функция.
+
+    df_period: exploded topics, но уже отфильтрованный на интересующий период
+    df_total_reviews_in_period: просто df отзывов за период (после preprocess+annotate+enrich_time_keys)
+
+    group_cols: ["category","category_display"] или
+                ["category","category_display","subtopic","subtopic_display"]
+
+    Возвращает агрегацию по этим ключам с полями:
+    - mentions
+    - share_pct
+    - avg_rating10
+    - neg_share_pct
+    - aspects_counter (dict)
+    """
+    if df_period.empty:
+        # вернём пустой df с ожидаемыми колонками
+        cols = group_cols + ["mentions","share_pct","avg_rating10","neg_share_pct","aspects_counter"]
+        return pd.DataFrame(columns=cols)
+
+    # Сколько всего отзывов в периоде (не строк в df_period, а реальных отзывов)
+    total_reviews = df_total_reviews_in_period["idx"].nunique()
+
+    # Группируем по теме
+    grp = df_period.groupby(group_cols, dropna=False)
+
+    out_rows = []
+    for gkey, subdf in grp:
+        # gkey может быть либо str, либо tuple
+        if not isinstance(gkey, tuple):
+            gkey = (gkey,)
+
+        # сколько отзывов упомянули эту тему (уникальных idx)
+        mentions = subdf["idx"].nunique()
+
+        # доля отзывов периода, где эта тема всплыла
+        share_pct = (mentions / total_reviews * 100.0) if total_reviews > 0 else 0.0
+
+        # средняя оценка среди отзывов, где тема упомянута
+        avg_rating10 = subdf.drop_duplicates("idx")["rating10"].astype(float).replace({None: np.nan}).mean()
+        if math.isnan(avg_rating10):
+            avg_rating10 = None
+
+        # негативные упоминания подтемы:
+        # считаем долю подстрок, где subtopic_sentiment == "neg"
+        neg_mentions = (subdf["subtopic_sentiment"] == "neg").sum()
+        total_mentions = len(subdf)
+        neg_share_pct = (neg_mentions / total_mentions * 100.0) if total_mentions else 0.0
+
+        # собрать аспекты влияния
+        all_aspects = []
+        for arr in subdf["aspects"]:
+            if isinstance(arr, list):
+                all_aspects.extend(arr)
+        # посчитаем сколько каких аспектов
+        aspects_counter = {}
+        for a in all_aspects:
+            aspects_counter[a] = aspects_counter.get(a, 0) + 1
+
+        out_row = dict(zip(group_cols, gkey))
+        out_row.update({
+            "mentions": mentions,
+            "share_pct": share_pct,
+            "avg_rating10": avg_rating10,
+            "neg_share_pct": neg_share_pct,
+            "aspects_counter": aspects_counter,
+        })
+        out_rows.append(out_row)
+
+    res = pd.DataFrame(out_rows)
+    return res
+
+
+def aggregate_period_topics(
+    df_reviews: pd.DataFrame,
+    df_topics_exploded: pd.DataFrame,
+    period_filter: pd.Series,
+    period_level: str,
+) -> Dict[str, pd.DataFrame]:
+    """
+    Строит агрегаты по категориям и подтемам для выбранного периода.
+
+    Вход:
+      df_reviews          - датафрейм отзывов после preprocess+annotate+enrich_time_keys,
+                            со столбцами (idx,date,rating10,week_key,...,topics)
+      df_topics_exploded  - explode_topics(df_reviews)
+      period_filter       - булева маска по df_reviews (True = отзыв входит в период)
+      period_level        - строка-индикатор для отладки, типа "week" / "month" / "year"
+
+    Выход:
+      {
+        "by_category": DataFrame[
+           category, category_display,
+           mentions, share_pct, avg_rating10, neg_share_pct, aspects_counter
+        ],
+        "by_subtopic": DataFrame[
+           category, category_display, subtopic, subtopic_display,
+           mentions, share_pct, avg_rating10, neg_share_pct, aspects_counter
+        ],
+        "total_reviews": int
+      }
+
+    """
+    # Оставляем только нужные отзывы
+    df_rev_period = df_reviews[period_filter].copy()
+    if df_rev_period.empty:
+        return {
+            "by_category": pd.DataFrame(columns=[
+                "category","category_display",
+                "mentions","share_pct","avg_rating10","neg_share_pct","aspects_counter"
+            ]),
+            "by_subtopic": pd.DataFrame(columns=[
+                "category","category_display","subtopic","subtopic_display",
+                "mentions","share_pct","avg_rating10","neg_share_pct","aspects_counter"
+            ]),
+            "total_reviews": 0,
+        }
+
+    idx_set = set(df_rev_period.index.tolist())
+
+    # отфильтруем explode по тем же отзывам
+    df_topics_period = df_topics_exploded[df_topics_exploded["idx"].isin(idx_set)].copy()
+
+    # агрегат по категориям
+    by_cat = _calc_topic_aggregate(
+        df_topics_period,
+        df_rev_period.reset_index(names="idx"),
+        ["category","category_display"],
+    )
+
+    # агрегат по подтемам
+    by_sub = _calc_topic_aggregate(
+        df_topics_period,
+        df_rev_period.reset_index(names="idx"),
+        ["category","category_display","subtopic","subtopic_display"],
+    )
+
+    return {
+        "by_category": by_cat,
+        "by_subtopic": by_sub,
+        "total_reviews": df_rev_period["idx"].nunique(),
+    }
+
+
+###############################################################################
+# 9. Базовая линия (baseline) по последним N неделям
+###############################################################################
+
+def get_recent_weeks_baseline(
+    df_reviews: pd.DataFrame,
+    df_topics_exploded: pd.DataFrame,
+    current_week_key: str,
+    n_weeks: int = 8,
+) -> Dict[str, pd.DataFrame]:
+    """
+    Строим baseline по последним n_weeks ПОЛНЫХ недель ДО текущей недели.
+    То есть если текущая неделя = 2025-W42,
+    то baseline = [W34..W41] (8 предыдущих).
+
+    Мы считаем ту же агрегацию по категориям и подтемам, но усредняем
+    доли/оценки по этим неделям.
+
+    Результат:
+      {
+        "by_category": DataFrame[
+            category, category_display,
+            base_share_pct, base_avg_rating10
+        ],
+        "by_subtopic": DataFrame[
+            category, category_display, subtopic, subtopic_display,
+            base_share_pct, base_avg_rating10
+        ]
+      }
+    """
+
+    # 1. Определим список предыдущих недель
+    #    Преобразуем week_key вида "2025-W42" в (year, week_int)
+    def parse_week_key(wk: str) -> Tuple[int,int]:
+        # "2025-W42" -> (2025,42)
+        m = re.match(r"(\d{4})-W(\d{2})$", wk)
+        if not m:
+            return (0,0)
+        return (int(m.group(1)), int(m.group(2)))
+
+    cur_y, cur_w = parse_week_key(current_week_key)
+    if cur_y == 0:
+        # нет валидной недели -> пусто
+        return {
+            "by_category": pd.DataFrame(columns=[
+                "category","category_display","base_share_pct","base_avg_rating10"
+            ]),
+            "by_subtopic": pd.DataFrame(columns=[
+                "category","category_display","subtopic","subtopic_display",
+                "base_share_pct","base_avg_rating10"
+            ])
+        }
+
+    # Генерируем список n_weeks предыдущих ключей.
+    # Учитываем переход года назад (W01 предыдущего года и т.д.).
+    prev_weeks = []
+    y, w = cur_y, cur_w
+    for _ in range(n_weeks):
+        # шаг назад на неделю
+        w -= 1
+        if w <= 0:
+            y -= 1
+            # сколько недель в том годе? ISO: обычно 52 или 53
+            # небольшая утилита:
+            last_week = pd.Timestamp(f"{y}-12-28").isocalendar().week
+            w = last_week
+        prev_weeks.append(f"{y}-W{w:02d}")
+
+    # теперь фильтруем df_reviews по этим неделям
+    mask_baseline = df_reviews["week_key"].isin(prev_weeks)
+    df_reviews_base = df_reviews[mask_baseline].copy()
+
+    if df_reviews_base.empty:
+        return {
+            "by_category": pd.DataFrame(columns=[
+                "category","category_display","base_share_pct","base_avg_rating10"
+            ]),
+            "by_subtopic": pd.DataFrame(columns=[
+                "category","category_display","subtopic","subtopic_display",
+                "base_share_pct","base_avg_rating10"
+            ])
+        }
+
+    df_topics_base = df_topics_exploded[df_topics_exploded["week_key"].isin(prev_weeks)].copy()
+
+    # baseline мы считаем так:
+    #   для каждой недели считаем агрегацию категорий и подтем,
+    #   потом усредняем эти метрики по неделям.
+    #
+    # То есть мы не просто свалили все недели в одну кучу (иначе 1 огромная неделя убьёт структуру),
+    # а усреднили по неделям, чтобы получить "типичную неделю".
+
+    def agg_one_week(week_id: str):
+        mask_w = df_reviews["week_key"] == week_id
+        return aggregate_period_topics(
+            df_reviews=df_reviews,
+            df_topics_exploded=df_topics_exploded,
+            period_filter=mask_w,
+            period_level="week",
+        )
+
+    per_week_cats = []
+    per_week_subs = []
+
+    for wk in prev_weeks:
+        wk_res = agg_one_week(wk)
+        cat_df = wk_res["by_category"].copy()
+        cat_df["week_key"] = wk
+        per_week_cats.append(cat_df)
+
+        sub_df = wk_res["by_subtopic"].copy()
+        sub_df["week_key"] = wk
+        per_week_subs.append(sub_df)
+
+    if per_week_cats:
+        cats_all = pd.concat(per_week_cats, ignore_index=True)
+    else:
+        cats_all = pd.DataFrame(columns=[
+            "category","category_display",
+            "mentions","share_pct","avg_rating10","neg_share_pct","aspects_counter","week_key"
+        ])
+
+    if per_week_subs:
+        subs_all = pd.concat(per_week_subs, ignore_index=True)
+    else:
+        subs_all = pd.DataFrame(columns=[
+            "category","category_display","subtopic","subtopic_display",
+            "mentions","share_pct","avg_rating10","neg_share_pct","aspects_counter","week_key"
+        ])
+
+    # усредняем по неделям (groupby category / subtopic)
+    def avg_over_weeks(df_in: pd.DataFrame, group_cols: List[str]) -> pd.DataFrame:
+        if df_in.empty:
+            cols = group_cols + ["base_share_pct","base_avg_rating10"]
+            return pd.DataFrame(columns=cols)
+
+        # среднее share_pct по неделям и среднее avg_rating10 по неделям
+        grouped = df_in.groupby(group_cols, dropna=False).agg({
+            "share_pct": "mean",
+            "avg_rating10": "mean",
+        }).reset_index()
+
+        grouped = grouped.rename(columns={
+            "share_pct": "base_share_pct",
+            "avg_rating10": "base_avg_rating10",
+        })
+        return grouped
+
+    base_cat = avg_over_weeks(
+        cats_all,
+        ["category","category_display"],
+    )
+
+    base_sub = avg_over_weeks(
+        subs_all,
+        ["category","category_display","subtopic","subtopic_display"],
+    )
+
+    return {
+        "by_category": base_cat,
+        "by_subtopic": base_sub,
+    }
+
+
+###############################################################################
+# 10. Обогащение текущей недели baseline-метриками
+###############################################################################
+
+def merge_with_baseline(
+    cur_df: pd.DataFrame,
+    base_df: pd.DataFrame,
+    key_cols: List[str],
+) -> pd.DataFrame:
+    """
+    Присоединяет baseline к текущей агрегации,
+    и считает тренды:
+      trend_importance_pp = share_pct - base_share_pct
+      trend_quality_diff  = avg_rating10 - base_avg_rating10
+    """
+    if cur_df.empty:
+        cols = key_cols + [
+            "mentions","share_pct","avg_rating10","neg_share_pct","aspects_counter",
+            "base_share_pct","base_avg_rating10",
+            "trend_importance_pp","trend_quality_diff",
+        ]
+        return pd.DataFrame(columns=cols)
+
+    out = cur_df.merge(
+        base_df,
+        how="left",
+        on=key_cols,
+        suffixes=("", "_base")
+    )
+
+    out["trend_importance_pp"] = out["share_pct"] - out["base_share_pct"]
+    out["trend_quality_diff"] = out["avg_rating10"] - out["base_avg_rating10"]
+
+    return out
+
+
+###############################################################################
+# 11. Главный хелпер для периода с baseline
+###############################################################################
+
+def build_period_analysis(
+    df_reviews: pd.DataFrame,
+    df_topics_exploded: pd.DataFrame,
+    period_filter: pd.Series,
+    period_level: str,
+    current_week_key: str,
+    baseline_dict: Dict[str, pd.DataFrame],
+) -> Dict[str, Any]:
+    """
+    Возвращает полную картину по периоду:
+      - агрегаты категорий и подтем за период
+      - baseline-сравнение (только для недели — но мы можем применять и к другим периодам при желании)
+      - общее число отзывов
+
+    Структура результата:
+      {
+        "total_reviews": int,
+        "by_category": DataFrame[
+            category, category_display,
+            mentions, share_pct, avg_rating10, neg_share_pct, aspects_counter,
+            base_share_pct, base_avg_rating10,
+            trend_importance_pp, trend_quality_diff
+        ],
+        "by_subtopic": DataFrame[
+            ... то же самое но с subtopic ...
+        ]
+      }
+
+    Пояснение:
+    - Для недельного периода мы будем заполнять baseline
+    - Для месяца/квартала/года baseline можем не присоединять,
+      или присоединить ту же baseline (это допустимо, но не критично в тексте).
+    """
+    # 1. Агрегация по периоду
+    agg_dict = aggregate_period_topics(
+        df_reviews=df_reviews,
+        df_topics_exploded=df_topics_exploded,
+        period_filter=period_filter,
+        period_level=period_level,
+    )
+
+    by_cat_cur = agg_dict["by_category"]
+    by_sub_cur = agg_dict["by_subtopic"]
+    total_reviews = agg_dict["total_reviews"]
+
+    # 2. Склеиваем baseline с текущей метрикой,
+    #    чтобы получить тренды (importances / quality diffs).
+    # baseline_dict:
+    #   {
+    #     "by_category": ...,
+    #     "by_subtopic": ...
+    #   }
+    #
+    # Если baseline пустой (например, первая неделя сбора данных),
+    # merge_with_baseline аккуратно отдаст NaN -> trend_importance_pp/quality_diff станут NaN.
+    by_cat_full = merge_with_baseline(
+        by_cat_cur,
+        baseline_dict.get("by_category", pd.DataFrame()),
+        ["category","category_display"],
+    )
+
+    by_sub_full = merge_with_baseline(
+        by_sub_cur,
+        baseline_dict.get("by_subtopic", pd.DataFrame()),
+        ["category","category_display","subtopic","subtopic_display"],
+    )
+
+    return {
+        "total_reviews": total_reviews,
+        "by_category": by_cat_full,
+        "by_subtopic": by_sub_full,
+    }
+
+
+###############################################################################
+# 12. Обёртка: готовим все периоды разом
+###############################################################################
+
+def prepare_all_period_summaries(
+    df_raw_reviews: pd.DataFrame,
+) -> Dict[str, Any]:
+    """
+    Главная точка входа для weekly_report_agent в будущем.
+
+    На вход:
+      df_raw_reviews — это исходный датафрейм с колонками выгрузки
+      (Дата, Рейтинг, Источник, Код языка, Текст отзыва, ...)
+
+    Шаги:
+      1. preprocess_reviews_df -> нормализация текста, оценок, языка
+      2. enrich_time_keys -> добавляем week_key, month_key, quarter_key, year_key
+      3. annotate_topics -> вытягиваем topics (List[TopicHit]) по каждой строке
+      4. explode_topics -> раздуваем по подтемам
+      5. считаем baseline по последним 8 неделям
+      6. для пяти периодов строим сводки:
+         - this_week        (по текущей неделе = последняя неделя в данных)
+         - month_to_date    (все отзывы с начала месяца этого конца недели)
+         - quarter_to_date
+         - year_to_date
+         - all_time         (всё)
+
+    Возвращаем структуру:
+      {
+        "ref": {
+            "week_key": ...,
+            "week_range": (start_date, end_date),
+            "month_label": "Октябрь 2025 г.",
+            "quarter_label": "IV кв. 2025 г.",
+            "year_label": "2025 г.",
+            "alltime_label": "Итого",
+        },
+        "this_week": { ... build_period_analysis(...) ... },
+        "mtd":       { ... },
+        "qtd":       { ... },
+        "ytd":       { ... },
+        "alltime":   { ... },
+        "df_reviews": df_reviews,               # нормализованный df
+        "df_topics_exploded": df_topics_exploded
+      }
+
+    ВАЖНО:
+    - Здесь мы не делаем HTML и не пишем письмо.
+    - Это чистый аналитический слой, чтобы агент мог красиво отрисовать.
+    """
+
+    # 1. preprocess
+    df_reviews = preprocess_reviews_df(df_raw_reviews)
+
+    # индексация для дальнейшего удобства (уникальный idx)
+    df_reviews = df_reviews.reset_index(drop=True)
+    df_reviews["idx"] = df_reviews.index
+
+    # 2. time keys
+    df_reviews = enrich_time_keys(df_reviews)
+
+    # 3. topics
+    df_reviews = annotate_topics(df_reviews)
+
+    # 4. explode
+    df_topics_exploded = explode_topics(df_reviews)
+
+    if df_reviews.empty:
+        # Пустые данные — вернём заготовку
+        return {
+            "ref": {},
+            "this_week": {},
+            "mtd": {},
+            "qtd": {},
+            "ytd": {},
+            "alltime": {},
+            "df_reviews": df_reviews,
+            "df_topics_exploded": df_topics_exploded,
+        }
+
+    # Опорная "текущая неделя" — это последняя неделя, которая есть в данных.
+    # Берем по максимальной дате.
+    last_date = df_reviews["date"].max()
+    cur_week_key = iso_year_week(last_date)
+    cur_month_key = last_date.strftime("%Y-%m")          # "2025-10"
+    cur_year_key = last_date.strftime("%Y")              # "2025"
+    cur_quarter_key = f"{last_date.year}-{quarter_label(last_date)}"
+
+    # Границы недели (понедельник-воскресенье) по last_date
+    # NOTE: pandas weekday(): Monday=0, Sunday=6
+    wd = last_date.weekday()
+    week_start = (last_date - pd.Timedelta(days=wd)).normalize()
+    week_end = (week_start + pd.Timedelta(days=6)).normalize()
+
+    # Аналогично month-start
+    month_start = last_date.replace(day=1).normalize()
+    # quarter-start
+    q = (last_date.month - 1)//3 + 1
+    q_start_month = 3*(q-1)+1
+    quarter_start = last_date.replace(month=q_start_month, day=1).normalize()
+    # year-start
+    year_start = last_date.replace(month=1, day=1).normalize()
+
+    # Метки для подписи периодов в письме
+    # Неделя: "13–19 окт 2025 г."
+    # Месяц: "Октябрь 2025 г."
+    # Квартал: "IV кв. 2025 г."
+    # Год: "2025 г."
+    # Итого: "Итого"
+    MONTH_NAMES_RU = {
+        1:"январь",2:"февраль",3:"март",4:"апрель",5:"май",6:"июнь",
+        7:"июль",8:"август",9:"сентябрь",10:"октябрь",11:"ноябрь",12:"декабрь"
+    }
+    MONTH_NAMES_RU_GEN = {
+        1:"января",2:"февраля",3:"марта",4:"апреля",5:"мая",6:"июня",
+        7:"июля",8:"августа",9:"сентября",10:"октября",11:"ноября",12:"декабря"
+    }
+    # квартал в человекочитаемой форме
+    QUARTER_NAME_RU = {
+        1:"I кв.", 2:"II кв.", 3:"III кв.", 4:"IV кв."
+    }
+
+    # Неделя: "13–19 окт 2025 г."
+    def format_week_range(d1: pd.Timestamp, d2: pd.Timestamp) -> str:
+        # пример: 13–19 окт 2025 г.
+        # берём день начала, день конца, месяц конца в родительном ("октября") и год
+        m = MONTH_NAMES_RU_GEN[d2.month]
+        return f"{d1.day}–{d2.day} {m} {d2.year} г."
+
+    # Месяц: "Октябрь 2025 г."
+    def format_month_label(d: pd.Timestamp) -> str:
+        m = MONTH_NAMES_RU[d.month].capitalize()
+        return f"{m} {d.year} г."
+
+    # Квартал: "IV кв. 2025 г."
+    def format_quarter_label(d: pd.Timestamp) -> str:
+        qq = (d.month - 1)//3 + 1
+        return f"{QUARTER_NAME_RU[qq]} {d.year} г."
+
+    # Год: "2025 г."
+    def format_year_label(d: pd.Timestamp) -> str:
+        return f"{d.year} г."
+
+    # 5. baseline: последние 8 недель ДО текущей
+    baseline = get_recent_weeks_baseline(
+        df_reviews=df_reviews,
+        df_topics_exploded=df_topics_exploded,
+        current_week_key=cur_week_key,
+        n_weeks=8,
+    )
+
+    # 6. Создаём маски для периодов
+
+    # Текущая неделя = все отзывы с week_key == cur_week_key
+    mask_week = (df_reviews["week_key"] == cur_week_key)
+
+    # Месяц-to-date = с month_start по last_date
+    mask_mtd = (df_reviews["date"] >= month_start) & (df_reviews["date"] <= last_date)
+
+    # Квартал-to-date
+    mask_qtd = (df_reviews["date"] >= quarter_start) & (df_reviews["date"] <= last_date)
+
+    # Год-to-date
+    mask_ytd = (df_reviews["date"] >= year_start) & (df_reviews["date"] <= last_date)
+
+    # Вся история
+    mask_all = pd.Series(True, index=df_reviews.index)
+
+    # 7. Сводки по периодам
+    this_week = build_period_analysis(
+        df_reviews=df_reviews,
+        df_topics_exploded=df_topics_exploded,
+        period_filter=mask_week,
+        period_level="week",
+        current_week_key=cur_week_key,
+        baseline_dict=baseline,
+    )
+    mtd = build_period_analysis(
+        df_reviews=df_reviews,
+        df_topics_exploded=df_topics_exploded,
+        period_filter=mask_mtd,
+        period_level="mtd",
+        current_week_key=cur_week_key,
+        baseline_dict=baseline,
+    )
+    qtd = build_period_analysis(
+        df_reviews=df_reviews,
+        df_topics_exploded=df_topics_exploded,
+        period_filter=mask_qtd,
+        period_level="qtd",
+        current_week_key=cur_week_key,
+        baseline_dict=baseline,
+    )
+    ytd = build_period_analysis(
+        df_reviews=df_reviews,
+        df_topics_exploded=df_topics_exploded,
+        period_filter=mask_ytd,
+        period_level="ytd",
+        current_week_key=cur_week_key,
+        baseline_dict=baseline,
+    )
+    alltime = build_period_analysis(
+        df_reviews=df_reviews,
+        df_topics_exploded=df_topics_exploded,
+        period_filter=mask_all,
+        period_level="alltime",
+        current_week_key=cur_week_key,
+        baseline_dict=baseline,
+    )
+
+    result = {
+        "ref": {
+            "week_key": cur_week_key,
+            "week_range": (week_start, week_end),
+            "week_label": f"Итоги недели {format_week_range(week_start, week_end)}",
+            "month_label": format_month_label(last_date),
+            "quarter_label": format_quarter_label(last_date),
+            "year_label": format_year_label(last_date),
+            "alltime_label": "Итого",
+
+            # Эти метки пойдут потом во врезки текста
+            "week_start": week_start,
+            "week_end": week_end,
+            "month_start": month_start,
+            "quarter_start": quarter_start,
+            "year_start": year_start,
+            "last_date": last_date,
+        },
+        "this_week": this_week,
+        "mtd": mtd,
+        "qtd": qtd,
+        "ytd": ytd,
+        "alltime": alltime,
+        "df_reviews": df_reviews,
+        "df_topics_exploded": df_topics_exploded,
+    }
+
+    return result
 
