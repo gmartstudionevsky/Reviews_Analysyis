@@ -52,6 +52,7 @@ PARAM_NAMES: Dict[str, str] = {
     "value": "Цена/качество",
     "would_return": "Готовность вернуться",
     "nps_1_5": "NPS (1-5)",
+    "nps": "NPS (1-5)"
 }
 
 def _colkey(s: str) -> str:
@@ -82,7 +83,7 @@ def find_columns(df: pd.DataFrame) -> Dict[str, str]:
     return cols
 
 def to_5_scale(x):
-    if pd.isna(x) or x == "Нет оценки":
+    if pd.isna(x) or str(x).strip() == "Нет оценки":
         return np.nan
     if isinstance(x, str):
         x = x.replace(',', '.').strip()
@@ -104,9 +105,9 @@ def normalize_surveys_df(df_raw: pd.DataFrame) -> pd.DataFrame:
     for p in PARAM_ORDER:
         col = cols.get(p)
         if col:
-            out[p] = df[col].map(to_5_scale)
+            out[p] = df[col].apply(to_5_scale)
     out = out.dropna(subset=["date"])
-    if out["overall"].isna().all():
+    if 'overall' not in out or out["overall"].isna().all():
         value_cols = [p for p in PARAM_ORDER if p not in ("overall", "nps_1_5") and p in out.columns]
         if value_cols:
             out["overall"] = out[value_cols].mean(axis=1)
@@ -119,7 +120,7 @@ def compute_nps(s: pd.Series) -> Tuple[int, int, float]:
     promoters = (s == 5).sum()
     detractors = (s <= 2).sum()
     nps = round(100 * (promoters - detractors) / valid, 2)
-    return promoters, detractors, nps
+    return int(promoters), int(detractors), nps
 
 def iso_week_key(d: date) -> str:
     year, week, _ = d.isocalendar()
@@ -155,27 +156,38 @@ def parse_and_aggregate_weekly(df_raw: pd.DataFrame) -> Tuple[pd.DataFrame, pd.D
     agg = weekly_aggregate(norm)
     return norm, agg
 
-# Date utilities
 def iso_week_monday(week_key: str) -> date:
     y, w = map(int, week_key.split("-W"))
     jan4 = date(y, 1, 4)
-    return jan4 - timedelta(days=jan4.isoweekday() - 1) + timedelta(weeks=w-1)
+    return jan4 - dt.timedelta(days=jan4.weekday()) + dt.timedelta(weeks=w-1, days=-jan4.weekday())
+
+def month_label(d: date) -> str:
+    ru_months = ["январь", "февраль", "март", "апрель", "май", "июнь", "июль", "август", "сентябрь", "октябрь", "ноябрь", "декабрь"]
+    return f"{ru_months[d.month-1]} {d.year}"
+
+def quarter_label(d: date) -> str:
+    q = (d.month - 1) // 3 + 1
+    roman = ["I", "II", "III", "IV"]
+    return f"{roman[q-1]} кв. {d.year}"
+
+def year_label(d: date) -> str:
+    return str(d.year)
 
 def period_ranges_for_week(week_start: date) -> Dict:
-    week_end = week_start + timedelta(days=6)
+    week_end = week_start + dt.timedelta(days=6)
     month_start = week_start.replace(day=1)
-    month_end = (month_start + timedelta(days=32)).replace(day=1) - timedelta(days=1)
+    month_end = (month_start + dt.timedelta(days=32)).replace(day=1) - dt.timedelta(days=1)
     quarter = (week_start.month - 1) // 3 + 1
     q_start_month = (quarter - 1) * 3 + 1
     q_start = date(week_start.year, q_start_month, 1)
-    q_end = (date(week_start.year, q_start_month + 3, 1) - timedelta(days=1)) if quarter < 4 else date(week_start.year, 12, 31)
+    q_end = (date(week_start.year, q_start_month + 3, 1) - dt.timedelta(days=1)) if quarter < 4 else date(week_start.year, 12, 31)
     year_start = date(week_start.year, 1, 1)
     year_end = date(week_start.year, 12, 31)
     return {
-        "week": {"start": week_start, "end": week_end},
-        "mtd": {"start": month_start, "end": month_end},
-        "qtd": {"start": q_start, "end": q_end},
-        "ytd": {"start": year_start, "end": year_end},
+        "week": {"start": week_start, "end": week_end, "label": f"{week_start.day}.{week_start.month}–{week_end.day}.{week_end.month}"},
+        "mtd": {"start": month_start, "end": month_end, "label": month_label(week_start)},
+        "qtd": {"start": q_start, "end": q_end, "label": quarter_label(week_start)},
+        "ytd": {"start": year_start, "end": year_end, "label": year_label(week_start)},
     }
 
 def aggregate_period(hist: pd.DataFrame, start: date, end: date) -> Dict:
@@ -189,10 +201,16 @@ def aggregate_period(hist: pd.DataFrame, start: date, end: date) -> Dict:
         if pdf.empty:
             by_param[p] = {"responses": 0, "avg5": None}
             continue
-        weights = pdf["responses"]
-        values = pdf["avg5"]
-        avg = np.average(values, weights=weights) if weights.sum() > 0 else None
-        by_param[p] = {"responses": weights.sum(), "avg5": round(avg, 2) if avg is not None else None}
+        weights = pdf["responses"].astype(int)
+        values = pdf["avg5"].astype(float)
+        valid = values.notna()
+        if valid.any():
+            avg = np.average(values[valid], weights=weights[valid])
+            responses = weights[valid].sum()
+        else:
+            avg = None
+            responses = 0
+        by_param[p] = {"responses": responses, "avg5": round(avg, 2) if avg is not None else None}
     nps_pdf = period_df[period_df["param"] == "nps"]
     if not nps_pdf.empty:
         prom = nps_pdf["promoters"].sum()
@@ -201,7 +219,7 @@ def aggregate_period(hist: pd.DataFrame, start: date, end: date) -> Dict:
         nps = round(100 * (prom - det) / tot, 2) if tot > 0 else None
     else:
         nps, tot = None, 0
-    by_param["nps"] = {"responses": tot, "avg5": None, "nps": nps}
-    total_surveys = by_param["overall"]["responses"]
-    overall_avg = by_param["overall"]["avg5"]
+    by_param["nps"] = {"responses": int(tot), "avg5": None, "nps": nps}
+    total_surveys = by_param.get("overall", {"responses": 0})["responses"]
+    overall_avg = by_param.get("overall", {"avg5": None})["avg5"]
     return {"total_surveys": total_surveys, "overall_avg5": overall_avg, "nps": by_param["nps"]["nps"], "by_param": by_param}
