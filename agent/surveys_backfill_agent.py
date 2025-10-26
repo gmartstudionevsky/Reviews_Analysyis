@@ -1,19 +1,52 @@
 # agent/surveys_backfill_agent.py
-import json
-import os, io, re, sys, datetime as dt
+#
+# Полная пересборка истории анкет TL: Marketing.
+#
+# Что делает:
+#   1. Идёт в папку DRIVE_FOLDER_ID в Google Drive.
+#   2. Собирает:
+#        - Report_history.xlsx (агрегированная история)
+#        - все Report_DD-MM-YYYY.xlsx (недельные выгрузки)
+#   3. Для каждого файла:
+#        - читает лист "Оценки гостей" (или "Reviews" в старых файлах)
+#        - прогоняет через parse_and_aggregate_weekly() из surveys_core
+#          -> получаем df_week (week_key, param, surveys_total, answered, avg5,
+#             promoters, detractors, nps_answers, nps_value)
+#   4. Сливает все результаты:
+#        - ключ = (week_key, param)
+#        - если одна и та же неделя+показатель встречается в нескольких файлах,
+#          берём последний по дате файла (т.е. более новый перезаписывает старый)
+#   5. Сортирует недели по возрастанию, параметры — по нашему порядку PARAM_ORDER.
+#   6. Полностью ПЕРЕЗАПИСЫВАЕТ лист surveys_history в Google Sheets:
+#        - сначала шапка
+#        - затем все строки.
+#
+# ЭТОТ СКРИПТ нужно запускать вручную (через отдельный workflow_dispatch),
+# а не по расписанию. В еженедельном отчёте backfill не гоняем.
+
+import os, io, re, sys, json, datetime as dt
 from datetime import date
 import pandas as pd
+import numpy as np
 
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 
-# наш модуль ядра анкет
+# импортируем ядро обработки анкет
 try:
-    from agent.surveys_core import parse_and_aggregate_weekly, SURVEYS_TAB
+    from agent.surveys_core import (
+        parse_and_aggregate_weekly,
+        SURVEYS_TAB,
+        PARAM_ORDER,
+    )
 except ModuleNotFoundError:
     sys.path.append(os.path.dirname(__file__))
-    from surveys_core import parse_and_aggregate_weekly, SURVEYS_TAB
+    from surveys_core import (
+        parse_and_aggregate_weekly,
+        SURVEYS_TAB,
+        PARAM_ORDER,
+    )
 
 # =========================
 # ENV & Google API clients
@@ -23,82 +56,100 @@ SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
 ]
 
-# поддержка двух способов: файл (GOOGLE_SERVICE_ACCOUNT_JSON) или прямой контент (GOOGLE_SERVICE_ACCOUNT_JSON_CONTENT)
 SA_PATH    = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
 SA_CONTENT = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON_CONTENT")
 
 if SA_CONTENT and SA_CONTENT.strip().startswith("{"):
     CREDS = Credentials.from_service_account_info(json.loads(SA_CONTENT), scopes=SCOPES)
 else:
+    if not SA_PATH:
+        raise RuntimeError("No GOOGLE_SERVICE_ACCOUNT_JSON or GOOGLE_SERVICE_ACCOUNT_JSON_CONTENT provided.")
     CREDS = Credentials.from_service_account_file(SA_PATH, scopes=SCOPES)
 
 DRIVE  = build("drive",  "v3", credentials=CREDS)
 SHEETS = build("sheets", "v4", credentials=CREDS).spreadsheets()
 
-DRIVE_FOLDER_ID  = os.environ["DRIVE_FOLDER_ID"]
-HISTORY_SHEET_ID = os.environ["SHEETS_HISTORY_ID"]
+DRIVE_FOLDER_ID   = os.environ["DRIVE_FOLDER_ID"]
+HISTORY_SHEET_ID  = os.environ["SHEETS_HISTORY_ID"]
 
-# ================
-# Sheets helpers
-# ================
-def ensure_tab(spreadsheet_id: str, tab_name: str, header: list[str]):
-    meta = SHEETS.get(spreadsheetId=spreadsheet_id).execute()
-    tabs = [s["properties"]["title"] for s in meta.get("sheets", [])]
-    if tab_name not in tabs:
-        SHEETS.batchUpdate(
-            spreadsheetId=spreadsheet_id,
-            body={"requests":[{"addSheet":{"properties":{"title":tab_name}}}]}
-        ).execute()
-        SHEETS.values().update(
-            spreadsheetId=spreadsheet_id,
-            range=f"{tab_name}!A1:{chr(64+len(header))}1",
-            valueInputOption="RAW",
-            body={"values":[header]}
-        ).execute()
+# =========================
+# Настройки форматов
+# =========================
 
-def gs_get_df(tab: str, a1: str) -> pd.DataFrame:
+# файлы вида Report_19-10-2025.xlsx
+WEEKLY_RE   = re.compile(r"^Report_(\d{2})-(\d{2})-(\d{4})\.xlsx$", re.IGNORECASE)
+# исторический слепок
+HISTORY_RE  = re.compile(r"^Report_history\.xlsx$", re.IGNORECASE)
+
+# Целевая шапка листа surveys_history (без avg10)
+SURVEYS_HEADER = [
+    "week_key",
+    "param",
+    "surveys_total",
+    "answered",
+    "avg5",
+    "promoters",
+    "detractors",
+    "nps_answers",
+    "nps_value",
+]
+
+def _week_sort_key(week_key: str) -> int:
+    """
+    Сортируем недели как YYYY*100 + WW.
+    Например '2025-W02' -> 202502,
+             '2025-W42' -> 202542.
+    """
     try:
-        res = SHEETS.values().get(spreadsheetId=HISTORY_SHEET_ID, range=f"{tab}!{a1}").execute()
-        vals = res.get("values", [])
-        return pd.DataFrame(vals[1:], columns=vals[0]) if len(vals)>1 else pd.DataFrame()
+        y, w = str(week_key).split("-W")
+        return int(y) * 100 + int(w)
     except Exception:
-        return pd.DataFrame()
+        return 0
 
-def gs_append(tab: str, a1: str, rows: list[list]):
-    if not rows: return
-    SHEETS.values().append(
-        spreadsheetId=HISTORY_SHEET_ID,
-        range=f"{tab}!{a1}",
-        valueInputOption="RAW",
-        body={"values": rows}
+# =========================
+# Google Drive helpers
+# =========================
+
+def drive_list_all_reports():
+    """
+    Возвращает список файлов (file_id, filename, sort_date) из папки DRIVE_FOLDER_ID,
+    которые выглядят как:
+      - Report_history.xlsx  (sort_date очень ранняя, чтобы он шёл первым)
+      - Report_DD-MM-YYYY.xlsx (sort_date = эта дата)
+    Мы сортируем по sort_date по возрастанию, так что более новые файлы
+    будут перезаписывать ранние данные той же недели.
+    """
+    res = DRIVE.files().list(
+        q=f"'{DRIVE_FOLDER_ID}' in parents and mimeType='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' and trashed=false",
+        fields="files(id,name,modifiedTime)",
+        pageSize=200,
     ).execute()
 
-# ==================
-# Drive helpers
-# ==================
-WEEKLY_RE = re.compile(r"^Report_(\d{2})-(\d{2})-(\d{4})\.xlsx$", re.IGNORECASE)
-HIST_HINT = re.compile(r"(history|истор)", re.IGNORECASE)
+    out = []
+    for f in res.get("files", []):
+        nm = f["name"]
 
-def list_reports_in_folder(folder_id: str):
-    """Возвращает список (id, name, modifiedTime) всех xlsx в папке."""
-    items=[]
-    pageToken=None
-    while True:
-        res = DRIVE.files().list(
-            q=f"'{folder_id}' in parents and trashed=false and mimeType contains 'spreadsheet'",
-            fields="nextPageToken, files(id,name,modifiedTime,mimeType)",
-            pageSize=1000,
-            pageToken=pageToken
-        ).execute()
-        items.extend(res.get("files", []))
-        pageToken = res.get("nextPageToken")
-        if not pageToken: break
-    # Google считает «Google Sheets» тоже spreadsheet — нам нужны XLSX
-    out=[]
-    for it in items:
-        name = it["name"]
-        if name.lower().endswith(".xlsx") or name.lower().endswith(".xls"):
-            out.append((it["id"], name, it.get("modifiedTime")))
+        # 1) Исторический файл без даты
+        if HISTORY_RE.match(nm):
+            sort_date = dt.date(2000,1,1)
+            out.append((f["id"], nm, sort_date))
+            continue
+
+        # 2) Регулярные файлы с датой
+        m = WEEKLY_RE.match(nm)
+        if m:
+            dd, mm, yyyy = m.groups()
+            try:
+                sort_date = dt.date(int(yyyy), int(mm), int(dd))
+            except Exception:
+                # если не удалось адекватно распарсить дату — даём очень раннюю, чтобы не убить историю
+                sort_date = dt.date(2000,1,2)
+            out.append((f["id"], nm, sort_date))
+
+    # Сначала самые старые, потом всё свежее.
+    # Важно: чем ПОЗЖЕ файл, тем ПОЗЖЕ он пройдёт цикл и "переедет"
+    # недели, найденные ранее.
+    out.sort(key=lambda x: x[2])
     return out
 
 def drive_download(file_id: str) -> bytes:
@@ -110,96 +161,152 @@ def drive_download(file_id: str) -> bytes:
         _, done = dl.next_chunk()
     return buf.getvalue()
 
-# ==================
-# Core backfill
-# ==================
-HEADER = ["week_key","param","responses","avg5","avg10","promoters","detractors","nps"]
+# =========================
+# Google Sheets helpers
+# =========================
 
-def load_existing_keys() -> set[tuple[str,str]]:
-    df = gs_get_df(SURVEYS_TAB, "A:H")
-    if df.empty: return set()
-    return set(zip(df.get("week_key",[]), df.get("param",[])))
+def ensure_tab(spreadsheet_id: str, tab_name: str, header: list[str]):
+    """
+    Убедиться, что лист есть и в A1:I1 лежит корректная шапка.
+    Мы будем перезаписывать лист полностью, включая шапку.
+    """
+    meta = SHEETS.get(spreadsheetId=spreadsheet_id).execute()
+    tabs = [s["properties"]["title"] for s in meta.get("sheets", [])]
 
-def rows_from_agg(df: pd.DataFrame) -> list[list]:
-    rows=[]
-    for _, r in df.iterrows():
+    if tab_name not in tabs:
+        # создаём лист, если его не было
+        SHEETS.batchUpdate(
+            spreadsheetId=spreadsheet_id,
+            body={"requests":[{"addSheet":{"properties":{"title":tab_name}}}]}
+        ).execute()
+
+    # пишем шапку в A1:I1 (в любом случае обновляем)
+    SHEETS.values().update(
+        spreadsheetId=spreadsheet_id,
+        range=f"{tab_name}!A1:I1",
+        valueInputOption="RAW",
+        body={"values":[header]},
+    ).execute()
+
+def write_full_history(df_all: pd.DataFrame):
+    """
+    Полностью очищает лист (кроме шапки, которую мы только что перезаписали)
+    и пишет туда все строки по порядку.
+    """
+    # удаляем всё, что было ниже заголовка
+    SHEETS.values().clear(
+        spreadsheetId=HISTORY_SHEET_ID,
+        range=f"{SURVEYS_TAB}!A2:I",
+    ).execute()
+
+    if df_all.empty:
+        print("[INFO] История пустая, нечего писать.")
+        return
+
+    # раскладываем df_all в list[list], в порядке SURVEYS_HEADER
+    rows = []
+    for _, r in df_all.iterrows():
         rows.append([
-            str(r["week_key"]),
-            str(r["param"]),
-            int(r["responses"]) if pd.notna(r["responses"]) else 0,
-            (None if pd.isna(r["avg5"]) else float(r["avg5"])),
-            (None if pd.isna(r["avg10"]) else float(r["avg10"])),
-            int(r["promoters"]) if "promoters" in r and pd.notna(r["promoters"]) else None,
-            int(r["detractors"]) if "detractors" in r and pd.notna(r["detractors"]) else None,
-            (None if ("nps" not in r or pd.isna(r["nps"])) else float(r["nps"])),
+            r["week_key"],
+            r["param"],
+            int(r["surveys_total"]) if not pd.isna(r["surveys_total"]) else 0,
+            int(r["answered"])      if not pd.isna(r["answered"])      else 0,
+            (None if pd.isna(r["avg5"])          else float(r["avg5"])),
+            (None if pd.isna(r["promoters"])     else int(r["promoters"])),
+            (None if pd.isna(r["detractors"])    else int(r["detractors"])),
+            (None if pd.isna(r["nps_answers"])   else int(r["nps_answers"])),
+            (None if pd.isna(r["nps_value"])     else float(r["nps_value"])),
         ])
-    return rows
 
-def process_excel_bytes(blob: bytes) -> pd.DataFrame:
-    xls = pd.ExcelFile(io.BytesIO(blob))
+    SHEETS.values().append(
+        spreadsheetId=HISTORY_SHEET_ID,
+        range=f"{SURVEYS_TAB}!A2",
+        valueInputOption="RAW",
+        body={"values": rows},
+    ).execute()
 
-    def choose_surveys_sheet(xls_file: pd.ExcelFile) -> pd.DataFrame:
-        preferred = ["Оcenки гостей", "Оценки гостей", "Оценки", "Ответы", "Анкеты", "Responses"]
-        for name in xls_file.sheet_names:
-            if name.strip().lower() in {p.lower() for p in preferred}:
-                return pd.read_excel(xls_file, name)
-        candidates = ["Дата", "Дата анкетирования", "Комментарий", "Средняя оценка", "№ 1", "№ 2", "№ 3"]
-        best_name, best_score = None, -1
-        for name in xls_file.sheet_names:
-            try:
-                probe = pd.read_excel(xls_file, name, nrows=1)
-                cols = [str(c) for c in probe.columns]
-                score = sum(any(cand.lower() in c.lower() for cand in candidates) for c in cols)
-                if score > best_score:
-                    best_name, best_score = name, score
-            except Exception:
-                continue
-        pick = best_name or xls_file.sheet_names[0]
-        return pd.read_excel(xls_file, pick)
+    print(f"[INFO] Загружено {len(rows)} строк в {SURVEYS_TAB}.")
 
-    df_raw = choose_surveys_sheet(xls)
-    _, agg = parse_and_aggregate_weekly(df_raw)
-    return agg
 
+# =========================
+# Основная логика backfill
+# =========================
 
 def main():
-    ensure_tab(HISTORY_SHEET_ID, SURVEYS_TAB, HEADER)
-    existing = load_existing_keys()
+    # Шаг 1. Собрать список всех источников
+    reports = drive_list_all_reports()
+    if not reports:
+        raise RuntimeError("Не нашли ни одного файла Report_*.xlsx в папке DRIVE_FOLDER_ID")
 
-    files = list_reports_in_folder(DRIVE_FOLDER_ID)
-    weekly_files, history_files = [], []
-    for fid, name, mtime in files:
-        if WEEKLY_RE.match(name):
-            weekly_files.append((fid, name, mtime))
-        elif HIST_HINT.search(name):
-            history_files.append((fid, name, mtime))
-    # сначала прогоняем исторический файл(ы), затем недельные
-    ordered = history_files + sorted(weekly_files, key=lambda t: t[1])
+    # Копим сюда все week_key+param, с приоритетом более "свежих" файлов
+    # (то есть в случае конфликта мы просто перезапишем ключ последним файлом)
+    weeks_map = {}
 
-    total_new = 0
-    for fid, name, _ in ordered:
+    # Шаг 2. Пройти по каждому файлу в порядке sort_date (от старых к новым)
+    for file_id, fname, sort_date in reports:
+        print(f"[INFO] читаем {fname} ({sort_date})")
+        blob = drive_download(file_id)
+        xls = pd.ExcelFile(io.BytesIO(blob))
+
+        # Нам нужно то, что содержит анкеты.
+        if "Оценки гостей" in xls.sheet_names:
+            raw = pd.read_excel(xls, sheet_name="Оценки гостей")
+        else:
+            # fallback для старых исторических файлов
+            raw = pd.read_excel(xls, sheet_name="Reviews")
+
+        # Нормализация+агрегация недели с учётом НОВОЙ логики (без avg10)
+        _, agg_week = parse_and_aggregate_weekly(raw)
+        # agg_week:
+        # week_key, param, surveys_total, answered, avg5,
+        # promoters, detractors, nps_answers, nps_value
+
+        for _, row in agg_week.iterrows():
+            key = (str(row["week_key"]), str(row["param"]))
+            weeks_map[key] = row.to_dict()
+
+    # Шаг 3. Превратить weeks_map обратно в DataFrame
+    if not weeks_map:
+        raise RuntimeError("После агрегации не осталось строк (скорее всего выгрузки пустые).")
+
+    df_all = pd.DataFrame(list(weeks_map.values()))
+
+    # Добавим сортировку:
+    #  - сначала недели по возрастанию,
+    #  - внутри недели — по нашему порядку PARAM_ORDER
+    def param_sort_key(p):
         try:
-            blob = drive_download(fid)
-            agg = process_excel_bytes(blob)
-            if agg.empty:
-                continue
-            # фильтр дублей по (week_key,param)
-            need = []
-            for _, r in agg.iterrows():
-                k = (str(r["week_key"]), str(r["param"]))
-                if k not in existing:
-                    need.append(r)
-                    existing.add(k)
-            if not need:
-                continue
-            rows = rows_from_agg(pd.DataFrame(need))
-            gs_append(SURVEYS_TAB, "A:H", rows)
-            total_new += len(rows)
-        except Exception as e:
-            # просто продолжаем следующий файл
-            print(f"[WARN] Failed {name}: {e}")
+            return PARAM_ORDER.index(p)
+        except ValueError:
+            return 999
 
-    print(f"[OK] Surveys backfill: appended {total_new} new rows into '{SURVEYS_TAB}'.")
+    df_all["__week_sort"]  = df_all["week_key"].map(_week_sort_key)
+    df_all["__param_sort"] = df_all["param"].map(param_sort_key)
+
+    df_all = (
+        df_all.sort_values(["__week_sort", "__param_sort"])
+              .drop(columns=["__week_sort", "__param_sort"])
+              .reset_index(drop=True)
+    )
+
+    # Убедимся, что порядок колонок соответствует нашей шапке
+    df_all = df_all[[
+        "week_key",
+        "param",
+        "surveys_total",
+        "answered",
+        "avg5",
+        "promoters",
+        "detractors",
+        "nps_answers",
+        "nps_value",
+    ]]
+
+    # Шаг 4. Перезаписываем лист в Google Sheets
+    ensure_tab(HISTORY_SHEET_ID, SURVEYS_TAB, SURVEYS_HEADER)
+    write_full_history(df_all)
+
+    print("[INFO] Backfill завершён успешно.")
 
 if __name__ == "__main__":
     main()
