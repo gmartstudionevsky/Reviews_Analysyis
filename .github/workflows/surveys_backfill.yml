@@ -1,4 +1,4 @@
-name: Surveys Backfill (b64)
+name: Surveys Backfill
 
 on:
   workflow_dispatch: {}   # запуск вручную из Actions
