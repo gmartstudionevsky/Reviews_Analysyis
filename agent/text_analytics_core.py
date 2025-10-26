@@ -1664,3 +1664,419 @@ def prepare_all_period_summaries(
 
     return result
 
+###############################################################################
+# 13. Форматирование чисел для отчёта
+###############################################################################
+
+def fmt_score(v: Optional[float]) -> str:
+    """
+    Возвращает строку с округлением до десятых или '—', если нет данных.
+    Пример: 9.06 -> '9.1'
+    """
+    if v is None or (isinstance(v, float) and math.isnan(v)):
+        return "—"
+    try:
+        return f"{float(v):.1f}"
+    except Exception:
+        return "—"
+
+def fmt_pct(v: Optional[float]) -> str:
+    """
+    Округляет до десятых и добавляет %.
+    12.345 -> '12.3 %'
+    """
+    if v is None or (isinstance(v, float) and math.isnan(v)):
+        return "—"
+    try:
+        return f"{float(v):.1f} %"
+    except Exception:
+        return "—"
+
+def safe_get(series: pd.Series, default=None):
+    """
+    Утилита, чтобы безопасно доставать значения из Series.loc[...] без KeyError.
+    """
+    try:
+        return series.iloc[0]
+    except Exception:
+        return default
+###############################################################################
+# 14. Выбор "ключевых" тем недели и формирование отклонений
+###############################################################################
+
+def pick_key_topics_for_week(
+    by_cat_week: pd.DataFrame,
+    by_sub_week: pd.DataFrame,
+    min_mentions: int = 2,
+    quality_drop_thr: float = -0.3,
+    quality_rise_thr: float = 0.3,
+    importance_rise_thr_pp: float = 5.0,
+    importance_fall_thr_pp: float = -10.0,
+) -> Dict[str, Any]:
+    """
+    Анализирует сводку текущей недели (by_category и by_subtopic)
+    и выбирает:
+    - темы, которые просели по качеству
+    - темы, которые выросли по качеству
+    - темы, которые резко чаще упоминаются (гостей волнует)
+    - темы, которые сейчас почти не волнуют (молчание)
+    
+    Возвращает словарь с полями:
+      {
+        "weaker": [ { "name": "...", "delta_quality": -0.4 }, ... ],
+        "stronger": [ { "name": "...", "delta_quality": +0.5 }, ... ],
+        "hot_attention": [ { "name": "...", "delta_importance_pp": +7.5 }, ... ],
+        "calm_down": [ { "name": "...", "delta_importance_pp": -12.0 }, ... ]
+      }
+
+    Здесь "name" — человекочитаемое имя (category_display).
+    """
+    weaker = []
+    stronger = []
+    hot_attention = []
+    calm_down = []
+
+    # Мы смотрим на уровень КАТЕГОРИЙ, потому что это управленческий уровень.
+    dfc = by_cat_week.copy()
+
+    if dfc.empty:
+        return {
+            "weaker": weaker,
+            "stronger": stronger,
+            "hot_attention": hot_attention,
+            "calm_down": calm_down,
+        }
+
+    # оставим только значимые темы
+    dfc = dfc[dfc["mentions"] >= min_mentions].copy()
+
+    for _, row in dfc.iterrows():
+        name = row["category_display"]
+        dq = row.get("trend_quality_diff", np.nan)
+        di = row.get("trend_importance_pp", np.nan)
+        neg_share = row.get("neg_share_pct", 0.0)
+
+        # просадка качества
+        if not pd.isna(dq) and dq <= quality_drop_thr:
+            weaker.append({
+                "name": name,
+                "delta_quality": dq,
+            })
+
+        # рост качества
+        if not pd.isna(dq) and dq >= quality_rise_thr:
+            stronger.append({
+                "name": name,
+                "delta_quality": dq,
+            })
+
+        # рост важности темы (гостей волнует чаще обычного).
+        # Если важность растёт и при этом негатив высокий — это "горит".
+        if not pd.isna(di) and di >= importance_rise_thr_pp:
+            hot_attention.append({
+                "name": name,
+                "delta_importance_pp": di,
+                "neg_share_pct": neg_share,
+            })
+
+        # падение важности темы + нет негатива -> спокойная зона.
+        if (
+            not pd.isna(di)
+            and di <= importance_fall_thr_pp
+            and (neg_share is not None)
+            and (neg_share < 10.0)  # низкий негатив
+        ):
+            calm_down.append({
+                "name": name,
+                "delta_importance_pp": di,
+            })
+
+    return {
+        "weaker": weaker,
+        "stronger": stronger,
+        "hot_attention": hot_attention,
+        "calm_down": calm_down,
+    }
+###############################################################################
+# 15. Анализ причин проблем с заселением (category="checkin_stay")
+###############################################################################
+
+def analyze_checkin_root_causes(
+    by_sub_week: pd.DataFrame,
+    category_key: str = "checkin_stay",
+    aspect_labels: Dict[str, str] = None,
+) -> Optional[str]:
+    """
+    Строит краткий текст о том, что было причиной проблем с заселением/проживанием.
+
+    Ищем подтемы внутри категории checkin_stay (заселение и проживание),
+    суммируем aspects_counter по ним, считаем, что доминирует.
+
+    aspect_labels: словарь для человекочитаемых формулировок аспектов:
+        {
+          "staff_slow": "нехватка оперативности персонала",
+          "room_not_ready": "номер не был готов вовремя (уборка / подготовка)",
+          "tech_access_issue": "технические сложности с доступом (коды, ключи, замки)"
+        }
+
+    Возвращает строку (русский текст) или None, если ничего нет.
+    """
+    if aspect_labels is None:
+        aspect_labels = {
+            "staff_slow": "оперативности сотрудников СПиР",
+            "room_not_ready": "готовности номера к заселению (уборка / подготовка)",
+            "tech_access_issue": "технического доступа (коды, карты, замки, лифт)",
+        }
+
+    # отфильтруем строки по категории
+    df_checkin = by_sub_week[by_sub_week["category"] == category_key].copy()
+    if df_checkin.empty:
+        return None
+
+    # собираем все aspects_counter
+    total_counter = {}
+    for _, row in df_checkin.iterrows():
+        ac = row.get("aspects_counter", {})
+        if not isinstance(ac, dict):
+            continue
+        for k, v in ac.items():
+            total_counter[k] = total_counter.get(k, 0) + v
+
+    if not total_counter:
+        return None
+
+    # сортируем по значимости
+    sorted_aspects = sorted(total_counter.items(), key=lambda x: x[1], reverse=True)
+
+    # Возьмём топ-2 причин и построим человекочитаемую фразу.
+    parts = []
+    for i, (asp_key, count) in enumerate(sorted_aspects[:2]):
+        human = aspect_labels.get(asp_key, asp_key)
+        parts.append(human)
+
+    if not parts:
+        return None
+
+    if len(parts) == 1:
+        return (
+            "Отмечаем, что замечания по заселению в основном связаны с "
+            + parts[0]
+            + "."
+        )
+    else:
+        return (
+            "Отмечаем, что замечания по заселению в основном связаны с "
+            + parts[0]
+            + ", а также с "
+            + parts[1]
+            + "."
+        )
+###############################################################################
+# 16. Формирование текстовых блоков для письма
+###############################################################################
+
+def summarize_overview_for_header(
+    ref_info: Dict[str, Any],
+    this_week: Dict[str, Any],
+    mtd: Dict[str, Any],
+    qtd: Dict[str, Any],
+    ytd: Dict[str, Any],
+    alltime: Dict[str, Any],
+) -> str:
+    """
+    Возвращает текстовый блок (HTML-параграфы) для шапки письма.
+    Он описывает текущую неделю и роль этой недели относительно месяца/квартала/года/итого.
+
+    Логика:
+    - Число отзывов недели и средняя оценка недели.
+    - Доля позитива/негатива недели.
+    - Какой вклад эта неделя даёт в MTD/QTD/YTD (в процентах отзывов).
+    - Ничего про "/10" в тексте.
+    """
+
+    # полезные краткие метрики: средний рейтинг недели, доля позитива и негатива недели
+    def get_basic_week_stats(block: Dict[str, Any]) -> Dict[str, Any]:
+        df_by_cat = block["by_category"]
+        total_reviews = block["total_reviews"]
+
+        # средняя оценка недели в целом:
+        # просто среднее rating10 по всем отзывам периода
+        # (не только темам). Это нужно достать из df_reviews, но у нас
+        # здесь нет df_reviews. Поэтому чуть ниже мы отметим, что
+        # weekly_report_agent при финальной сборке должен передать эти числа явно.
+        #
+        # Для каркаса пока поставим None -> "—".
+        avg_rating_overall = None
+
+        # посчитаем % позитива / негатива по sentiment_overall,
+        # но это тоже требует df_reviews периода. Аналогично — агент может это посчитать
+        # и передать как параметры. Здесь формально оставим "—".
+        pos_pct = None
+        neg_pct = None
+
+        return {
+            "total_reviews": total_reviews,
+            "avg_rating_overall": avg_rating_overall,
+            "pos_pct": pos_pct,
+            "neg_pct": neg_pct,
+        }
+
+    wk_stats = get_basic_week_stats(this_week)
+
+    # вклад недели в larger periods (% отзывов)
+    def share_in(b_small: Dict[str,Any], b_big: Dict[str,Any]) -> Optional[float]:
+        num_small = b_small["total_reviews"]
+        num_big = b_big["total_reviews"]
+        if not num_big:
+            return None
+        return (num_small / num_big) * 100.0
+
+    share_in_mtd = share_in(this_week, mtd)
+    share_in_qtd = share_in(this_week, qtd)
+    share_in_ytd = share_in(this_week, ytd)
+    share_in_all = share_in(this_week, alltime)
+
+    # формируем фразы
+    # Пример тона:
+    # "<b>Текущая неделя:</b> 14 отзывов, средняя оценка 9.1. Позитивные упоминания — 78.6 %, негативные — 7.1 %."
+    # "Эта неделя дала около 62 % всех отзывов за месяц и идёт на уровне общего тона месяца."
+    p_week = (
+        "<p>"
+        f"<b>Текущая неделя:</b> {wk_stats['total_reviews']} отзыв(ов). "
+        f"Средняя оценка — {fmt_score(wk_stats['avg_rating_overall'])}. "
+        f"Позитивные упоминания — {fmt_pct(wk_stats['pos_pct'])}, "
+        f"негативные — {fmt_pct(wk_stats['neg_pct'])}."
+        "</p>"
+    )
+
+    # второе предложение: вклад недели
+    parts_role = []
+    if share_in_mtd is not None:
+        parts_role.append(
+            f"Эта неделя дала примерно {fmt_pct(share_in_mtd)[:-2]} всех отзывов за месяц"
+        )
+    if share_in_qtd is not None:
+        parts_role.append(
+            f"{fmt_pct(share_in_qtd)[:-2]} за квартал"
+        )
+    if share_in_ytd is not None:
+        parts_role.append(
+            f"{fmt_pct(share_in_ytd)[:-2]} за год"
+        )
+    if share_in_all is not None:
+        parts_role.append(
+            f"{fmt_pct(share_in_all)[:-2]} за всю совокупность отзывов"
+        )
+
+    if parts_role:
+        role_sentence = (
+            "<p><b>Роль недели в общей статистике:</b> "
+            + "; ".join(parts_role)
+            + ".</p>"
+        )
+    else:
+        role_sentence = ""
+
+    return p_week + role_sentence
+
+
+def summarize_trends_block(
+    by_cat_week: pd.DataFrame,
+    picked: Dict[str, Any],
+) -> str:
+    """
+    Формирует текст блока "Динамика и вклад текущей недели":
+    - ниже исторического уровня,
+    - выше исторического уровня,
+    - что особенно волнует гостей,
+    - что сейчас не вызывает жалоб.
+    
+    Формат:
+    <h3>Динамика и вклад текущей недели</h3>
+    <p><b>Существенные отклонения этой недели по темам:</b><br>
+    <span style="color:#c0392b;"><b>Ниже исторического уровня</b></span> — ...<br>
+    <span style="color:#2e8b57;"><b>Выше исторического уровня</b></span> — ...<br>
+    ...
+    </p>
+    """
+
+    weaker_lines = []
+    for w in picked["weaker"]:
+        delta_q = fmt_score(w["delta_quality"])
+        # delta_q уже со знаком (напр. -0.4), fmt_score оставит минус
+        weaker_lines.append(f"«{w['name']}» ({delta_q})")
+
+    stronger_lines = []
+    for s in picked["stronger"]:
+        delta_q = fmt_score(s["delta_quality"])
+        stronger_lines.append(f"«{s['name']}» (+{delta_q.lstrip('-')})")
+
+    hot_lines = []
+    for h in picked["hot_attention"]:
+        di = fmt_score(h["delta_importance_pp"])  # рост важности, в п.п.
+        # fmt_score не добавляет %, добавим позже текстом
+        hot_lines.append(
+            f"«{h['name']}» (+{di.lstrip('-')} п.п. к типичной частоте обсуждения)"
+        )
+
+    calm_lines = []
+    for c in picked["calm_down"]:
+        di = fmt_score(c["delta_importance_pp"])
+        calm_lines.append(
+            f"«{c['name']}» (−{di.lstrip('-')} п.п. к обычной частоте, жалоб практически нет)"
+        )
+
+    # собираем абзац
+    lines = []
+
+    lines.append("<p><b>Существенные отклонения этой недели по темам:</b><br>")
+
+    # Ниже исторического уровня
+    if weaker_lines:
+        lines.append(
+            '<span style="color:#c0392b;"><b>Ниже исторического уровня</b></span> — '
+            + ", ".join(weaker_lines)
+            + ".<br>"
+        )
+
+    # Выше исторического уровня
+    if stronger_lines:
+        lines.append(
+            '<span style="color:#2e8b57;"><b>Выше исторического уровня</b></span> — '
+            + ", ".join(stronger_lines)
+            + ".<br>"
+        )
+
+    # Часто волнует
+    if hot_lines:
+        lines.append(
+            "<b>Особенно часто упоминалось</b> — "
+            + ", ".join(hot_lines)
+            + ".<br>"
+        )
+
+    # Спокойно
+    if calm_lines:
+        lines.append(
+            "Отдельно отметим спокойные зоны — "
+            + ", ".join(calm_lines)
+            + "."
+        )
+
+    lines.append("</p>")
+
+    return "\n".join(lines)
+
+
+def summarize_checkin_line(root_cause_text: Optional[str]) -> str:
+    """
+    Возвращает фразу о причинах заселения, если есть.
+    Если нет причин — возвращает "".
+    """
+    if not root_cause_text:
+        return ""
+    return (
+        "<p><b>Заселение и проживание.</b> "
+        + root_cause_text +
+        "</p>"
+    )
