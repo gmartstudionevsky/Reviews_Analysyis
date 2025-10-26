@@ -1,46 +1,40 @@
-name: Surveys Backfill
-
-on:
-  workflow_dispatch: {}
-
-jobs:
-  backfill:
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Install deps
-        run: |
-          python -m pip install --upgrade pip
-          pip install pandas numpy google-api-python-client google-auth google-auth-oauthlib google-auth-httplib2 openpyxl xlrd
-
-      # 👇 вот этот шаг — ключевой
-      - name: Decode service account key
-        # Мы декодируем твой секрет GOOGLE_SERVICE_ACCOUNT_JSON_B64
-        # и сохраняем как файл /tmp/sa.json
-        run: |
-          echo "${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON_B64 }}" | base64 -d > /tmp/sa.json
-          # на всякий случай проверим, что в файле действительно JSON
-          head -c 200 /tmp/sa.json || true
-
-      - name: Run surveys backfill
-        env:
-          # путь к только что созданному файлу с ключом
-          GOOGLE_SERVICE_ACCOUNT_JSON: /tmp/sa.json
-
-          # эти два уже были и продолжают работать:
-          DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
-          SHEETS_HISTORY_ID: ${{ secrets.SHEETS_HISTORY_ID }}
-
-          # эти переменные нам больше не нужны, но
-          # код умеет с ними жить, так что просто не передаём:
-          # GOOGLE_SERVICE_ACCOUNT_JSON_CONTENT
-        run: |
-          python -m agent.surveys_backfill_agent
+ name: Surveys Backfill
+ 
+ on:
+   workflow_dispatch: {}
+ 
+ jobs:
+   backfill:
+     runs-on: ubuntu-latest
+ 
+     steps:
+       - name: Checkout repo
+         uses: actions/checkout@v4
+ 
+       - name: Set up Python
+         uses: actions/setup-python@v5
+         with:
+           python-version: "3.11"
+ 
+       - name: Install deps
+         run: |
+           python -m pip install --upgrade pip
+           pip install pandas numpy google-api-python-client google-auth google-auth-oauthlib google-auth-httplib2 openpyxl xlrd
+ 
+-      - name: Decode service account key
+-        run: |
+-          echo "${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON_B64 }}" | base64 -d > /tmp/sa.json
+-          head -c 200 /tmp/sa.json || true
+-
+       - name: Run surveys backfill
+         env:
+-          GOOGLE_SERVICE_ACCOUNT_JSON: /tmp/sa.json
+-          # GOOGLE_SERVICE_ACCOUNT_JSON_CONTENT: (не нужен)
++          # главный секрет доступа к Google в base64
++          GOOGLE_SERVICE_ACCOUNT_JSON_B64: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON_B64 }}
++
+           DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
+           SHEETS_HISTORY_ID: ${{ secrets.SHEETS_HISTORY_ID }}
+ 
+         run: |
+           python -m agent.surveys_backfill_agent
