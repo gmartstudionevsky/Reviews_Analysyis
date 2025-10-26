@@ -1,177 +1,107 @@
 # agent/surveys_backfill_agent.py
-# Бэкфилл всей истории анкет в единый лист surveys_raw (1 строка = 1 анкета).
-#
-# Запуск: python -m agent.surveys_backfill_agent
-#
-# Что делает:
-# 1. Лезет в папку на Google Drive (DRIVE_FOLDER_ID).
-# 2. Находит все файлы с анкетами:
-#    - Report_dd-mm-yyyy.xlsx
-#    - любые XLSX/XLS, где в имени есть "history" или "истор"
-# 3. Парсит каждый, нормализует (surveys_core.normalize_surveys_file).
-# 4. В таблице SHEETS_HISTORY_ID создаёт лист "surveys_raw", если его нет.
-# 5. Достраивает новые строки без дублей (по survey_id).
+import json
+import os, io, re, sys, datetime as dt
+from datetime import date
+import pandas as pd
 
--import json
--import os, io, re, sys, datetime as dt
-+import json
-+import base64
-+import os, io, re, sys, datetime as dt
- from datetime import date
- import pandas as pd
- 
- from google.oauth2.service_account import Credentials
- from googleapiclient.discovery import build
- from googleapiclient.http import MediaIoBaseDownload
- 
-@@
- SCOPES = [
-     "https://www.googleapis.com/auth/drive.readonly",
-     "https://www.googleapis.com/auth/spreadsheets",
- ]
- 
--# поддержка двух способов: файл (GOOGLE_SERVICE_ACCOUNT_JSON) или прямой контент (GOOGLE_SERVICE_ACCOUNT_JSON_CONTENT)
--SA_PATH    = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
--SA_CONTENT = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON_CONTENT")
--
--if SA_CONTENT and SA_CONTENT.strip().startswith("{"):
--    CREDS = Credentials.from_service_account_info(json.loads(SA_CONTENT), scopes=SCOPES)
--else:
--    CREDS = Credentials.from_service_account_file(SA_PATH, scopes=SCOPES)
-+# поддерживаем 3 способа:
-+# 1) GOOGLE_SERVICE_ACCOUNT_JSON_B64  (base64 от полного JSON ключа)
-+# 2) GOOGLE_SERVICE_ACCOUNT_JSON_CONTENT (сырой JSON как текст)
-+# 3) GOOGLE_SERVICE_ACCOUNT_JSON (путь к файлу .json)
-+SA_B64     = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON_B64")
-+SA_CONTENT = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON_CONTENT")
-+SA_PATH    = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
-+
-+if SA_B64:
-+    # декодируем base64 → dict и создаём учётку из него
-+    decoded_bytes = base64.b64decode(SA_B64)
-+    decoded_str   = decoded_bytes.decode("utf-8")
-+    CREDS = Credentials.from_service_account_info(json.loads(decoded_str), scopes=SCOPES)
-+elif SA_CONTENT and SA_CONTENT.strip().startswith("{"):
-+    CREDS = Credentials.from_service_account_info(json.loads(SA_CONTENT), scopes=SCOPES)
-+elif SA_PATH:
-+    CREDS = Credentials.from_service_account_file(SA_PATH, scopes=SCOPES)
-+else:
-+    raise RuntimeError(
-+        "Не найден ни один из секретов сервисного аккаунта: "
-+        "GOOGLE_SERVICE_ACCOUNT_JSON_B64 / GOOGLE_SERVICE_ACCOUNT_JSON_CONTENT / GOOGLE_SERVICE_ACCOUNT_JSON"
-+    )
- 
- DRIVE  = build("drive",  "v3", credentials=CREDS)
- SHEETS = build("sheets", "v4", credentials=CREDS).spreadsheets()
- 
- DRIVE_FOLDER_ID  = os.environ["DRIVE_FOLDER_ID"]
- SHEETS_HISTORY_ID = os.environ["SHEETS_HISTORY_ID"]
+from google.oauth2.service_account import Credentials
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseDownload
 
+# наш модуль ядра анкет
+try:
+    from agent.surveys_core import parse_and_aggregate_weekly, SURVEYS_TAB
+except ModuleNotFoundError:
+    sys.path.append(os.path.dirname(__file__))
+    from surveys_core import parse_and_aggregate_weekly, SURVEYS_TAB
 
-SURVEYS_SHEET_TAB = "surveys_raw"
-
-SURVEYS_HEADER = [
-    "survey_id", "date", "week_key",
-    "overall5",
-    "fo_checkin5", "clean_checkin5", "room_comfort5",
-    "fo_stay5", "its_service5", "hsk_stay5", "breakfast5",
-    "atmosphere5", "location5", "value5", "would_return5",
-    "nps5",
-    "comment",
+# =========================
+# ENV & Google API clients
+# =========================
+SCOPES = [
+    "https://www.googleapis.com/auth/drive.readonly",
+    "https://www.googleapis.com/auth/spreadsheets",
 ]
 
+# поддержка двух способов: файл (GOOGLE_SERVICE_ACCOUNT_JSON) или прямой контент (GOOGLE_SERVICE_ACCOUNT_JSON_CONTENT)
+SA_PATH    = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
+SA_CONTENT = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON_CONTENT")
 
-# -------------------
-# Работа с Google Sheets
-# -------------------
+if SA_CONTENT and SA_CONTENT.strip().startswith("{"):
+    CREDS = Credentials.from_service_account_info(json.loads(SA_CONTENT), scopes=SCOPES)
+else:
+    CREDS = Credentials.from_service_account_file(SA_PATH, scopes=SCOPES)
+
+DRIVE  = build("drive",  "v3", credentials=CREDS)
+SHEETS = build("sheets", "v4", credentials=CREDS).spreadsheets()
+
+DRIVE_FOLDER_ID  = os.environ["DRIVE_FOLDER_ID"]
+HISTORY_SHEET_ID = os.environ["SHEETS_HISTORY_ID"]
+
+# ================
+# Sheets helpers
+# ================
 def ensure_tab(spreadsheet_id: str, tab_name: str, header: list[str]):
-    """Если листа нет – создаём и записываем заголовок."""
     meta = SHEETS.get(spreadsheetId=spreadsheet_id).execute()
-    have_titles = [s["properties"]["title"] for s in meta.get("sheets", [])]
-    if tab_name not in have_titles:
-        # создаём новый лист
+    tabs = [s["properties"]["title"] for s in meta.get("sheets", [])]
+    if tab_name not in tabs:
         SHEETS.batchUpdate(
             spreadsheetId=spreadsheet_id,
             body={"requests":[{"addSheet":{"properties":{"title":tab_name}}}]}
         ).execute()
-        # пишем заголовок
         SHEETS.values().update(
             spreadsheetId=spreadsheet_id,
             range=f"{tab_name}!A1:{chr(64+len(header))}1",
             valueInputOption="RAW",
-            body={"values":[header]},
+            body={"values":[header]}
         ).execute()
 
-def gs_read_all_raw() -> pd.DataFrame:
-    """Читаем уже загруженные анкеты из surveys_raw (если он вообще есть)."""
+def gs_get_df(tab: str, a1: str) -> pd.DataFrame:
     try:
-        res = SHEETS.values().get(
-            spreadsheetId=HISTORY_SHEET_ID,
-            range=f"{SURVEYS_SHEET_TAB}!A1:Z999999"  # с запасом
-        ).execute()
+        res = SHEETS.values().get(spreadsheetId=HISTORY_SHEET_ID, range=f"{tab}!{a1}").execute()
         vals = res.get("values", [])
-        if not vals or len(vals) < 2:
-            return pd.DataFrame(columns=SURVEYS_HEADER)
-        header = vals[0]
-        data   = vals[1:]
-        df = pd.DataFrame(data, columns=header)
-        return df
+        return pd.DataFrame(vals[1:], columns=vals[0]) if len(vals)>1 else pd.DataFrame()
     except Exception:
-        # если вкладки ещё нет - вернём пустой DF
-        return pd.DataFrame(columns=SURVEYS_HEADER)
+        return pd.DataFrame()
 
-def gs_append_rows(rows: list[list[str | float | None]]):
-    """Дописать строки в конец surveys_raw."""
-    if not rows:
-        return
+def gs_append(tab: str, a1: str, rows: list[list]):
+    if not rows: return
     SHEETS.values().append(
         spreadsheetId=HISTORY_SHEET_ID,
-        range=f"{SURVEYS_SHEET_TAB}!A1",
+        range=f"{tab}!{a1}",
         valueInputOption="RAW",
-        body={"values": rows},
+        body={"values": rows}
     ).execute()
 
+# ==================
+# Drive helpers
+# ==================
+WEEKLY_RE = re.compile(r"^Report_(\d{2})-(\d{2})-(\d{4})\.xlsx$", re.IGNORECASE)
+HIST_HINT = re.compile(r"(history|истор)", re.IGNORECASE)
 
-# -------------------
-# Работа с Google Drive
-# -------------------
-WEEKLY_RE   = re.compile(r"^Report_(\d{2})-(\d{2})-(\d{4})\.xlsx?$", re.IGNORECASE)
-HISTORY_RE  = re.compile(r"(history|истор)", re.IGNORECASE)
-
-def list_candidate_files(folder_id: str):
-    """
-    Забрать все XLS/XLSX из папки:
-    - которые выглядят как Report_dd-mm-yyyy.xlsx
-    - или содержат 'history'/'истор' в названии
-    """
-    items = []
-    page_token = None
+def list_reports_in_folder(folder_id: str):
+    """Возвращает список (id, name, modifiedTime) всех xlsx в папке."""
+    items=[]
+    pageToken=None
     while True:
-        resp = DRIVE.files().list(
-            q=f"'{folder_id}' in parents and trashed=false",
-            fields="nextPageToken, files(id,name,mimeType,modifiedTime)",
+        res = DRIVE.files().list(
+            q=f"'{folder_id}' in parents and trashed=false and mimeType contains 'spreadsheet'",
+            fields="nextPageToken, files(id,name,modifiedTime,mimeType)",
             pageSize=1000,
-            pageToken=page_token
+            pageToken=pageToken
         ).execute()
-        for f in resp.get("files", []):
-            name = f["name"]
-            lname = name.lower()
-            if lname.endswith(".xlsx") or lname.endswith(".xls"):
-                if WEEKLY_RE.match(name) or HISTORY_RE.search(name):
-                    items.append((f["id"], f["name"], f.get("modifiedTime","")))
-        page_token = resp.get("nextPageToken")
-        if not page_token:
-            break
+        items.extend(res.get("files", []))
+        pageToken = res.get("nextPageToken")
+        if not pageToken: break
+    # Google считает «Google Sheets» тоже spreadsheet — нам нужны XLSX
+    out=[]
+    for it in items:
+        name = it["name"]
+        if name.lower().endswith(".xlsx") or name.lower().endswith(".xls"):
+            out.append((it["id"], name, it.get("modifiedTime")))
+    return out
 
-    # упорядочим: сначала history файлы (они, как правило, общие выгрузки), потом недельные по дате
-    hist_files   = [it for it in items if HISTORY_RE.search(it[1])]
-    weekly_files = [it for it in items if WEEKLY_RE.match(it[1])]
-    # weekly отсортируем по имени (дата в имени файла)
-    weekly_files.sort(key=lambda x: x[1])
-    return hist_files + weekly_files
-
-def drive_download_bytes(file_id: str) -> bytes:
-    """Скачать бинарник XLS/XLSX из Google Drive."""
+def drive_download(file_id: str) -> bytes:
     req = DRIVE.files().get_media(fileId=file_id)
     buf = io.BytesIO()
     dl = MediaIoBaseDownload(buf, req)
@@ -180,139 +110,96 @@ def drive_download_bytes(file_id: str) -> bytes:
         _, done = dl.next_chunk()
     return buf.getvalue()
 
+# ==================
+# Core backfill
+# ==================
+HEADER = ["week_key","param","responses","avg5","avg10","promoters","detractors","nps"]
 
-def pick_sheet_with_surveys(xls: pd.ExcelFile) -> pd.DataFrame:
-    """
-    Эвристика выбора нужного листа внутри Excel-файла.
-    Ищем лист по названию и/или по колонкам.
-    """
-    preferred_names = ["Оценки гостей", "Оценки", "Ответы", "Анкеты", "Responses"]
-    norm_pref = {p.lower() for p in preferred_names}
+def load_existing_keys() -> set[tuple[str,str]]:
+    df = gs_get_df(SURVEYS_TAB, "A:H")
+    if df.empty: return set()
+    return set(zip(df.get("week_key",[]), df.get("param",[])))
 
-    # 1) прямое совпадение по имени
-    for sh in xls.sheet_names:
-        if sh.strip().lower() in norm_pref:
-            return pd.read_excel(xls, sh)
+def rows_from_agg(df: pd.DataFrame) -> list[list]:
+    rows=[]
+    for _, r in df.iterrows():
+        rows.append([
+            str(r["week_key"]),
+            str(r["param"]),
+            int(r["responses"]) if pd.notna(r["responses"]) else 0,
+            (None if pd.isna(r["avg5"]) else float(r["avg5"])),
+            (None if pd.isna(r["avg10"]) else float(r["avg10"])),
+            int(r["promoters"]) if "promoters" in r and pd.notna(r["promoters"]) else None,
+            int(r["detractors"]) if "detractors" in r and pd.notna(r["detractors"]) else None,
+            (None if ("nps" not in r or pd.isna(r["nps"])) else float(r["nps"])),
+        ])
+    return rows
 
-    # 2) эвристика по колонкам
-    probe_keywords = [
-        "Дата", "Дата анкетирования", "Комментарий", "Средняя оценка", "№ 1", "№ 2", "№ 3",
-        "Оцените работу службы приёма", "готовность вернуться", "расположение отеля",
-    ]
+def process_excel_bytes(blob: bytes) -> pd.DataFrame:
+    xls = pd.ExcelFile(io.BytesIO(blob))
 
-    best_sheet   = None
-    best_score   = -1
-    for sh in xls.sheet_names:
-        try:
-            small = pd.read_excel(xls, sh, nrows=1)
-        except Exception:
-            continue
-        cols = [str(c) for c in small.columns]
-        score = sum(any(pk.lower() in c.lower() for c in cols) for pk in probe_keywords)
-        if score > best_score:
-            best_sheet = sh
-            best_score = score
-
-    if best_sheet is None:
-        # fallback — просто первый лист
-        best_sheet = xls.sheet_names[0]
-
-    return pd.read_excel(xls, best_sheet)
-
-
-# -------------------
-# Основная логика бэкфилла
-# -------------------
-def backfill_all():
-    # Убедимся, что лист существует
-    ensure_tab(HISTORY_SHEET_ID, SURVEYS_SHEET_TAB, SURVEYS_HEADER)
-
-    # Читаем то, что уже лежит в surveys_raw
-    already_df = gs_read_all_raw()
-    existing_ids = set(already_df["survey_id"].tolist()) if "survey_id" in already_df.columns else set()
-
-    candidates = list_candidate_files(DRIVE_FOLDER_ID)
-
-    new_rows_total = 0
-
-    for file_id, name, mtime in candidates:
-        print(f"[INFO] Обрабатываем файл {name} ...")
-        try:
-            blob = drive_download_bytes(file_id)
-            xls  = pd.ExcelFile(io.BytesIO(blob))
-            raw  = pick_sheet_with_surveys(xls)
-
-            norm = normalize_surveys_file(raw)
-            if norm.empty:
-                print(f"[WARN] {name}: после нормализации пусто")
+    def choose_surveys_sheet(xls_file: pd.ExcelFile) -> pd.DataFrame:
+        preferred = ["Оcenки гостей", "Оценки гостей", "Оценки", "Ответы", "Анкеты", "Responses"]
+        for name in xls_file.sheet_names:
+            if name.strip().lower() in {p.lower() for p in preferred}:
+                return pd.read_excel(xls_file, name)
+        candidates = ["Дата", "Дата анкетирования", "Комментарий", "Средняя оценка", "№ 1", "№ 2", "№ 3"]
+        best_name, best_score = None, -1
+        for name in xls_file.sheet_names:
+            try:
+                probe = pd.read_excel(xls_file, name, nrows=1)
+                cols = [str(c) for c in probe.columns]
+                score = sum(any(cand.lower() in c.lower() for cand in candidates) for c in cols)
+                if score > best_score:
+                    best_name, best_score = name, score
+            except Exception:
                 continue
+        pick = best_name or xls_file.sheet_names[0]
+        return pd.read_excel(xls_file, pick)
 
-            # фильтруем только новые анкеты (по survey_id)
-            norm_new = norm[~norm["survey_id"].isin(existing_ids)].copy()
-            if norm_new.empty:
-                print(f"[INFO] {name}: нет новых анкет, всё уже есть")
-                continue
-
-            # добавляем их в existing_ids, чтобы не задублировать далее в этом же прогонах
-            for sid in norm_new["survey_id"]:
-                existing_ids.add(sid)
-
-            # готовим к апенду в Sheets
-            # (каждую строку превращаем в массив значений в порядке SURVEYS_HEADER)
-            to_append = []
-            for _, r in norm_new.iterrows():
-                row_list = [
-                    str(r.get("survey_id","")),
-                    str(r.get("date","")),
-                    str(r.get("week_key","")),
-                    _safe_num(r.get("overall5")),
-                    _safe_num(r.get("fo_checkin5")),
-                    _safe_num(r.get("clean_checkin5")),
-                    _safe_num(r.get("room_comfort5")),
-                    _safe_num(r.get("fo_stay5")),
-                    _safe_num(r.get("its_service5")),
-                    _safe_num(r.get("hsk_stay5")),
-                    _safe_num(r.get("breakfast5")),
-                    _safe_num(r.get("atmosphere5")),
-                    _safe_num(r.get("location5")),
-                    _safe_num(r.get("value5")),
-                    _safe_num(r.get("would_return5")),
-                    _safe_num(r.get("nps5")),
-                    str(r.get("comment","")),
-                ]
-                to_append.append(row_list)
-
-            gs_append_rows(to_append)
-            new_rows_total += len(to_append)
-            print(f"[OK] {name}: добавлено {len(to_append)} новых анкет")
-
-        except Exception as e:
-            # не падаем на одном битом файле — просто логируем
-            print(f"[ERROR] {name}: {e}")
-
-    print(f"[DONE] Бэкфилл завершён. Новых анкет добавлено: {new_rows_total}")
-
-
-def _safe_num(x):
-    """Приводим число к float с точкой или '' если NaN, чтобы красиво легло в Google Sheets."""
-    if x is None:
-        return ""
-    if isinstance(x, (float, int, np.floating, np.integer)):
-        if pd.isna(x):
-            return ""
-        return float(x)
-    try:
-        f = float(x)
-        if pd.isna(f):
-            return ""
-        return f
-    except Exception:
-        return ""
+    df_raw = choose_surveys_sheet(xls)
+    _, agg = parse_and_aggregate_weekly(df_raw)
+    return agg
 
 
 def main():
-    backfill_all()
+    ensure_tab(HISTORY_SHEET_ID, SURVEYS_TAB, HEADER)
+    existing = load_existing_keys()
 
+    files = list_reports_in_folder(DRIVE_FOLDER_ID)
+    weekly_files, history_files = [], []
+    for fid, name, mtime in files:
+        if WEEKLY_RE.match(name):
+            weekly_files.append((fid, name, mtime))
+        elif HIST_HINT.search(name):
+            history_files.append((fid, name, mtime))
+    # сначала прогоняем исторический файл(ы), затем недельные
+    ordered = history_files + sorted(weekly_files, key=lambda t: t[1])
+
+    total_new = 0
+    for fid, name, _ in ordered:
+        try:
+            blob = drive_download(fid)
+            agg = process_excel_bytes(blob)
+            if agg.empty:
+                continue
+            # фильтр дублей по (week_key,param)
+            need = []
+            for _, r in agg.iterrows():
+                k = (str(r["week_key"]), str(r["param"]))
+                if k not in existing:
+                    need.append(r)
+                    existing.add(k)
+            if not need:
+                continue
+            rows = rows_from_agg(pd.DataFrame(need))
+            gs_append(SURVEYS_TAB, "A:H", rows)
+            total_new += len(rows)
+        except Exception as e:
+            # просто продолжаем следующий файл
+            print(f"[WARN] Failed {name}: {e}")
+
+    print(f"[OK] Surveys backfill: appended {total_new} new rows into '{SURVEYS_TAB}'.")
 
 if __name__ == "__main__":
     main()
