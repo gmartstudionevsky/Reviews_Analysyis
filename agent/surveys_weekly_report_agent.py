@@ -1,12 +1,17 @@
 # agent/surveys_weekly_report_agent.py
+#
 # Еженедельный отчёт по анкетам TL: Marketing
 #
-# Версия с исправлением средних значений:
-# - корректно читаем числа с запятой ("4,71") из Google Sheets
-# - корректно считаем средние /5 и показываем их в письме
+# Чистая версия без avg10:
+# - формат листа surveys_history теперь:
+#   week_key, param, surveys_total, answered, avg5,
+#   promoters, detractors, nps_answers, nps_value
 #
-# avg10 пока остаётся в истории (в шите), но не используется в письме.
-# На следующем шаге уберём avg10 из пайплайна полностью.
+# - upsert_week() пишет/обновляет в этом формате
+# - surveys_aggregate_period() и письмо работают только с /5 и NPS
+#
+# Предпосылка: лист surveys_history в Google Sheets ты очистил до шапки
+# и готов принять новые данные.
 
 import os, io, re, sys, json, math, datetime as dt
 from datetime import date
@@ -101,6 +106,9 @@ SMTP_PORT         = int(os.environ.get("SMTP_PORT", 587))
 WEEKLY_RE = re.compile(r"^Report_(\d{2})-(\d{2})-(\d{4})\.xlsx$", re.IGNORECASE)
 
 def latest_report_from_drive():
+    """
+    Берём самый свежий файл вида Report_DD-MM-YYYY.xlsx из папки DRIVE_FOLDER_ID.
+    """
     res = DRIVE.files().list(
         q=f"'{DRIVE_FOLDER_ID}' in parents and mimeType='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' and trashed=false",
         fields="files(id,name,modifiedTime)",
@@ -119,7 +127,7 @@ def latest_report_from_drive():
     if not items:
         raise RuntimeError("В папке нет файлов вида Report_dd-mm-yyyy.xlsx.")
     items.sort(key=lambda t: t[2], reverse=True)
-    return items[0]  # (file_id, filename, date)
+    return items[0]  # (file_id, filename, date_obj)
 
 def drive_download(file_id: str) -> bytes:
     req = DRIVE.files().get_media(fileId=file_id)
@@ -134,6 +142,10 @@ def drive_download(file_id: str) -> bytes:
 # Sheets helpers
 # =========================
 def ensure_tab(spreadsheet_id: str, tab_name: str, header: list[str]):
+    """
+    Гарантируем, что лист существует и в первой строке правильный заголовок.
+    Если лист создаётся заново, сразу пишем шапку.
+    """
     meta = SHEETS.get(spreadsheetId=spreadsheet_id).execute()
     tabs = [s["properties"]["title"] for s in meta.get("sheets", [])]
     if tab_name not in tabs:
@@ -147,8 +159,24 @@ def ensure_tab(spreadsheet_id: str, tab_name: str, header: list[str]):
             valueInputOption="RAW",
             body={"values":[header]},
         ).execute()
+    else:
+        # Если лист уже есть, мы не трогаем шапку автоматически.
+        # Но если хочешь, можешь раскомментить этот блок, чтобы на каждом запуске
+        # гарантированно восстанавливать шапку в A1:I1.
+        #
+        # SHEETS.values().update(
+        #     spreadsheetId=spreadsheet_id,
+        #     range=f"{tab_name}!A1:{chr(64+len(header))}1",
+        #     valueInputOption="RAW",
+        #     body={"values":[header]},
+        # ).execute()
+        pass
 
 def gs_get_df(tab: str, a1: str) -> pd.DataFrame:
+    """
+    Считать диапазон из Google Sheets в pandas.DataFrame.
+    Возвращает пустой df, если нет данных под шапкой.
+    """
     try:
         res = SHEETS.values().get(
             spreadsheetId=HISTORY_SHEET_ID,
@@ -159,14 +187,13 @@ def gs_get_df(tab: str, a1: str) -> pd.DataFrame:
     except Exception:
         return pd.DataFrame()
 
-# структура листа surveys_history (пока в ней avg10 остаётся для совместимости с текущими данными)
+# Новая целевая шапка surveys_history — без avg10
 SURVEYS_HEADER = [
     "week_key",
     "param",
     "surveys_total",
     "answered",
     "avg5",
-    "avg10",
     "promoters",
     "detractors",
     "nps_answers",
@@ -174,6 +201,12 @@ SURVEYS_HEADER = [
 ]
 
 def rows_from_agg(df: pd.DataFrame) -> list[list]:
+    """
+    Преобразуем недельную агрегацию (agg_week из surveys_core) к строкам для шита.
+    df ожидается с колонками:
+      week_key, param, surveys_total, answered, avg5,
+      promoters, detractors, nps_answers, nps_value
+    """
     out = []
     for _, r in df.iterrows():
         out.append([
@@ -181,8 +214,7 @@ def rows_from_agg(df: pd.DataFrame) -> list[list]:
             str(r["param"]),
             (int(r["surveys_total"]) if not pd.isna(r["surveys_total"]) else 0),
             (int(r["answered"])      if not pd.isna(r["answered"])      else 0),
-            (None if pd.isna(r["avg5"])        else float(r["avg5"])),
-            (None if pd.isna(r["avg10"])       else float(r["avg10"])),
+            (None if pd.isna(r["avg5"])          else float(r["avg5"])),
             (None if "promoters"    not in r or pd.isna(r["promoters"])    else int(r["promoters"])),
             (None if "detractors"   not in r or pd.isna(r["detractors"])   else int(r["detractors"])),
             (None if "nps_answers"  not in r or pd.isna(r["nps_answers"])  else int(r["nps_answers"])),
@@ -192,11 +224,12 @@ def rows_from_agg(df: pd.DataFrame) -> list[list]:
 
 def upsert_week(agg_week_df: pd.DataFrame) -> int:
     """
-    Перезаписываем ТОЛЬКО эту неделю:
-     - читаем текущую историю
-     - выкидываем строки той же week_key
-     - чистим строковые данные ниже заголовка
-     - записываем обратно (старые недели + новая неделя)
+    Обновляем в шите только одну неделю:
+    - читаем текущую историю
+    - выкидываем строки с той же week_key
+    - чистим всё тело листа (кроме заголовка)
+    - пишем обратно старые недели + новую неделю
+    Формат без avg10 (A:I).
     """
     if agg_week_df.empty:
         return 0
@@ -205,17 +238,17 @@ def upsert_week(agg_week_df: pd.DataFrame) -> int:
 
     wk = str(agg_week_df["week_key"].iloc[0])
 
-    hist = gs_get_df(SURVEYS_TAB, "A:J")
+    hist = gs_get_df(SURVEYS_TAB, "A:I")
     keep = (
         hist[hist.get("week_key", "") != wk]
         if not hist.empty
         else pd.DataFrame(columns=SURVEYS_HEADER)
     )
 
-    # очистка листа со второй строки
+    # подчистить старые значения под шапкой
     SHEETS.values().clear(
         spreadsheetId=HISTORY_SHEET_ID,
-        range=f"{SURVEYS_TAB}!A2:J",
+        range=f"{SURVEYS_TAB}!A2:I",
     ).execute()
 
     rows_keep = keep[SURVEYS_HEADER].values.tolist() if not keep.empty else []
@@ -237,15 +270,13 @@ def upsert_week(agg_week_df: pd.DataFrame) -> int:
 
 def _to_num_series(s: pd.Series) -> pd.Series:
     """
-    Приводим серию значений из Google Sheets к числам:
-    - заменяем запятую на точку
-    - конвертим в float
-    Всё, что не удаётся, становится NaN.
+    Приводим данные из Sheets к числам:
+    - '4,71' → 4.71
+    - '5'    → 5.0
+    - всё некорректное → NaN
     """
     if s is None:
         return pd.Series(dtype="float64")
-
-    # в таблице могут быть уже числа (float/int), тогда astype(str) им не навредит
     return pd.to_numeric(
         s.astype(str).str.replace(",", ".", regex=False),
         errors="coerce"
@@ -253,9 +284,9 @@ def _to_num_series(s: pd.Series) -> pd.Series:
 
 def _weighted_avg(values: pd.Series, weights: pd.Series) -> float | None:
     """
-    Взвешенная средняя по /5.
-    values  = средние за недели (могут быть строками "4,71")
-    weights = answered за недели (могут быть строками "5")
+    Взвешенная средняя по /5:
+    - values  = средние /5 по неделям (как строки из Sheets)
+    - weights = answered по неделям (как строки из Sheets)
     """
     v = _to_num_series(values)
     w = _to_num_series(weights)
@@ -273,12 +304,11 @@ def _weighted_avg(values: pd.Series, weights: pd.Series) -> float | None:
 
 def surveys_aggregate_period(history_df: pd.DataFrame, start: date, end: date) -> dict:
     """
-    Собираем агрегаты за период [start; end] по всем параметрам.
-
-    Возвращает:
+    Считаем агрегат за произвольный период (неделя / месяц / квартал / год / итого).
+    Возвращаем:
     {
-      "by_param": DataFrame с колонками:
-          param, surveys_total, answered, avg5, avg10,
+      "by_param": DataFrame с колонками
+          param, surveys_total, answered, avg5,
           promoters, detractors, nps_answers, nps_value
       "totals": {
           "surveys_total": int,
@@ -288,8 +318,8 @@ def surveys_aggregate_period(history_df: pd.DataFrame, start: date, end: date) -
     }
 
     Логика:
-    - Средняя /5 считается взвешенно по числу ответивших.
-    - NPS = (%промоутеров - %детракторов)*100 по тем, кто ответил на NPS.
+    - средняя avg5 взвешивается по answered;
+    - NPS считается из промоутеров и детракторов.
     """
 
     empty_bp_cols = [
@@ -297,7 +327,6 @@ def surveys_aggregate_period(history_df: pd.DataFrame, start: date, end: date) -
         "surveys_total",
         "answered",
         "avg5",
-        "avg10",
         "promoters",
         "detractors",
         "nps_answers",
@@ -311,12 +340,11 @@ def surveys_aggregate_period(history_df: pd.DataFrame, start: date, end: date) -
 
     df = history_df.copy()
 
-    # Грубо нормализуем числовые столбцы сразу после чтения из Google Sheets
+    # приведение всех числовых столбцов
     numeric_cols = [
         "surveys_total",
         "answered",
         "avg5",
-        "avg10",
         "promoters",
         "detractors",
         "nps_answers",
@@ -326,8 +354,9 @@ def surveys_aggregate_period(history_df: pd.DataFrame, start: date, end: date) -
         if c in df.columns:
             df[c] = _to_num_series(df[c])
 
-    # Вычисляем понедельник недели из week_key и фильтруем интервал периода
+    # добавляем понедельник ISO-недели, чтобы фильтровать по диапазону
     df["mon"] = df["week_key"].map(lambda k: iso_week_monday(str(k)))
+
     df = df[(df["mon"] >= start) & (df["mon"] <= end)].copy()
     if df.empty:
         return {
@@ -341,18 +370,11 @@ def surveys_aggregate_period(history_df: pd.DataFrame, start: date, end: date) -
         answered_sum      = int(_to_num_series(g["answered"]).fillna(0).sum())
 
         avg5_weighted  = _weighted_avg(g["avg5"], g["answered"])
-        # avg10 взвешенно для совместимости со структурой, хотя в письме его не показываем
-        if "avg10" in g.columns:
-            avg10_weighted = _weighted_avg(g["avg10"], g["answered"])
-        else:
-            avg10_weighted = None
 
-        # NPS только для param == "nps"
         promoters_sum   = None
         detractors_sum  = None
         nps_answers_sum = None
         nps_val         = None
-
         if param == "nps":
             promoters_sum   = int(_to_num_series(g.get("promoters",   pd.Series())).fillna(0).sum())
             detractors_sum  = int(_to_num_series(g.get("detractors",  pd.Series())).fillna(0).sum())
@@ -368,11 +390,10 @@ def surveys_aggregate_period(history_df: pd.DataFrame, start: date, end: date) -
                 )
 
         rows.append({
-            "param":        param,
+            "param":         param,
             "surveys_total": surveys_total_sum,
             "answered":      answered_sum,
             "avg5":          avg5_weighted,
-            "avg10":         avg10_weighted,
             "promoters":     promoters_sum,
             "detractors":    detractors_sum,
             "nps_answers":   nps_answers_sum,
@@ -424,7 +445,6 @@ def fmt_int(x):
 def fmt_nps(x):
     if x is None or (isinstance(x, float) and np.isnan(x)):
         return "—"
-    # одна цифра после запятой/точки ок (в письме ты видел "60.0")
     return f"{float(x):.1f}"
 
 def header_block(week_start: date, week_end: date, W: dict, M: dict, Q: dict, Y: dict, T: dict):
@@ -560,6 +580,9 @@ def _week_order_key(k):
         return 0
 
 def plot_radar_params(week_df: pd.DataFrame, month_df: pd.DataFrame, path_png: str):
+    """
+    Радар-диаграмма (Неделя vs Месяц) по средним /5 по ключевым параметрам.
+    """
     if week_df is None or week_df.empty or month_df is None or month_df.empty:
         return None
 
@@ -591,7 +614,7 @@ def plot_radar_params(week_df: pd.DataFrame, month_df: pd.DataFrame, path_png: s
     ]
     order = [p for p in order if (p in W or p in M)]
     if len(order) < 3:
-        return None
+        return None  # без минимум 3 осей радар выглядит странно
 
     labels = [PARAM_TITLES.get(p, p) for p in order]
     wvals  = [W.get(p, np.nan) for p in order]
@@ -627,14 +650,21 @@ def plot_radar_params(week_df: pd.DataFrame, month_df: pd.DataFrame, path_png: s
     return path_png
 
 def plot_params_heatmap(history_df: pd.DataFrame, path_png: str):
+    """
+    Теплокарта по последним 8 неделям:
+    строки — параметры с наибольшим числом ответов,
+    колонки — недели,
+    значение цвета — средняя /5.
+    """
     if history_df is None or history_df.empty:
         return None
 
     df = history_df.copy()
-    for c in ["avg5", "answered"]:
-        if c in df.columns:
-            df[c] = _to_num_series(df[c])
+    # числа с запятой → float
+    df["avg5"] = _to_num_series(df.get("avg5", pd.Series(dtype=str)))
+    df["answered"] = _to_num_series(df.get("answered", pd.Series(dtype=str)))
 
+    # NPS не кладём в теплокарту - это не /5
     df = df[df["param"] != "nps"].copy()
     if df.empty:
         return None
@@ -684,20 +714,19 @@ def plot_params_heatmap(history_df: pd.DataFrame, path_png: str):
     return path_png
 
 def plot_overall_nps_trends(history_df: pd.DataFrame, path_png: str):
+    """
+    Линейный график за 12 последних недель:
+    - итоговая оценка /5,
+    - NPS,
+    + 4-недельное скользящее.
+    """
     if history_df is None or history_df.empty:
         return None
 
     df = history_df.copy()
-    df["avg5"] = np.where(
-        df["avg5"].notna(),
-        _to_num_series(df["avg5"]),
-        np.nan
-    )
-    df["nps_value"] = np.where(
-        df["nps_value"].notna(),
-        _to_num_series(df["nps_value"]),
-        np.nan
-    )
+
+    df["avg5"] = _to_num_series(df.get("avg5", pd.Series(dtype=str)))
+    df["nps_value"] = _to_num_series(df.get("nps_value", pd.Series(dtype=str)))
 
     ov  = df[df["param"] == "overall"][["week_key","avg5"]]
     npv = df[df["param"] == "nps"][["week_key","nps_value"]]
@@ -791,7 +820,7 @@ def send_email(subject, html_body, attachments=None):
 # Main
 # =========================
 def main():
-    # 1) берём последний отчёт Report_DD-MM-YYYY.xlsx из Drive
+    # 1) Берём свежий отчёт (Report_DD-MM-YYYY.xlsx) из Drive
     file_id, fname, fdate = latest_report_from_drive()
     data = drive_download(file_id)
 
@@ -799,27 +828,31 @@ def main():
     if "Оценки гостей" in xls.sheet_names:
         raw = pd.read_excel(xls, sheet_name="Оценки гостей")
     else:
+        # fallback на старую структуру
         raw = pd.read_excel(xls, sheet_name="Reviews")
 
-    # нормализация и недельная агрегация
+    # нормализация и недельная агрегация по новой логике из surveys_core
     norm_df, agg_week = parse_and_aggregate_weekly(raw)
 
-    # 2) обновляем лист surveys_history без дублей по неделе
+    # 2) обновляем лист surveys_history:
+    #    - без дублей по неделе
     added = upsert_week(agg_week)
     print(f"[INFO] upsert_week(): добавлено строк недели: {added}")
 
-    # перечитываем всю историю (уже с новой неделей)
-    hist = gs_get_df(SURVEYS_TAB, "A:J")
+    # 3) читаем всю историю обратно
+    hist = gs_get_df(SURVEYS_TAB, "A:I")
     if hist.empty:
         raise RuntimeError("surveys_history пуст — нечего анализировать.")
 
+    # определяем дату текущей недели
     wk_key = str(agg_week["week_key"].iloc[0])
     w_start = iso_week_monday(wk_key)
     w_end   = w_start + dt.timedelta(days=6)
 
+    # периоды: неделя / месяц-to-date / квартал-to-date / год-to-date
     ranges = period_ranges_for_week(w_start)
 
-    # "Итого (вся история)" — от первой недели в шите до последней
+    # Итого за всё время: от первой недели в истории до последней
     hist_mondays = hist["week_key"].map(lambda k: iso_week_monday(str(k)))
     all_start = hist_mondays.min()
     all_end   = hist_mondays.max() + dt.timedelta(days=6)
@@ -831,11 +864,12 @@ def main():
     Y = surveys_aggregate_period(hist, ranges["ytd"]["start"], ranges["ytd"]["end"])
     T = surveys_aggregate_period(hist, all_start, all_end)
 
+    # Тело письма
     head  = header_block(w_start, w_end, W, M, Q, Y, T)
     table = table_params_block(W["by_param"], M["by_param"], Q["by_param"], Y["by_param"], T["by_param"])
     html  = head + table + footnote_block()
 
-    # графики
+    # Построение графиков
     charts = []
     p1 = "/tmp/surveys_radar.png"
     p2 = "/tmp/surveys_heatmap.png"
