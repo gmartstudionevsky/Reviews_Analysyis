@@ -2,35 +2,37 @@
 #
 # ARTSTUDIO Nevsky — еженедельный отчёт по анкетам TL: Marketing
 #
-# Версия с расширенной аналитикой:
-# - Корректные расчёты по 5-балльной шкале (без avg10)
-# - NPS считается по формуле промоутеры-дектракторы в п.п., и выводится как %
-# - Письмо с новой структурой:
+# Версия с расширенной аналитикой и финальными штрихами оформления:
+# - корректные расчёты по 5-балльной шкале (без avg10)
+# - NPS считается в п.п. и выводится как %
+# - оформление письма с акцентами жирным, фирменными цветами и мягким фоном
+# - в тексте НЕ упоминаем "/5", кроме методики в сноске
+# - в шапке вместо " · " используем обычные точки
+# - вклад недели формулируется в понятных терминах ("Текущая неделя дала около 62% всех анкет за месяц")
+# - при описании отклонений по параметрам выводим отдельными строками "Ниже..." и "Выше..."
+#   и перечисляем несколько параметров сразу при необходимости
+#
+# Структура письма:
 #   1. Шапка:
-#      - "Итоги недели …"
+#      - "Итоги недели ..."
 #      - Месяц / Квартал / Год / Итого:
-#         • показатели периода
-#         • вклад текущей недели
-#         • влияние этой недели на среднюю оценку и NPS
-#         • список параметров, где эта неделя заметно лучше / хуже уровня периода
-#         • цветной маркер ▲/▼ перед названием периода
-#   2. Таблица параметров качества по периодам
+#           • показатели периода
+#           • вклад текущей недели
+#           • влияние этой недели на среднюю оценку и NPS
+#           • существенные отклонения по параметрам (ниже / выше уровня периода)
+#           • цветной маркер ▲ / ▼ перед названием периода
+#   2. Таблица параметров качества
 #   3. Динамика и точки внимания:
-#      - текущая неделя vs предыдущая неделя
+#      - текущая неделя vs предыдущая
 #      - текущая неделя vs средний уровень последних недель
-#      - ключевые сигналы недели (что особенно хорошо / требует внимания)
+#      - ключевые сигналы этой недели
 #      - тревожные точки (⚠)
 #   4. Сравнение с прошлым годом:
 #      - таблица
-#      - комментарий с плюсами/минусами
+#      - комментарий с плюсами и минусами
 #   5. Сноска с методикой
 #
-# - Графики (PNG-вложения):
-#   • Радар: текущая неделя vs средний уровень последних недель
-#   • Теплокарта: оценки параметров за последние 8 недель
-#   • Линейный тренд: итоговая оценка и NPS за 12 недель
-#
-# Цветовая палитра:
+# Цветовая палитра (бренд):
 #   Основные:
 #     RGB 196 154 95   -> #C49A5F  (границы / акценты)
 #     RGB 38 45 54     -> #262D36  (основной текст)
@@ -145,8 +147,8 @@ SMTP_PORT         = int(os.environ.get("SMTP_PORT", 587))
 # =========================================
 
 COLOR_TEXT_MAIN   = "#262D36"  # основной тёмный
-COLOR_BG_HEADER   = "#FFF6E5"  # мягкий бежевый фон
-COLOR_BORDER      = "#C49A5F"  # рамки/границы
+COLOR_BG_HEADER   = "#FFF6E5"  # мягкий фон
+COLOR_BORDER      = "#C49A5F"  # границы/рамки
 COLOR_POSITIVE    = "#FFCC00"  # позитив ▲
 COLOR_NEGATIVE    = "#EF7D17"  # негатив ▼
 
@@ -253,7 +255,7 @@ SURVEYS_HEADER = [
 
 def rows_from_agg(df: pd.DataFrame) -> list[list]:
     """
-    перевод недельной агрегации (agg_week из surveys_core) → строки для Sheets
+    agg_week → строки для Sheets
     """
     out = []
     for _, r in df.iterrows():
@@ -272,9 +274,9 @@ def rows_from_agg(df: pd.DataFrame) -> list[list]:
 
 def upsert_week(agg_week_df: pd.DataFrame) -> int:
     """
-    Обновить данные за данную неделю в листе surveys_history:
+    Обновить данные за неделю в листе surveys_history:
     - удалить старые строки с этим week_key
-    - записать все остальные + новые
+    - записать всё остальное + новые строки
     """
     if agg_week_df.empty:
         return 0
@@ -290,7 +292,7 @@ def upsert_week(agg_week_df: pd.DataFrame) -> int:
         pd.DataFrame(columns=SURVEYS_HEADER)
     )
 
-    # очистка тела
+    # очистим тело
     SHEETS.values().clear(
         spreadsheetId=HISTORY_SHEET_ID,
         range=f"{SURVEYS_TAB}!A2:I",
@@ -329,7 +331,7 @@ def add_year_suffix(label_no_g: str) -> str:
     return f"{label_no_g} г."
 
 def pretty_month_label(d: date) -> str:
-    ml = month_label(d)  # напр. "октябрь 2025"
+    ml = month_label(d)  # "октябрь 2025"
     ml_cap = ml[0].upper() + ml[1:]
     return f"{ml_cap} г."
 
@@ -348,16 +350,12 @@ def shift_year_back_safe(d: date) -> date:
 
 def week_short_label_for_key(week_key: str, ref_year: int|None=None) -> str:
     """
-    Для теплокарты: компактный подпись недели вида '13–19 окт' или '13–19 окт 2025'
-    Если ref_year задан и совпадает с годом, год не пишем.
+    Для теплокарты: короткая подпись недели вида '13–19 окт' или '13–19 окт 2025'
     """
     start = iso_week_monday(str(week_key))
     end = start + dt.timedelta(days=6)
 
     same_year = (start.year == end.year)
-    # показываем год, если:
-    # - пересекает год
-    # - ref_year задан и != start.year
     show_year = (not same_year) or (ref_year is not None and ref_year != start.year)
 
     if start.month == end.month and start.year == end.year:
@@ -399,7 +397,7 @@ def _weighted_avg(values: pd.Series, weights: pd.Series) -> float|None:
 
 def surveys_aggregate_period(history_df: pd.DataFrame, start: date, end: date) -> dict:
     """
-    Возвращает словарь:
+    Возвращает:
     {
       "by_param": df[param, surveys_total, answered, avg5,
                      promoters, detractors, nps_answers, nps_value],
@@ -500,9 +498,6 @@ def _to_float_or_none(x):
         return None
 
 def fmt_avg5(x):
-    """
-    '4.7' или '—'
-    """
     v = _to_float_or_none(x)
     if v is None:
         return "—"
@@ -522,8 +517,7 @@ def fmt_nps(x):
 
 def signed_delta(val_diff, suffix=""):
     """
-    val_diff: float
-    return "+0.3", "−0.4 п.п.", "0.0"
+    "+0.3", "−0.4 п.п.", "0.0"
     """
     if val_diff is None:
         return "0.0" + suffix
@@ -538,19 +532,18 @@ def signed_delta(val_diff, suffix=""):
 
 def delta_text_relative(cur, base, score_suffix="", nps_suffix=" п.п.", for_nps=False):
     """
-    Возвращает:
-      - "выше среднего уровня месяца (+0.3)"
-      - "ниже среднего уровня месяца (−0.4)"
-      - "на уровне месяца"
-    Внешний код подставит "месяца"/"квартала"/"года" и т.д.
+    Возвращает кортеж (phrase, arrow_html_or_None).
+    phrase, например:
+      "выше среднего уровня (+0.3)"
+      "ниже среднего уровня (−0.4)"
+      "на уровне"
     """
     c = _to_float_or_none(cur)
     b = _to_float_or_none(base)
     if c is None or b is None:
-        return None, None  # no statement, no direction arrow
+        return None, None
 
     diff = round(c - b, 1)
-    # решаем нейтральность:
     thr = 2.0 if for_nps else 0.1
     if abs(diff) < thr:
         return "на уровне", None
@@ -560,12 +553,11 @@ def delta_text_relative(cur, base, score_suffix="", nps_suffix=" п.п.", for_np
         arrow = f"<span style='color:{COLOR_POSITIVE};font-weight:bold;'>▲</span>"
         suff = nps_suffix if for_nps else score_suffix
         delta_part = signed_delta(diff, suff)
-        return f"{txt} (+{delta_part.lstrip('+')})", arrow
+        return f"{txt} ({delta_part})", arrow
     else:
         txt = "ниже среднего уровня"
         arrow = f"<span style='color:{COLOR_NEGATIVE};font-weight:bold;'>▼</span>"
         suff = nps_suffix if for_nps else score_suffix
-        # diff <0 so signed_delta(diff)= "−0.4"
         delta_part = signed_delta(diff, suff)
         return f"{txt} ({delta_part})", arrow
 
@@ -611,15 +603,14 @@ def extract_param_deltas(cur_map, base_map,
                          rep_min_base:int,
                          delta_thr:float):
     """
-    Сравниваем параметры cur_map vs base_map:
-    Возвращаем два списка:
-      ups = [(param_name, cur_avg, diff)]
-      downs = [(param_name, cur_avg, diff)]
-    где diff = cur_avg - base_avg.
+    Сравниваем параметры cur_map vs base_map.
+    Возвращаем:
+      ups   = [(param_name, cur_avg, diff), ...]  diff>0
+      downs = [(param_name, cur_avg, diff), ...] diff<0
     Фильтр:
-      answered_cur >= rep_min_cur,
-      answered_base >= rep_min_base,
-      abs(diff) >= delta_thr,
+      answered_cur >= rep_min_cur
+      answered_base >= rep_min_base
+      abs(diff) >= delta_thr
       param != 'nps'
     """
     ups, downs = [], []
@@ -637,7 +628,6 @@ def extract_param_deltas(cur_map, base_map,
             continue
         if cur_ans is None or base_ans is None:
             continue
-
         if cur_ans < rep_min_cur or base_ans < rep_min_base:
             continue
 
@@ -650,8 +640,6 @@ def extract_param_deltas(cur_map, base_map,
         else:
             downs.append((p, cur_avg, diff))
 
-    # сортировки: большие улучшения сначала в ups,
-    # большие ухудшения (более минусовые) сначала в downs
     ups.sort(key=lambda x: x[2], reverse=True)
     downs.sort(key=lambda x: x[2])
     return ups, downs
@@ -663,7 +651,7 @@ def extract_problem_params_for_alert(cur_map, base_map):
     Параметр попадает, если:
       - cur_ans >=3
       И ( cur_avg <4.0
-          ИЛИ (base_avg не None и (base_avg - cur_avg)>=0.3) )
+          ИЛИ (base_avg - cur_avg)>=0.3 )
     """
     out = []
     for p, wrow in cur_map.items():
@@ -690,7 +678,6 @@ def extract_problem_params_for_alert(cur_map, base_map):
                 diff_vs_base = round(cur_avg - base_avg, 1)
             out.append((p, cur_avg, int(round(cur_ans)), diff_vs_base))
 
-    # Можно отсортировать по средней (хуже наверх)
     out.sort(key=lambda x: x[1])
     return out
 
@@ -699,16 +686,23 @@ def extract_problem_params_for_alert(cur_map, base_map):
 # Шапка письма
 # =========================================
 
-def summarize_period_influence_text(W, P, period_word: str, is_total: bool):
+def summarize_period_influence_text(
+    W,
+    P,
+    period_word_gen: str,
+    period_word_acc: str,
+    is_total: bool
+):
     """
-    Формирует 2-3 фразы:
-    - вклад текущей недели в период
-    - сравнение оценки и NPS недели с уровнем периода
-    - и, при наличии, списки параметров, которые сильно отклоняются
-      (ниже/выше уровня периода)
+    Возвращает:
+    - contrib_line_html
+    - compare_html
+    - params_block_html
+    - (Pavg, Wavg) для стрелки в заголовке
 
-    period_word: "месяца", "квартала", "года", "общего периода" (для Итого)
-    is_total: True для Итого (меняем формулировки про "исторический уровень")
+    period_word_gen: "месяца" / "квартала" / "года" / "периода"
+    period_word_acc: "месяц" / "квартал" / "год" / "период" (винительный падеж)
+    is_total: True для Итого (используем "общего исторического уровня")
     """
 
     Wtot = _to_float_or_none(W["totals"]["surveys_total"]) or 0
@@ -720,82 +714,90 @@ def summarize_period_influence_text(W, P, period_word: str, is_total: bool):
     Wnps = _to_float_or_none(W["totals"]["nps"])
     Pnps = _to_float_or_none(P["totals"]["nps"])
 
-    # 1. вклад недели по объёму анкет
+    # ----- 1. вклад недели -----
     if Ptot <= 0:
-        contrib_line = (
+        contrib_line_html = (
             "Данных по периоду пока недостаточно для сравнения."
         )
     else:
         share = 100.0 * (Wtot / Ptot) if Ptot > 0 else 0.0
         share_rounded = int(round(share))
         if Ptot == Wtot and Ptot > 0:
-            # неделя = весь период
             if is_total:
-                contrib_line = (
-                    "Показатели этого сводного периода сейчас полностью сформированы данными текущей недели."
+                contrib_line_html = (
+                    "Показатели этого сводного периода сейчас полностью сформированы "
+                    "данными текущей недели."
                 )
             else:
-                contrib_line = (
-                    f"Показатели {period_word} сейчас полностью определяются текущей неделей "
-                    f"(100% анкет {period_word} приходятся на эту неделю)."
+                contrib_line_html = (
+                    f"Показатели {period_word_gen} сейчас полностью определяются текущей неделей "
+                    f"(<b>100%</b> анкет {period_word_gen} приходятся на текущую неделю)."
                 )
         elif share < 5:
-            contrib_line = (
-                f"Текущая неделя дала менее 5% всех анкет за {period_word}; "
-                "влияние на общий уровень метрик минимальное."
+            contrib_line_html = (
+                "Текущая неделя дала менее <b>5%</b> всех анкет за "
+                f"{period_word_acc}; влияние на общий уровень метрик минимальное."
             )
         else:
-            contrib_line = (
-                f"Текущая неделя дала около {share_rounded}% всех анкет за {period_word}."
+            contrib_line_html = (
+                "Текущая неделя дала около "
+                f"<b>{share_rounded}%</b> всех анкет за {period_word_acc}."
             )
 
-    # 2. влияние недели на среднюю оценку и NPS
-    #    (выше среднего уровня периода? ниже? на уровне?)
-    # для текста нам нужны короткие формулировки
-    def compare_line():
-        # итоговая оценка
-        score_phrase, score_arrow = delta_text_relative(Wavg, Pavg, score_suffix="", for_nps=False)
-        nps_phrase, nps_arrow     = delta_text_relative(Wnps, Pnps, nps_suffix=" п.п.", for_nps=True)
+    # ----- 2. сравнение средней оценки и NPS -----
+    def compare_line_html():
+        score_phrase, _score_arrow = delta_text_relative(
+            Wavg, Pavg, score_suffix="", for_nps=False
+        )
+        nps_phrase, _nps_arrow = delta_text_relative(
+            Wnps, Pnps, nps_suffix=" п.п.", for_nps=True
+        )
 
-        # соберём формулировку
-        # случаи:
+        base_word = period_word_gen if not is_total else "периода"
+
         if score_phrase is None and nps_phrase is None:
-            return "Средняя оценка и NPS этой недели соответствуют текущему уровню периода."
+            return (
+                f"<b>Средняя оценка и NPS этой недели</b> соответствуют текущему уровню {base_word}."
+            )
 
         parts = []
 
-        if score_phrase is None:
-            # нет данных по оценке
-            pass
-        else:
-            # score_phrase например: "выше среднего уровня (+0.3)"
-            # нам надо завершить фразу "...среднего уровня месяца"
+        if score_phrase is not None:
             if "на уровне" in score_phrase:
-                parts.append(f"Средняя оценка этой недели на уровне {period_word}.")
-            else:
                 parts.append(
-                    f"Средняя оценка этой недели {score_phrase.replace('среднего уровня', f'среднего уровня {period_word}')}."
+                    f"<b>Средняя оценка этой недели</b> на уровне {base_word}."
+                )
+            else:
+                # "выше среднего уровня (+0.3)" → "...выше среднего уровня месяца (+0.3)"
+                parts.append(
+                    "<b>Средняя оценка этой недели</b> " +
+                    score_phrase.replace("среднего уровня",
+                                         f"среднего уровня {base_word}") +
+                    "."
                 )
 
-        if nps_phrase is None:
-            pass
-        else:
+        if nps_phrase is not None:
             if "на уровне" in nps_phrase:
-                parts.append(f"NPS этой недели на уровне {period_word}.")
+                parts.append(
+                    f"<b>NPS этой недели</b> на уровне {base_word}."
+                )
             else:
                 parts.append(
-                    f"NPS этой недели {nps_phrase.replace('среднего уровня', f'среднего уровня {period_word}')}."
+                    "<b>NPS этой недели</b> " +
+                    nps_phrase.replace("среднего уровня",
+                                       f"среднего уровня {base_word}") +
+                    "."
                 )
 
         if not parts:
-            return "Средняя оценка и NPS этой недели соответствуют текущему уровню периода."
+            return (
+                f"<b>Средняя оценка и NPS этой недели</b> соответствуют текущему уровню {base_word}."
+            )
         return " ".join(parts)
 
-    compare_txt = compare_line()
+    compare_html = compare_line_html()
 
-    # 3. параметрные отклонения (сразу несколько)
-    #    "ниже текущего уровня месяца — ..., ..."
-    #    "выше текущего уровня месяца — ..., ..."
+    # ----- 3. существенные отклонения по параметрам -----
     Wmap = df_param_map(W["by_param"])
     Pmap = df_param_map(P["by_param"])
 
@@ -807,10 +809,10 @@ def summarize_period_influence_text(W, P, period_word: str, is_total: bool):
         delta_thr=0.3,
     )
 
-    # форматируем списки параметров
     downs_txt = []
     for p, cur_avg, diff in downs:
         title = PARAM_TITLES.get(p, p)
+        # diff отрицателен → signed_delta(diff) уже с минусом
         downs_txt.append(f"«{title}» ({signed_delta(diff)})")
 
     ups_txt = []
@@ -819,29 +821,29 @@ def summarize_period_influence_text(W, P, period_word: str, is_total: bool):
         ups_txt.append(f"«{title}» ({signed_delta(diff)})")
 
     if is_total:
-        base_word_low  = "ниже общего исторического уровня"
-        base_word_high = "выше общего исторического уровня"
+        base_low  = "Ниже общего исторического уровня"
+        base_high = "Выше общего исторического уровня"
     else:
-        base_word_low  = f"ниже текущего уровня {period_word}"
-        base_word_high = f"выше текущего уровня {period_word}"
+        base_low  = f"Ниже текущего уровня {period_word_gen}"
+        base_high = f"Выше текущего уровня {period_word_gen}"
 
     if not downs_txt and not ups_txt:
-        params_line = (
+        params_block_html = (
             "По отдельным параметрам существенных отклонений за неделю не зафиксировано."
         )
     else:
-        parts = ["Существенные отклонения этой недели по параметрам:"]
+        lines = [ "<b>Существенные отклонения этой недели по параметрам:</b>" ]
         if downs_txt:
-            parts.append(
-                f"{base_word_low} — " + ", ".join(downs_txt) + "."
+            lines.append(
+                f"{base_low} — " + ", ".join(downs_txt) + "."
             )
         if ups_txt:
-            parts.append(
-                f"{base_word_high} — " + ", ".join(ups_txt) + "."
+            lines.append(
+                f"{base_high} — " + ", ".join(ups_txt) + "."
             )
-        params_line = " ".join(parts)
+        params_block_html = "<br>".join(lines)
 
-    return contrib_line, compare_txt, params_line, Pavg, Wavg
+    return contrib_line_html, compare_html, params_block_html, Pavg, Wavg
 
 
 def header_block(
@@ -859,14 +861,11 @@ def header_block(
 ):
     """
     Шапка письма.
-    - "Итоги недели ..."
-    - Месяц / Квартал / Год / Итого с анализом вклада текущей недели
-    Везде используем фирменную палитру и fallback-шрифт.
     """
 
     def impact_arrow(period_avg, week_avg):
         """
-        Возвращает '', или HTML со стрелкой ▲/▼ (золото/оранжево-красный),
+        Возвращает '' или стрелку ▲/▼ цветом бренда,
         если неделя тянет период вверх или вниз по итоговой оценке.
         """
         pa = _to_float_or_none(period_avg)
@@ -882,22 +881,25 @@ def header_block(
         else:
             return f"<span style='color:{COLOR_NEGATIVE};font-weight:bold;'>▼</span> "
 
-    # неделя: просто цифры
+    # блок для недели (без сравнений, просто факты)
     week_block = (
         f"<div style='margin-bottom:16px;color:{COLOR_TEXT_MAIN};font-family:{FONT_STACK};'>"
         f"<div style='font-weight:bold;'>{'Итоги ' + week_label_full}</div>"
         f"<div>"
-        f"Анкет: {fmt_int(W['totals']['surveys_total'])} · "
-        f"Итоговая оценка: {fmt_avg5(W['totals']['overall5'])} · "
-        f"NPS: {fmt_nps(W['totals']['nps'])}"
+        f"<b>Анкет:</b> {fmt_int(W['totals']['surveys_total'])}. "
+        f"<b>Итоговая оценка:</b> {fmt_avg5(W['totals']['overall5'])}. "
+        f"<b>NPS:</b> {fmt_nps(W['totals']['nps'])}"
         f"</div>"
         f"</div>"
     )
 
-    # месяц / квартал / год / итого: показатели периода + вклад недели
-    def period_block(period_title, P, period_word, is_total=False):
-        contrib_line, compare_txt, params_line, Pavg, Wavg = summarize_period_influence_text(
-            W, P, period_word=period_word, is_total=is_total
+    # блоки для периода: месяц / квартал / год / итого
+    def period_block(period_title, P, period_word_gen, period_word_acc, is_total=False):
+        contrib_line_html, compare_html, params_block_html, Pavg, Wavg = summarize_period_influence_text(
+            W, P,
+            period_word_gen=period_word_gen,
+            period_word_acc=period_word_acc,
+            is_total=is_total
         )
         arrow = impact_arrow(Pavg, Wavg)
 
@@ -905,20 +907,25 @@ def header_block(
             f"<div style='margin-bottom:16px;color:{COLOR_TEXT_MAIN};font-family:{FONT_STACK};'>"
             f"<div style='font-weight:bold;'>{arrow}{period_title}</div>"
             f"<div>"
-            f"Анкет: {fmt_int(P['totals']['surveys_total'])} · "
-            f"Итоговая оценка: {fmt_avg5(P['totals']['overall5'])} · "
-            f"NPS: {fmt_nps(P['totals']['nps'])}"
+            f"<b>Анкет:</b> {fmt_int(P['totals']['surveys_total'])}. "
+            f"<b>Итоговая оценка:</b> {fmt_avg5(P['totals']['overall5'])}. "
+            f"<b>NPS:</b> {fmt_nps(P['totals']['nps'])}"
             f"</div>"
-            f"<div>{contrib_line}</div>"
-            f"<div>{compare_txt}</div>"
-            f"<div>{params_line}</div>"
+            f"<div>{contrib_line_html}</div>"
+            f"<div>{compare_html}</div>"
+            f"<div>{params_block_html}</div>"
             f"</div>"
         )
 
-    month_block   = period_block(month_label_full,   M, "месяца",   is_total=False)
-    quarter_block = period_block(quarter_label_full, Q, "квартала", is_total=False)
-    year_block    = period_block(year_label_full,    Y, "года",     is_total=False)
-    total_block   = period_block(total_label_full,   T, "периода",  is_total=True)
+    # генитив / винительный для периодов
+    # месяц:   "месяца"   / "месяц"
+    # квартал: "квартала" / "квартал"
+    # год:     "года"     / "год"
+    # итого:   "периода"  / "период"
+    month_block   = period_block(month_label_full,   M, "месяца",   "месяц",   is_total=False)
+    quarter_block = period_block(quarter_label_full, Q, "квартала", "квартал", is_total=False)
+    year_block    = period_block(year_label_full,    Y, "года",     "год",     is_total=False)
+    total_block   = period_block(total_label_full,   T, "периода",  "период",  is_total=True)
 
     title_html = (
         f"<h2 style='margin-bottom:16px;color:{COLOR_TEXT_MAIN};font-family:{FONT_STACK};'>"
@@ -1040,15 +1047,15 @@ def trends_block(W, Prev, L4):
     1. Текущая неделя по сравнению с предыдущей
     2. Текущая неделя относительно среднего уровня последних недель
     3. Ключевые сигналы этой недели
-    4. Тревожные точки (⚠)
+    4. ⚠ Тревожные точки
     """
 
     def to_map(agg):
         return df_param_map(agg["by_param"])
 
-    Wmap   = to_map(W)
-    Prevmap= to_map(Prev)
-    L4map  = to_map(L4)
+    Wmap    = to_map(W)
+    Prevmap = to_map(Prev)
+    L4map   = to_map(L4)
 
     # ------- 1. сравнение с предыдущей неделей -------
     cur_overall  = W["totals"]["overall5"]
@@ -1064,7 +1071,6 @@ def trends_block(W, Prev, L4):
     if _to_float_or_none(cur_nps) is not None and _to_float_or_none(prev_nps) is not None:
         diff_nps_prev = round(_to_float_or_none(cur_nps) - _to_float_or_none(prev_nps), 1)
 
-    # по параметрам: улучшения/ухудшения против предыдущей недели
     ups_prev, downs_prev = extract_param_deltas(
         cur_map=Wmap,
         base_map=Prevmap,
@@ -1074,7 +1080,6 @@ def trends_block(W, Prev, L4):
     )
 
     def list_params_diff(items):
-        # items: [(param, cur_avg, diff), ...]
         out = []
         for p, cur_avg, diff in items:
             title = PARAM_TITLES.get(p, p)
@@ -1086,39 +1091,42 @@ def trends_block(W, Prev, L4):
 
     if (_to_float_or_none(cur_overall) is None) and (_to_float_or_none(cur_nps) is None):
         line_prev_header = (
-            "Текущая неделя по сравнению с предыдущей: данных для сравнения пока недостаточно."
+            "Данных для сравнения с предыдущей неделей пока недостаточно."
         )
     else:
         parts1 = []
         if _to_float_or_none(cur_overall) is not None:
             if diff_over_prev is None or abs(diff_over_prev) < 0.05:
                 parts1.append(
-                    f"Итоговая оценка: {fmt_avg5(cur_overall)} (на уровне прошлой недели)."
+                    f"<b>Итоговая оценка:</b> {fmt_avg5(cur_overall)} (на уровне прошлой недели)."
                 )
             else:
                 parts1.append(
-                    f"Итоговая оценка: {fmt_avg5(cur_overall)} ({signed_delta(diff_over_prev)} к прошлой неделе)."
+                    f"<b>Итоговая оценка:</b> {fmt_avg5(cur_overall)} "
+                    f"({signed_delta(diff_over_prev)} к прошлой неделе)."
                 )
         if _to_float_or_none(cur_nps) is not None:
             if diff_nps_prev is None or abs(diff_nps_prev) < 2.0:
                 parts1.append(
-                    f"NPS: {fmt_nps(cur_nps)} (на уровне прошлой недели)."
+                    f"<b>NPS:</b> {fmt_nps(cur_nps)} (на уровне прошлой недели)."
                 )
             else:
                 parts1.append(
-                    f"NPS: {fmt_nps(cur_nps)} ({signed_delta(diff_nps_prev,' п.п.')} к прошлой неделе)."
+                    f"<b>NPS:</b> {fmt_nps(cur_nps)} "
+                    f"({signed_delta(diff_nps_prev,' п.п.')} к прошлой неделе)."
                 )
         line_prev_header = " ".join(parts1)
 
-    # детализация по параметрам
     detail_prev_lines = []
     if ups_prev_txt:
         detail_prev_lines.append(
-            "Улучшилось по сравнению с прошлой неделей: " + ", ".join(ups_prev_txt) + "."
+            "<b>Улучшилось по сравнению с прошлой неделей:</b> " +
+            ", ".join(ups_prev_txt) + "."
         )
     if downs_prev_txt:
         detail_prev_lines.append(
-            "Ухудшилось по сравнению с прошлой неделей: " + ", ".join(downs_prev_txt) + "."
+            "<b>Ухудшилось по сравнению с прошлой неделей:</b> " +
+            ", ".join(downs_prev_txt) + "."
         )
     if not detail_prev_lines:
         detail_prev_lines.append(
@@ -1160,40 +1168,43 @@ def trends_block(W, Prev, L4):
 
     if (_to_float_or_none(cur_overall_L4) is None) and (_to_float_or_none(cur_nps_L4) is None):
         line_L4_header = (
-            "Текущая неделя относительно среднего уровня последних недель: данных для анализа пока недостаточно."
+            "Данных для оценки относительно среднего уровня последних недель пока недостаточно."
         )
     else:
         parts2 = []
         if _to_float_or_none(cur_overall_L4) is not None:
             if diff_over_L4 is None or abs(diff_over_L4) < 0.1:
                 parts2.append(
-                    f"Итоговая оценка этой недели: {fmt_avg5(cur_overall_L4)} (на уровне средних последних недель)."
+                    f"<b>Итоговая оценка этой недели:</b> {fmt_avg5(cur_overall_L4)} "
+                    "(на уровне средних последних недель)."
                 )
             else:
                 parts2.append(
-                    f"Итоговая оценка этой недели: {fmt_avg5(cur_overall_L4)} ({signed_delta(diff_over_L4)} к среднему последних недель)."
+                    f"<b>Итоговая оценка этой недели:</b> {fmt_avg5(cur_overall_L4)} "
+                    f"({signed_delta(diff_over_L4)} к среднему последних недель)."
                 )
         if _to_float_or_none(cur_nps_L4) is not None:
             if diff_nps_L4 is None or abs(diff_nps_L4) < 2.0:
                 parts2.append(
-                    f"NPS этой недели: {fmt_nps(cur_nps_L4)} (на уровне средних последних недель)."
+                    f"<b>NPS этой недели:</b> {fmt_nps(cur_nps_L4)} "
+                    "(на уровне средних последних недель)."
                 )
             else:
                 parts2.append(
-                    f"NPS этой недели: {fmt_nps(cur_nps_L4)} ({signed_delta(diff_nps_L4,' п.п.')} к среднему последних недель)."
+                    f"<b>NPS этой недели:</b> {fmt_nps(cur_nps_L4)} "
+                    f"({signed_delta(diff_nps_L4,' п.п.')} к среднему последних недель)."
                 )
         line_L4_header = " ".join(parts2)
 
     detail_L4_lines = []
     if ups_L4_txt:
         detail_L4_lines.append(
-            "Выше обычного уровня: " + ", ".join(ups_L4_txt) + "."
+            "<b>Выше обычного уровня:</b> " + ", ".join(ups_L4_txt) + "."
         )
     if downs_L4_txt:
         detail_L4_lines.append(
-            "Ниже обычного уровня: " + ", ".join(downs_L4_txt) + "."
+            "<b>Ниже обычного уровня:</b> " + ", ".join(downs_L4_txt) + "."
         )
-
     if not detail_L4_lines:
         detail_L4_lines.append(
             "По ключевым параметрам отклонений от обычного уровня не зафиксировано."
@@ -1208,9 +1219,6 @@ def trends_block(W, Prev, L4):
     )
 
     # ------- 3. ключевые сигналы недели -------
-    # Интерпретация: где сейчас хорошо и где проседаем.
-    # Возьмём ups_L4 (лучше обычного) и downs_L4 (хуже обычного),
-    # но покажем сами текущие значения cur_avg по неделе.
     good_lines = []
     for p, cur_avg, diff in ups_L4:
         title = PARAM_TITLES.get(p, p)
@@ -1224,11 +1232,11 @@ def trends_block(W, Prev, L4):
     key_signal_lines = []
     if good_lines:
         key_signal_lines.append(
-            "На хорошем уровне: " + ", ".join(good_lines) + "."
+            "<b>На хорошем уровне:</b> " + ", ".join(good_lines) + "."
         )
     if risk_lines:
         key_signal_lines.append(
-            "Требует внимания: " + ", ".join(risk_lines) + "."
+            "<b>Требует внимания:</b> " + ", ".join(risk_lines) + "."
         )
     if not key_signal_lines:
         key_signal_lines.append(
@@ -1284,15 +1292,8 @@ def trends_block(W, Prev, L4):
 
 def yoy_block_table(period_rows: list[dict]):
     """
-    Таблица Период | Анкет | Итоговая оценка | Δ к прошлому году | NPS | Δ к прошлому году
-    period_rows = [
-      {
-        "label": "...",
-        "cur":  {"surveys_total":..., "overall5":..., "nps":...},
-        "prev": {"surveys_total":..., "overall5":..., "nps":...},
-      },
-      ...
-    ]
+    Таблица:
+    Период | Анкет | Итоговая оценка | Δ к прошлому году | NPS | Δ к прошлому году
     """
     row_html = []
     for row in period_rows:
@@ -1307,7 +1308,6 @@ def yoy_block_table(period_rows: list[dict]):
         prev_over = prev.get("overall5")
         prev_nps  = prev.get("nps")
 
-        # дельты
         diff_over = None
         if _to_float_or_none(cur_over) is not None and _to_float_or_none(prev_over) is not None:
             diff_over = round(_to_float_or_none(cur_over) - _to_float_or_none(prev_over), 1)
@@ -1359,8 +1359,7 @@ def yoy_block_table(period_rows: list[dict]):
 
 def yoy_comment_block(W, W_prevY):
     """
-    Комментарий после таблицы "Сравнение с прошлым годом".
-    Сравниваем текущую неделю vs ту же неделю прошлого года:
+    После таблицы "Сравнение с прошлым годом":
     - общая оценка и NPS
     - параметры, ставшие лучше или хуже
     """
@@ -1368,7 +1367,6 @@ def yoy_comment_block(W, W_prevY):
     Wmap      = df_param_map(W["by_param"])
     Wprev_map = df_param_map(W_prevY["by_param"])
 
-    # общая оценка / NPS
     cur_over = _to_float_or_none(W["totals"]["overall5"])
     prv_over = _to_float_or_none(W_prevY["totals"]["overall5"])
     cur_nps  = _to_float_or_none(W["totals"]["nps"])
@@ -1376,27 +1374,26 @@ def yoy_comment_block(W, W_prevY):
 
     lines = []
 
-    # общая оценка
+    # итоговая оценка
     if cur_over is not None and prv_over is not None:
         d_over = round(cur_over - prv_over, 1)
         if abs(d_over) < 0.1:
-            lines.append("Итоговая оценка на уровне прошлого года.")
+            lines.append("<b>Итоговая оценка</b> на уровне прошлого года.")
         elif d_over > 0:
-            lines.append(f"Итоговая оценка выше прошлого года ({signed_delta(d_over)}).")
+            lines.append(f"<b>Итоговая оценка</b> выше прошлого года ({signed_delta(d_over)}).")
         else:
-            lines.append(f"Итоговая оценка ниже прошлого года ({signed_delta(d_over)}).")
+            lines.append(f"<b>Итоговая оценка</b> ниже прошлого года ({signed_delta(d_over)}).")
 
     # nps
     if cur_nps is not None and prv_nps is not None:
         d_nps = round(cur_nps - prv_nps, 1)
         if abs(d_nps) < 2.0:
-            lines.append("NPS на уровне прошлого года.")
+            lines.append("<b>NPS</b> на уровне прошлого года.")
         elif d_nps > 0:
-            lines.append(f"NPS выше прошлого года ({signed_delta(d_nps,' п.п.')}).")
+            lines.append(f"<b>NPS</b> выше прошлого года ({signed_delta(d_nps,' п.п.')}).")
         else:
-            lines.append(f"NPS ниже прошлого года ({signed_delta(d_nps,' п.п.')}).")
+            lines.append(f"<b>NPS</b> ниже прошлого года ({signed_delta(d_nps,' п.п.')}).")
 
-    # параметры vs прошлый год
     ups_prevY, downs_prevY = extract_param_deltas(
         cur_map=Wmap,
         base_map=Wprev_map,
@@ -1473,10 +1470,7 @@ def _week_order_key(k):
 def plot_radar_params(W_df: pd.DataFrame, L4_df: pd.DataFrame, w_label_short: str, path_png: str):
     """
     Радар: текущая неделя vs средний уровень последних недель.
-    Фильтруем параметры, у которых есть достаточное число ответов:
-      - неделя: >=2 ответов
-      - L4: >=4 ответов
-    Исключаем NPS.
+    Фильтр: неделя ≥2 ответов, L4 ≥4 ответов, исключаем NPS.
     """
     if W_df is None or W_df.empty or L4_df is None or L4_df.empty:
         return None
@@ -1571,11 +1565,9 @@ def plot_params_heatmap(history_df: pd.DataFrame, path_png: str):
     if df.empty:
         return None
 
-    # Подберём год референса (последняя неделя)
     ref_year = iso_week_monday(str(weeks_sorted[-1])).year
     week_labels_short = {wk: week_short_label_for_key(wk, ref_year=ref_year) for wk in weeks_sorted}
 
-    # выберем топ-10 параметров по числу ответов (репрезентативность)
     top_params = (
         df.groupby("param")["answered"]
           .sum()
@@ -1754,14 +1746,14 @@ def main():
     else:
         raw = pd.read_excel(xls, sheet_name="Reviews")
 
-    # 3) парс недели
+    # 3) считаем неделю
     norm_df, agg_week = parse_and_aggregate_weekly(raw)
 
     # 4) пишем неделю в историю
     added = upsert_week(agg_week)
     print(f"[INFO] upsert_week(): добавлено строк недели: {added}")
 
-    # 5) читаем актуальную историю
+    # 5) история
     hist = gs_get_df(SURVEYS_TAB, "A:I")
     if hist.empty:
         raise RuntimeError("surveys_history пуст — нечего анализировать.")
@@ -1779,12 +1771,12 @@ def main():
 
     ranges = period_ranges_for_week(w_start)
 
-    # full history span
+    # диапазон всей истории
     hist_mondays = hist["week_key"].map(lambda k: iso_week_monday(str(k)))
     all_start = hist_mondays.min()
     all_end   = hist_mondays.max() + dt.timedelta(days=6)
 
-    # 7) агрегаты текущие
+    # 7) агрегаты
     W = surveys_aggregate_period(hist, w_start, w_end)
     M = surveys_aggregate_period(hist, ranges["mtd"]["start"], ranges["mtd"]["end"])
     Q = surveys_aggregate_period(hist, ranges["qtd"]["start"], ranges["qtd"]["end"])
@@ -1797,7 +1789,7 @@ def main():
     # 8) подписи периодов
     week_lbl_no_g   = week_label(w_start, w_end)          # "13–19 окт 2025"
     week_col_label  = add_year_suffix(week_lbl_no_g)      # "13–19 окт 2025 г."
-    week_label_full = "недели " + week_col_label          # для хедера: "Итоги недели ..."
+    week_label_full = "недели " + week_col_label          # "недели 13–19 окт 2025 г."
 
     month_label_full   = pretty_month_label(w_start)      # "Октябрь 2025 г."
     month_col_label    = month_label_full
@@ -1860,10 +1852,10 @@ def main():
         },
     ]
 
-    # 10) собираем HTML
+    # 10) HTML секции письма
     head_html = header_block(
         obj_name="ARTSTUDIO Nevsky",
-        week_label_full=week_label_full,  # "недели 13–19 окт 2025 г."
+        week_label_full=week_label_full,
         month_label_full=month_label_full,
         quarter_label_full=quarter_label_full,
         year_label_full=year_label_full,
@@ -1882,7 +1874,7 @@ def main():
 
     trends_html = trends_block(W, Prev, L4)
 
-    yoy_table_html = yoy_block_table(yoy_periods)
+    yoy_table_html   = yoy_block_table(yoy_periods)
     yoy_comment_html = yoy_comment_block(W, W_prevY)
 
     footer_html = footnote_block(all_start, w_end)
@@ -1902,7 +1894,6 @@ def main():
     p2 = "/tmp/surveys_heatmap.png"
     p3 = "/tmp/surveys_trends.png"
 
-    # короткая подпись недели для радара
     w_label_short = week_short_label_for_key(wk_key, ref_year=w_start.year)
 
     if plot_radar_params(W["by_param"], L4["by_param"], w_label_short, p1): charts.append(p1)
