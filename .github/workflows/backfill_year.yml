@@ -1,4 +1,4 @@
-name: Backfill Reviews (year)
+name: Backfill Reviews
 
 on:
   workflow_dispatch:
