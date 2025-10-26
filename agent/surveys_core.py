@@ -1,317 +1,321 @@
 # agent/surveys_core.py
-# Нормализация "сырых" анкет TL: Marketing в единую структуру.
-# Каждая строка = одна анкета гостя.
-
+# TL: Marketing surveys — нормализация + недельная агрегация (включая NPS)
 from __future__ import annotations
-import re, hashlib
+import re
+import math
 from datetime import date
-from typing import Dict, List, Optional
-import pandas as pd
+from typing import Dict, List, Tuple
+
 import numpy as np
+import pandas as pd
 
+# куда пишем историю
+SURVEYS_TAB = "surveys_history"   # week_key | param | responses | avg5 | avg10 | promoters | detractors | nps
 
-# ==== Маппинг названий колонок из выгрузки -> наши внутренние ключи ====
-# Мы приводим их к коротким машиночитаемым именам.
-# Формат: наш_ключ : [возможные названия колонок в выгрузке]
-COLUMN_ALIASES: Dict[str, List[str]] = {
-    # служебные
-    "fio": [
-        "ФИО", "Имя", "Имя гостя", "Ф.И.О", "Фамилия Имя",
-    ],
-    "booking": [
-        "Номер брони", "Бронирование", "Бронь", "Номер заказа", "Номер резервации",
-    ],
-    "phone": ["Телефон", "Тел.", "Номер телефона", "Контактный номер"],
-    "email": ["Email", "E-mail", "Почта", "Адрес электронной почты"],
-    "comment": ["Комментарий гостя", "Комментарий", "Отзыв", "Комментарий клиента", "Ваши комментарии"],
-    "survey_date": [
-        "Дата анкетирования", "Дата прохождения опроса", "Дата заполнения",
-        "Дата и время", "Дата опроса", "Дата анкеты", "Дата", "Дата обращения",
-    ],
-
-    # общее впечатление
+# Алиасы (точные названия из выгрузок)
+PARAM_ALIASES: Dict[str, List[str]] = {
     "overall": [
-        "Средняя оценка гостя", "Итоговая оценка", "Общая оценка", "Общая удовлетворенность",
+        "Средняя оценка гостя", "Итоговая оценка", "Общая оценка",
     ],
-
-    # блок 1: заезд / заселение
     "fo_checkin": [
         "№ 1.1 Оцените работу службы приёма и размещения при заезде",
         "1.1 прием и размещение при заезде",
-        "Оцените работу службы приёма и размещения при заезде",
-        "Служба приёма при заселении",
     ],
     "clean_checkin": [
         "№ 1.2 Оцените чистоту номера при заезде",
         "1.2 чистота при заезде",
-        "Чистота номера при заезде",
     ],
     "room_comfort": [
         "№ 1.3 Оцените комфорт и оснащение номера",
-        "1.3 комфорт и оснащение номера",
-        "Комфорт и оснащение номера",
-        "Комфорт номера",
+        "1.3 комфорт и оснащение",
     ],
-
-    # блок 2: проживание
     "fo_stay": [
         "№ 2.1 Оцените работу службы приёма и размещения во время проживания",
         "2.1 прием и размещение во время проживания",
-        "Служба приёма во время проживания",
-        "Служба размещения (проживание)",
     ],
     "its_service": [
+        "№  2.2 Оцените работу технической службы",
         "№ 2.2 Оцените работу технической службы",
         "2.2 техническая служба",
-        "Работа технической службы",
-        "Техническая служба",
     ],
     "hsk_stay": [
         "№ 2.3 Оцените уборку номера во время проживания",
         "2.3 уборка во время проживания",
-        "Уборка номера во время проживания",
-        "Housekeeping во время проживания",
     ],
     "breakfast": [
         "№ 2.4 Оцените завтраки",
         "2.4 завтраки",
-        "Завтраки",
-        "Качество завтрака",
     ],
-
-    # блок 3: отель в целом
     "atmosphere": [
         "№ 3.1 Оцените атмосферу в отеле",
         "3.1 атмосфера",
-        "Атмосфера в отеле",
     ],
     "location": [
         "№ 3.2 Оцените расположение отеля",
         "3.2 расположение",
-        "Расположение отеля",
-        "Локация отеля",
     ],
     "value": [
         "№ 3.3 Оцените соотношение цены и качества",
         "3.3 цена/качество",
-        "Соотношение цены и качества",
-        "Цена / качество",
     ],
     "would_return": [
         "№ 3.4 Хотели бы вы вернуться в ARTSTUDIO Nevsky?",
         "3.4 вернулись бы",
-        "Готовность вернуться",
-        "Вернулись бы к нам снова",
     ],
-
-    # NPS-вопрос
-    "nps5": [
+    "nps_1_5": [
         "№ 3.5 Оцените вероятность того, что вы порекомендуете нас друзьям и близким (по шкале от 1 до 5)",
-        "3.5 nps 1-5",
-        "nps (1-5)",
-        "nps 1-5",
-        "Готовность рекомендовать (1-5)",
+        "3.5 nps 1-5", "nps (1-5)", "nps 1-5",
     ],
+    # сервисные
+    "survey_date": [
+        "Дата анкетирования", "Дата прохождения опроса", "Дата заполнения",
+        "Дата и время", "Дата опроса", "Дата анкеты", "Дата",
+    ],
+    "comment": ["Комментарий гостя", "Комментарий", "Отзыв"],
+    "fio": ["ФИО", "Имя", "Имя гостя"],
+    "booking": ["Номер брони", "Бронь", "Бронирование"],
+    "phone": ["Телефон", "Тел."],
+    "email": ["Email", "E-mail", "Почта"],
 }
 
+# Порядок в отчетах
+PARAM_ORDER: List[str] = [
+    "overall",
+    "fo_checkin", "clean_checkin", "room_comfort",
+    "fo_stay", "its_service", "hsk_stay", "breakfast",
+    "atmosphere", "location", "value", "would_return",
+    "nps_1_5",
+]
 
-# ===== Нормализация имён столбцов =====
-def _norm_name_for_match(s: str) -> str:
-    """Опускаем регистр, убираем nbsp, лишнюю пунктуацию и дубли пробелов."""
+# --------- нормализация заголовков и «умный» поиск колонок ----------
+def _colkey(s: str) -> str:
     t = str(s).replace("\u00a0", " ").strip().lower()
     t = re.sub(r"\s+", " ", t)
-    t = re.sub(r"[^\w\sа-яё0-9]", " ", t)
-    t = re.sub(r"\s+", " ", t)
-    return t.strip()
+    # оставляем буквы/цифры/пробел/точки и № — чтобы ловить «№ 1.1»
+    t = re.sub(r"[^0-9a-zа-яё №\.\-\s]", " ", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
 
-def _find_col(df: pd.DataFrame, aliases: List[str]) -> Optional[str]:
-    """
-    Пытаемся найти реальное имя колонки в df, соответствующее одному из вариантов aliases.
-    Делаем несколько проходов: точное совпадение после нормализации, подстрока и т.д.
-    """
-    lowmap = {_norm_name_for_match(c): c for c in df.columns}
+SMART_REGEX: Dict[str, List[re.Pattern]] = {
+    "overall":       [re.compile(r"(средн\w*\s+оценк\w*|итог\w*|общ\w*\s+оценк\w*)")],
+    "fo_checkin":    [re.compile(r"(№\s*1\.?1\b|1\.?1\b).*?(при[её]м|размещен|заезд|ресеп)"),
+                      re.compile(r"(заезд|чек[\-\s]?ин).*?(спир|при[её]м)")],
+    "clean_checkin": [re.compile(r"(№\s*1\.?2\b|1\.?2\b).*?(чист)"),
+                      re.compile(r"\bчистот[аы]\b.*(заезд)")],
+    "room_comfort":  [re.compile(r"(№\s*1\.?3\b|1\.?3\b).*?(комфорт|оснащ)"),
+                      re.compile(r"(комфорт|оснащ).*номер")],
+    "fo_stay":       [re.compile(r"(№\s*2\.?1\b|2\.?1\b).*?(при[её]м|размещен)"),
+                      re.compile(r"(ресепш|ресепшен|администрат).*?(проживан)")],
+    "its_service":   [re.compile(r"(№\s*2\.?2\b|2\.?2\b).*?(тех|служб)"),
+                      re.compile(r"(техслужб|инженер|ремонт|почин)")],
+    "hsk_stay":      [re.compile(r"(№\s*2\.?3\b|2\.?3\b).*?(уборк)"),
+                      re.compile(r"\bуборк[аи]\b.*(проживан)")],
+    "breakfast":     [re.compile(r"(№\s*2\.?4\b|2\.?4\b).*?(завтрак)"),
+                      re.compile(r"\bзавтрак")],
+    "atmosphere":    [re.compile(r"(№\s*3\.?1\b|3\.?1\b).*?(атмосфер)")],
+    "location":      [re.compile(r"(№\s*3\.?2\b|3\.?2\b).*?(располож)"),
+                      re.compile(r"\bрасполож")],
+    "value":         [re.compile(r"(№\s*3\.?3\b|3\.?3\b).*?(цен|качеств)"),
+                      re.compile(r"(цена|стоимост).*(качест)")],
+    "would_return":  [re.compile(r"(№\s*3\.?4\b|3\.?4\b).*?(верн)"),
+                      re.compile(r"(вернул.*бы|снова при[её]хал)"),
+                     ],
+    "nps_1_5":       [re.compile(r"(№\s*3\.?5\b|3\.?5\b).*?(рекоменд|nps)"),
+                      re.compile(r"\bnps\b")],
+}
 
-    # точное совпадение (после нормализации)
-    for cand in aliases:
-        key = _norm_name_for_match(cand)
-        if key in lowmap:
-            return lowmap[key]
-
-    # подстрока
-    for cand in aliases:
-        key = _norm_name_for_match(cand)
-        for lk, orig in lowmap.items():
-            if key and key in lk:
-                return orig
-
-    # все слова встречаются
-    for cand in aliases:
-        words = [w for w in _norm_name_for_match(cand).split() if len(w) > 1]
-        for lk, orig in lowmap.items():
-            if all(w in lk for w in words):
-                return orig
-
+def _find_col(df: pd.DataFrame, aliases: List[str]) -> str | None:
+    low = {_colkey(c): c for c in df.columns}
+    # точные попадания
+    for a in aliases:
+        k = _colkey(a)
+        if k in low: return low[k]
+    # подстроки
+    for a in aliases:
+        k = _colkey(a)
+        for lk, orig in low.items():
+            if k and k in lk: return orig
+    # все слова из алиаса
+    for a in aliases:
+        words = [w for w in _colkey(a).split() if len(w) > 1]
+        for lk, orig in low.items():
+            if all(w in lk for w in words): return orig
     return None
 
+def _find_col_smart(df: pd.DataFrame, key: str) -> str | None:
+    pats = SMART_REGEX.get(key, [])
+    if not pats: return None
+    low = {_colkey(c): c for c in df.columns}
+    best = None
+    for lk, orig in low.items():
+        for p in pats:
+            if p.search(lk):
+                best = orig
+                break
+        if best: break
+    return best
 
-# ===== Парсинг отдельной оценки в шкалу /5 =====
-def _to_5_scale(val) -> float:
+# --------- числовая нормализация и NPS ----------
+def to_5_scale(x) -> float:
     """
-    Универсально приводим оценку гостя к шкале /5.
-    Поддерживаются форматы:
-    - "5", "4,5", "4.0"
-    - "9.0" (считаем что это /10 -> делим на 2)
-    - "80" (считаем как % -> делим на 20)
-    - пусто / мусор -> NaN
+    Приводим значение к шкале /5.
+    Понимаем '4,5', '5 из 5', '9.0' (→ 4.5), '80' (→ 4.0).
+    Вне диапазона 1..5 → NaN.
     """
-    if val is None:
-        return np.nan
-    s = str(val).strip().replace(",", ".")
-    if s in ("", "-", "–", "—"):
-        return np.nan
+    if x is None: return np.nan
+    s = str(x).strip().replace(",", ".")
     m = re.search(r"(-?\d+(?:\.\d+)?)", s)
-    if not m:
-        return np.nan
+    if not m: return np.nan
     v = float(m.group(1))
-
-    # если выглядит как классическая 1..5
     if 0 <= v <= 5:
-        return v
-    # часто встречается 0..10 → делим на 2
-    if 0 <= v <= 10:
-        return v / 2.0
-    # иногда % или 0..100 → делим на 20 (100 => 5.0)
-    if 0 <= v <= 100:
-        return v / 20.0
+        v5 = v
+    elif 0 <= v <= 10:
+        v5 = v / 2.0
+    elif 0 <= v <= 100:
+        v5 = v / 20.0
+    else:
+        return np.nan
+    # фильтруем мусор вроде 0.0 или 5.5
+    return v5 if 1.0 <= v5 <= 5.0 else np.nan
 
-    return np.nan
+def compute_nps_from_1to5(series: pd.Series) -> Tuple[int, int, float | np.nan]:
+    """
+    Новое правило: 1–2 = детракторы, 3–4 = нейтралы, 5 = промоутеры.
+    """
+    s = pd.to_numeric(series, errors="coerce").dropna()
+    s = s[(s >= 1) & (s <= 5)]
+    if s.empty: return 0, 0, np.nan
+    promoters  = int((s >= 5.0).sum())
+    detractors = int((s <= 2.0).sum())
+    total      = int(len(s))
+    nps = ((promoters / total) - (detractors / total)) * 100.0
+    return promoters, detractors, round(float(nps), 1)
 
+def iso_week_key(d: date) -> str:
+    iso = d.isocalendar()
+    return f"{iso.year}-W{iso.week}"
 
-# ===== Парсинг даты анкеты =====
-def _parse_date_any(x) -> Optional[date]:
+# =======================
+# Нормализация анкет
+# =======================
+def _parse_date_any(x) -> date | None:
     try:
-        d = pd.to_datetime(x, errors="coerce", dayfirst=True)
-        if pd.isna(d):
-            return None
-        return d.date()
+        return pd.to_datetime(x, errors="coerce", dayfirst=True).date()
     except Exception:
         return None
 
-
-# ===== Преобразование "сырого" Excel-листа с анкетами в нормализованный датафрейм =====
-def normalize_surveys_file(df_raw: pd.DataFrame) -> pd.DataFrame:
+def normalize_surveys_df(df0: pd.DataFrame) -> pd.DataFrame:
     """
-    Вход: df_raw = DataFrame из XLSX (лист с анкетами).
-    Выход: DataFrame с колонками:
-      survey_id (строка хэша)
-      date (YYYY-MM-DD)
-      week_key (YYYY-W##, ISO неделя)
-      overall5, fo_checkin5, clean_checkin5, room_comfort5,
-      fo_stay5, its_service5, hsk_stay5, breakfast5,
-      atmosphere5, location5, value5, would_return5,
-      nps5,
-      comment
-    Все оценки в шкале /5 (float). nps5 — шкала 1–5 (как дал гость).
+    На вход — сырая таблица (лист с ответами).
+    Выход — DF с колонками:
+      date, comment, fio, booking, phone, email,
+      overall5/10, <param5/10>, nps5
     """
+    df = df0.copy()
 
-    df = df_raw.copy()
+    # 1) находим колонки по алиасам/регэкспам
+    cols: Dict[str, str] = {}
+    for key, aliases in PARAM_ALIASES.items():
+        hit = _find_col(df, aliases)
+        if not hit:
+            hit = _find_col_smart(df, key)
+        if hit:
+            cols[key] = hit
 
-    # 1) сопоставляем колонки
-    colmap: Dict[str, Optional[str]] = {}
-    for key, alias_list in COLUMN_ALIASES.items():
-        hit = _find_col(df, alias_list)
-        colmap[key] = hit  # может быть None, если в выгрузке такого столбца нет
-
-    # 2) достаем дату анкетирования (обязательное поле)
-    date_col = colmap.get("survey_date")
-    if not date_col:
-        # fallback эвристика: ищем колонку, где как минимум половина значений парсится как дата
-        best_name = None
-        best_hits = 0
-        n = len(df)
+    if "survey_date" not in cols:
+        # эвристика: колонка, где ≥50% значений — валидные даты
+        best, best_hits, n = None, 0, len(df)
         for c in df.columns:
-            parsed = pd.to_datetime(df[c], errors="coerce", dayfirst=True)
-            hits = int(parsed.notna().sum())
-            if hits > best_hits and hits >= max(3, int(0.5 * n)):
-                best_name = c
-                best_hits = hits
-        if best_name:
-            date_col = best_name
+            try:
+                parsed = pd.to_datetime(df[c], errors="coerce", dayfirst=True)
+                hits = int(parsed.notna().sum())
+                if hits > best_hits and hits >= max(5, int(0.5 * n)):
+                    best, best_hits = c, hits
+            except Exception:
+                continue
+        if best:
+            cols["survey_date"] = best
         else:
-            raise RuntimeError("Не нашли колонку с датой анкетирования 😬")
+            raise RuntimeError("В файле не найдена колонка с датой анкетирования.")
 
     out = pd.DataFrame()
-    out["date"] = df[date_col].map(_parse_date_any)
+    out["date"] = df[cols["survey_date"]].map(_parse_date_any)
 
-    # 3) комментарий (оставим как есть)
-    if colmap.get("comment"):
-        out["comment"] = df[colmap["comment"]].astype(str)
-    else:
-        out["comment"] = ""
+    for k in ("comment", "fio", "booking", "phone", "email"):
+        out[k] = df[cols[k]].astype(str) if k in cols else ""
 
-    # 4) технические поля гостя (нужны только для уникальности)
-    tmp_fio     = df[colmap["fio"]].astype(str)      if colmap.get("fio")      else ""
-    tmp_booking = df[colmap["booking"]].astype(str)  if colmap.get("booking")  else ""
-    tmp_phone   = df[colmap["phone"]].astype(str)    if colmap.get("phone")    else ""
-    tmp_email   = df[colmap["email"]].astype(str)    if colmap.get("email")    else ""
+    # 2) значения /5 по параметрам
+    for p in PARAM_ORDER:
+        if p == "nps_1_5":
+            col = cols.get(p)
+            out["nps5"] = df[col].map(to_5_scale) if col else np.nan
+            continue
+        col = cols.get(p)
+        v5 = df[col].map(to_5_scale) if col else np.nan
+        out[f"{p}5"]  = v5
+        out[f"{p}10"] = v5 * 2.0
 
-    # 5) оценки → шкала /5
-    def grab_to5(key: str):
-        if not colmap.get(key):
-            return np.nan
-        return df[colmap[key]].map(_to_5_scale)
+    # 3) если overall не дан — считаем среднее по доступным шкалам /5 (кроме nps5)
+    if out["overall5"].isna().all():
+        value_cols5 = [c for c in out.columns if c.endswith("5") and c not in ("nps5",)]
+        if value_cols5:
+            out["overall5"]  = pd.to_numeric(out[value_cols5], errors="coerce").mean(axis=1)
+            out["overall10"] = out["overall5"] * 2.0
 
-    out["overall5"]       = grab_to5("overall")
-    out["fo_checkin5"]    = grab_to5("fo_checkin")
-    out["clean_checkin5"] = grab_to5("clean_checkin")
-    out["room_comfort5"]  = grab_to5("room_comfort")
-    out["fo_stay5"]       = grab_to5("fo_stay")
-    out["its_service5"]   = grab_to5("its_service")
-    out["hsk_stay5"]      = grab_to5("hsk_stay")
-    out["breakfast5"]     = grab_to5("breakfast")
-    out["atmosphere5"]    = grab_to5("atmosphere")
-    out["location5"]      = grab_to5("location")
-    out["value5"]         = grab_to5("value")
-    out["would_return5"]  = grab_to5("would_return")
-    out["nps5"]           = grab_to5("nps5")  # эта колонка уже 1..5 от гостя
+    # 4) удаляем строки без даты
+    out = out[pd.notna(out["date"])].reset_index(drop=True)
+    return out
 
-    # 6) неделя (ISO-неделя) для быстрой фильтрации потом
-    def _week_key(d: Optional[date]) -> str:
-        if d is None or pd.isna(d):
-            return ""
-        iso = d.isocalendar()  # (year, week, weekday)
-        return f"{iso.year}-W{iso.week:02d}"
+# =======================
+# Недельная агрегация
+# =======================
+def weekly_aggregate(df_norm: pd.DataFrame) -> pd.DataFrame:
+    """
+    week_key | param | responses | avg5 | avg10 | promoters | detractors | nps
+    responses:
+      - для 'overall' = число анкет (строк) в неделе
+      - для прочих параметров = число валидных ответов по параметру
+    """
+    if df_norm.empty:
+        return pd.DataFrame(columns=["week_key","param","responses","avg5","avg10","promoters","detractors","nps"])
 
-    out["week_key"] = out["date"].map(_week_key)
+    df = df_norm.copy()
+    df["week_key"] = df["date"].map(iso_week_key)
 
-    # 7) делаем стабильный идентификатор строки анкеты (для дедуплика в Google Sheet)
-    # используем дату + бронь + телефон + email + общий комментарий (это почти наверняка уникально)
-    def _mk_id(row):
-        raw_id = "|".join([
-            str(row.get("date", "")),
-            str(row.get("comment", "")).strip(),
-            # персональные поля тоже участвуют в хэше, но мы их не сохраняем в таблицу в открытом виде
-            # чтобы одинаковые анкеты не грузились дважды:
-            str(tmp_fio[row.name]),
-            str(tmp_booking[row.name]),
-            str(tmp_phone[row.name]),
-            str(tmp_email[row.name]),
-        ])
-        return hashlib.sha1(raw_id.encode("utf-8")).hexdigest()
+    rows = []
+    params = [p for p in PARAM_ORDER if p != "nps_1_5"]
 
-    out["survey_id"] = out.apply(_mk_id, axis=1)
+    for wk, wdf in df.groupby("week_key"):
+        total_surveys = int(len(wdf))  # это и есть анкеты недели
 
-    # 8) выбрасываем строки без даты (это невалидные строки выгрузки)
-    out = out[ out["date"].notna() ].reset_index(drop=True)
+        for p in params:
+            s = pd.to_numeric(wdf[f"{p}5"], errors="coerce")
+            s = s.where(s.between(1, 5))
+            cnt = int(s.notna().sum())
+            avg5 = float(s.mean()) if cnt > 0 else np.nan
+            avg10 = (avg5 * 2.0) if cnt > 0 else np.nan
+            responses = total_surveys if p == "overall" else cnt
+            rows.append([
+                wk, p, responses,
+                (None if isinstance(avg5,float) and math.isnan(avg5) else round(avg5, 2)),
+                (None if isinstance(avg10,float) and math.isnan(avg10) else round(avg10, 2)),
+                None, None, None
+            ])
 
-    # финальный порядок колонок
-    final_cols = [
-        "survey_id", "date", "week_key",
-        "overall5",
-        "fo_checkin5", "clean_checkin5", "room_comfort5",
-        "fo_stay5", "its_service5", "hsk_stay5", "breakfast5",
-        "atmosphere5", "location5", "value5", "would_return5",
-        "nps5",
-        "comment",
-    ]
-    return out[final_cols]
+        # NPS (1–5: 1–2 D, 3–4 N, 5 P)
+        if "nps5" in wdf.columns:
+            v = pd.to_numeric(wdf["nps5"], errors="coerce").where(lambda x: x.between(1, 5))
+            promoters, detractors, nps = compute_nps_from_1to5(v)
+            rows.append([wk, "nps", int(v.notna().sum()), None, None, promoters, detractors, nps])
+
+    out = pd.DataFrame(rows, columns=["week_key","param","responses","avg5","avg10","promoters","detractors","nps"])
+    order = [p for p in PARAM_ORDER if p != "nps_1_5"] + ["nps"]
+    out["param"] = pd.Categorical(out["param"], categories=order, ordered=True)
+    out = out.sort_values(["week_key","param"]).reset_index(drop=True)
+    return out
+
+# Фасад
+def parse_and_aggregate_weekly(df_raw: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    norm = normalize_surveys_df(df_raw)
+    agg  = weekly_aggregate(norm)
+    return norm, agg
