@@ -9,6 +9,9 @@ from datetime import date
 import pandas as pd
 import numpy as np
 
+import sys
+sys.path.append(os.path.dirname(__file__))
+
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
@@ -77,12 +80,30 @@ def drive_download(file_id: str) -> bytes:
         _, done = dl.next_chunk()
     return buf.getvalue()
 
+def ensure_tab(spreadsheet_id: str, tab_name: str, header: list[str]):
+    meta = SHEETS.get(spreadsheetId=spreadsheet_id).execute()
+    tabs = [s["properties"]["title"] for s in meta.get("sheets", [])]
+    if tab_name not in tabs:
+        SHEETS.batchUpdate(
+            spreadsheetId=spreadsheet_id,
+            body={"requests": [{"addSheet": {"properties": {"title": tab_name}}}]}
+        ).execute()
+        SHEETS.values().update(
+            spreadsheetId=spreadsheet_id,
+            range=f"{tab_name}!A1:{chr(64 + len(header))}1",
+            valueInputOption="RAW",
+            body={"values": [header]}
+        ).execute()
+
 def gs_get_df(tab: str) -> pd.DataFrame:
-    res = SHEETS.values().get(spreadsheetId=HISTORY_SHEET_ID, range=tab).execute()
-    vals = res.get("values", [])
-    if not vals:
+    try:
+        res = SHEETS.values().get(spreadsheetId=HISTORY_SHEET_ID, range=tab).execute()
+        vals = res.get("values", [])
+        if not vals:
+            return pd.DataFrame()
+        return pd.DataFrame(vals[1:], columns=vals[0])
+    except Exception:
         return pd.DataFrame()
-    return pd.DataFrame(vals[1:], columns=vals[0])
 
 def gs_append(tab: str, rows: List[List]):
     if not rows:
@@ -94,7 +115,10 @@ def gs_append(tab: str, rows: List[List]):
         body={"values": rows}
     ).execute()
 
+HEADER = ["week_key", "param", "responses", "avg5", "promoters", "detractors", "nps"]
+
 def upsert_week(agg_week: pd.DataFrame) -> int:
+    ensure_tab(HISTORY_SHEET_ID, SURVEYS_TAB, HEADER)
     hist = gs_get_df(SURVEYS_TAB)
     existing = set(zip(hist["week_key"], hist["param"]))
     rows = []
@@ -105,66 +129,83 @@ def upsert_week(agg_week: pd.DataFrame) -> int:
                 r["week_key"], r["param"], r["responses"], r["avg5"],
                 r.get("promoters"), r.get("detractors"), r.get("nps")
             ]
-            rows.append([None if pd.isna(v) else v for v in row])
+            rows.append([None if v is None or pd.isna(v) else v for v in row])
     if rows:
         gs_append(SURVEYS_TAB, rows)
     return len(rows)
 
+def choose_surveys_sheet(xls: pd.ExcelFile) -> pd.DataFrame:
+    preferred = ["Оценки гостей", "Оценки", "Ответы", "Анкеты", "Responses"]
+    for name in xls.sheet_names:
+        if name.strip().lower() in [p.lower() for p in preferred]:
+            return pd.read_excel(xls, name)
+    candidates = ["Дата", "Дата анкетирования", "Комментарий", "Средняя оценка", "№ 1", "№ 2", "№ 3"]
+    best_name, best_score = None, -1
+    for name in xls.sheet_names:
+        probe = pd.read_excel(xls, name, nrows=1)
+        cols = [str(c) for c in probe.columns]
+        score = sum(any(cand.lower() in c.lower() for cand in candidates) for c in cols)
+        if score > best_score:
+            best_name, best_score = name, score
+    pick = best_name or xls.sheet_names[0]
+    return pd.read_excel(xls, pick)
+
 def header_block(w_start: date, w_end: date, W: Dict, M: Dict, Q: Dict, Y: Dict) -> str:
-    w_overall = f"{W['overall_avg5']:.2f}" if W['overall_avg5'] is not None else "-"
-    m_overall = f"{M['overall_avg5']:.2f}" if M['overall_avg5'] is not None else "-"
-    q_overall = f"{Q['overall_avg5']:.2f}" if Q['overall_avg5'] is not None else "-"
-    y_overall = f"{Y['overall_avg5']:.2f}" if Y['overall_avg5'] is not None else "-"
-    w_nps = f"{W['nps']:.2f}" if W['nps'] is not None else "-"
-    m_nps = f"{M['nps']:.2f}" if M['nps'] is not None else "-"
-    q_nps = f"{Q['nps']:.2f}" if Q['nps'] is not None else "-"
-    y_nps = f"{Y['nps']:.2f}" if Y['nps'] is not None else "-"
+    w_overall = f"{W['overall_avg5']:.2f}" if W['overall_avg5'] is not None else "—"
+    m_overall = f"{M['overall_avg5']:.2f}" if M['overall_avg5'] is not None else "—"
+    q_overall = f"{Q['overall_avg5']:.2f}" if Q['overall_avg5'] is not None else "—"
+    y_overall = f"{Y['overall_avg5']:.2f}" if Y['overall_avg5'] is not None else "—"
+    w_nps = f"{W['nps']:.2f}" if W['nps'] is not None else "—"
+    m_nps = f"{M['nps']:.2f}" if M['nps'] is not None else "—"
+    q_nps = f"{Q['nps']:.2f}" if Q['nps'] is not None else "—"
+    y_nps = f"{Y['nps']:.2f}" if Y['nps'] is not None else "—"
     return f"""
-ARTSTUDIO Nevsky — Анкеты за неделю {w_start.day}-{w_end.day} окт {w_start.year}
+ARTSTUDIO Nevsky. Анкеты TL: Marketing — неделя {w_start.day}.{w_start.month}–{w_end.day}.{w_end.month}
 
-Неделя: {w_start.day}-{w_end.day} окт {w_start.year}; анкет: {W['total_surveys']}; итоговая: {w_overall}; NPS: {w_nps}.
+Неделя: {w_start.day}.{w_start.month}–{w_end.day}.{w_end.month}; анкет: {W['total_surveys']}; итоговая: {w_overall}; NPS: {w_nps}.
 
-Текущий месяц (октябрь {w_start.year}): анкет {M['total_surveys']}, итоговая {m_overall}, NPS {m_nps};
-Текущий квартал (IV кв. {w_start.year}): анкет {Q['total_surveys']}, итоговая {q_overall}, NPS {q_nps};
-Текущий год ({w_start.year}): анкет {Y['total_surveys']}, итоговая {y_overall}, NPS {y_nps}.
+Текущий месяц ({period_ranges_for_week(w_start)['mtd']['label']}): анкет {M['total_surveys']}, итоговая {m_overall}, NPS {m_nps};
+Текущий квартал ({period_ranges_for_week(w_start)['qtd']['label']}): анкет {Q['total_surveys']}, итоговая {q_overall}, NPS {q_nps};
+Текущий год ({period_ranges_for_week(w_start)['ytd']['label']}): анкет {Y['total_surveys']}, итоговая {y_overall}, NPS {y_nps}.
+
+Параметры (неделя / Текущий месяц / Текущий квартал / Текущий год)
 """
 
-def table_block(W: Dict, M: Dict, Q: Dict, Y: Dict) -> str:
+def table_params_block(W_bp: Dict[str, Dict], M_bp: Dict[str, Dict], Q_bp: Dict[str, Dict], Y_bp: Dict[str, Dict]) -> str:
     html = "<table><tr><th>Параметр</th><th>Ср.</th><th>Ответы</th><th>Ср.</th><th>Ответы</th><th>Ср.</th><th>Ответы</th><th>Ср.</th><th>Ответы</th></tr>"
-    for p in PARAM_ORDER + ["nps_1_5"]:
-        if p == "nps_1_5":
-            p = "nps"
-            w_val = W["by_param"][p]["nps"]
-            m_val = M["by_param"][p]["nps"]
-            q_val = Q["by_param"][p]["nps"]
-            y_val = Y["by_param"][p]["nps"]
-            fmt = ".2f"
-        else:
-            w_val = W["by_param"].get(p, {})["avg5"]
-            m_val = M["by_param"].get(p, {})["avg5"]
-            q_val = Q["by_param"].get(p, {})["avg5"]
-            y_val = Y["by_param"].get(p, {})["avg5"]
-            fmt = ".2f"
-        w_str = f"{w_val:{fmt}}" if w_val is not None else "-"
-        m_str = f"{m_val:{fmt}}" if m_val is not None else "-"
-        q_str = f"{q_val:{fmt}}" if q_val is not None else "-"
-        y_str = f"{y_val:{fmt}}" if y_val is not None else "-"
-        w_resp = W["by_param"].get(p, {})["responses"]
-        m_resp = M["by_param"].get(p, {})["responses"]
-        q_resp = Q["by_param"].get(p, {})["responses"]
-        y_resp = Y["by_param"].get(p, {})["responses"]
+    for p in [p for p in PARAM_ORDER if p != "nps_1_5"] + ["nps"]:
         name = PARAM_NAMES.get(p, p)
+        if p == "nps":
+            w_val = W_bp.get(p, {})["nps"]
+            m_val = M_bp.get(p, {})["nps"]
+            q_val = Q_bp.get(p, {})["nps"]
+            y_val = Y_bp.get(p, {})["nps"]
+            fmt = ""
+        else:
+            w_val = W_bp.get(p, {})["avg5"]
+            m_val = M_bp.get(p, {})["avg5"]
+            q_val = Q_bp.get(p, {})["avg5"]
+            y_val = Y_bp.get(p, {})["avg5"]
+            fmt = " /5"
+        w_str = f"{w_val:.2f}{fmt}" if w_val is not None else "—"
+        m_str = f"{m_val:.2f}{fmt}" if m_val is not None else "—"
+        q_str = f"{q_val:.2f}{fmt}" if q_val is not None else "—"
+        y_str = f"{y_val:.2f}{fmt}" if y_val is not None else "—"
+        w_resp = W_bp.get(p, {})["responses"]
+        m_resp = M_bp.get(p, {})["responses"]
+        q_resp = Q_bp.get(p, {})["responses"]
+        y_resp = Y_bp.get(p, {})["responses"]
         html += f"<tr><td>{name}</td><td>{w_str}</td><td>{w_resp}</td><td>{m_str}</td><td>{m_resp}</td><td>{q_str}</td><td>{q_resp}</td><td>{y_str}</td><td>{y_resp}</td></tr>"
     html += "</table>"
     return html
 
 def footnote_block() -> str:
-    return "* Все значения по анкетам отображаются в шкале /5. NPS считается по шкале 1-5: 1-2 — детракторы, 3-4 — нейтрал, 5 — промоутеры; NPS = %промоутеров - %детракторов."
+    return "* Все значения по анкетам отображаются в шкале /5. Внутри расчётов применяется взвешивание по количеству ответов. NPS считается по шкале 1–5: 1–2 — детракторы, 3–4 — нейтрал, 5 — промоутеры; NPS = %промоутеров − %детракторов."
 
-def plot_radar_params(W_bp: Dict, M_bp: Dict, path: str):
+def plot_radar_params(w_bp: Dict, m_bp: Dict, path: str):
     params = [p for p in PARAM_ORDER if p != "nps_1_5"]
-    w_avgs = [W_bp.get(p, {})["avg5"] or 0 for p in params]
-    m_avgs = [M_bp.get(p, {})["avg5"] or 0 for p in params]
+    w_avgs = [w_bp.get(p, {})["avg5"] or 0 for p in params]
+    m_avgs = [m_bp.get(p, {})["avg5"] or 0 for p in params]
     labels = [PARAM_NAMES[p] for p in params]
     num_vars = len(labels)
     angles = np.linspace(0, 2 * np.pi, num_vars, endpoint=False).tolist()
@@ -173,41 +214,42 @@ def plot_radar_params(W_bp: Dict, M_bp: Dict, path: str):
     m_avgs += m_avgs[:1]
     fig, ax = plt.subplots(figsize=(6, 6), subplot_kw=dict(polar=True))
     ax.fill(angles, w_avgs, color='blue', alpha=0.25)
-    ax.plot(angles, w_avgs, color='blue', linewidth=2, label='Week')
+    ax.plot(angles, w_avgs, color='blue', linewidth=2, label='Неделя')
     ax.fill(angles, m_avgs, color='green', alpha=0.25)
-    ax.plot(angles, m_avgs, color='green', linewidth=2, label='Month')
+    ax.plot(angles, m_avgs, color='green', linewidth=2, label='Месяц')
     ax.set_yticklabels([])
     ax.set_xticks(angles[:-1])
-    ax.set_xticklabels(labels)
+    ax.set_xticklabels(labels, rotation=45, ha="right")
     ax.legend()
     plt.savefig(path)
     plt.close()
 
-def plot_heatmap(hist: pd.DataFrame, path: str):
+def plot_params_heatmap(hist: pd.DataFrame, path: str):
     params = [p for p in PARAM_ORDER if p != "nps_1_5"]
     pivot = hist[hist["param"].isin(params)].pivot(index="week_key", columns="param", values="avg5")
     fig, ax = plt.subplots(figsize=(10, 8))
-    cmap = cm.get_cmap('YlGn')
+    cmap = plt.get_cmap('YlGn')
     norm = Normalize(vmin=1, vmax=5)
     im = ax.imshow(pivot, cmap=cmap, norm=norm)
     ax.set_xticks(np.arange(len(pivot.columns)))
     ax.set_xticklabels([PARAM_NAMES[p] for p in pivot.columns], rotation=45, ha="right")
     ax.set_yticks(np.arange(len(pivot.index)))
     ax.set_yticklabels(pivot.index)
-    plt.colorbar(im)
+    plt.colorbar(im, ax=ax)
     plt.savefig(path)
     plt.close()
 
-def plot_trends(hist: pd.DataFrame, path: str):
+def plot_overall_nps_trends(hist: pd.DataFrame, path: str):
     overall = hist[hist["param"] == "overall"]
     nps = hist[hist["param"] == "nps"]
     fig, ax1 = plt.subplots(figsize=(10, 6))
-    ax1.plot(overall["week_key"], overall["avg5"], color='blue', label='Overall Avg')
-    ax1.set_ylabel('Average /5')
+    ax1.plot(overall["week_key"], overall["avg5"], color='blue', label='Итоговая оценка')
+    ax1.set_ylabel('Средняя /5')
+    ax1.tick_params(axis='x', rotation=45)
     ax2 = ax1.twinx()
     ax2.plot(nps["week_key"], nps["nps"], color='green', label='NPS')
     ax2.set_ylabel('NPS')
-    fig.legend()
+    fig.legend(loc='upper right')
     plt.savefig(path)
     plt.close()
 
@@ -220,7 +262,9 @@ def send_email(subject: str, html: str, attachments: List[str]):
     for path in attachments:
         if os.path.exists(path):
             with open(path, "rb") as f:
-                part = MIMEImage(f.read())
+                part = MIMEBase("application", "octet-stream")
+                part.set_payload(f.read())
+                encoders.encode_base64(part)
                 part.add_header("Content-Disposition", f"attachment; filename={os.path.basename(path)}")
                 msg.attach(part)
     with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
@@ -232,23 +276,23 @@ def main():
     fid, name = latest_report_from_drive()
     blob = drive_download(fid)
     xls = pd.ExcelFile(io.BytesIO(blob))
-    sheet_names = xls.sheet_names
-    preferred = ["Оценки гостей", "Оценки", "Ответы", "Анкеты", "Responses"]
-    sheet = next((s for s in sheet_names if s.lower() in [p.lower() for p in preferred]), sheet_names[0])
-    df_raw = pd.read_excel(xls, sheet)
+    df_raw = choose_surveys_sheet(xls)
     _, agg_week = parse_and_aggregate_weekly(df_raw)
-    upsert_week(agg_week)
+    upserted = upsert_week(agg_week)
+    print(f"[INFO] surveys_weekly: upserted {upserted} rows for {SURVEYS_TAB}")
     hist = gs_get_df(SURVEYS_TAB)
+    if hist.empty:
+        raise RuntimeError("surveys_history is empty")
     wk_key = agg_week["week_key"].iloc[0]
     w_start = iso_week_monday(wk_key)
-    w_end = w_start + timedelta(days=6)
+    w_end = w_start + dt.timedelta(days=6)
     ranges = period_ranges_for_week(w_start)
     W = aggregate_period(hist, ranges["week"]["start"], ranges["week"]["end"])
     M = aggregate_period(hist, ranges["mtd"]["start"], ranges["mtd"]["end"])
     Q = aggregate_period(hist, ranges["qtd"]["start"], ranges["qtd"]["end"])
     Y = aggregate_period(hist, ranges["ytd"]["start"], ranges["ytd"]["end"])
     head = header_block(w_start, w_end, W, M, Q, Y)
-    table = table_block(W, M, Q, Y)
+    table = table_params_block(W["by_param"], M["by_param"], Q["by_param"], Y["by_param"])
     footnote = footnote_block()
     html = head + table + footnote
     charts = []
@@ -256,12 +300,12 @@ def main():
     plot_radar_params(W["by_param"], M["by_param"], p1)
     charts.append(p1)
     p2 = "/tmp/surveys_heatmap.png"
-    plot_heatmap(hist, p2)
+    plot_params_heatmap(hist, p2)
     charts.append(p2)
     p3 = "/tmp/surveys_trends.png"
-    plot_trends(hist, p3)
+    plot_overall_nps_trends(hist, p3)
     charts.append(p3)
-    subject = f"ARTSTUDIO Nevsky. Анкеты TL: Marketing — неделя {w_start.day}.{w_start.month}-{w_end.day}.{w_end.month}"
+    subject = f"ARTSTUDIO Nevsky. Анкеты TL: Marketing — неделя {w_start.day}.{w_start.month}–{w_end.day}.{w_end.month}"
     send_email(subject, html, charts)
 
 if __name__ == "__main__":
