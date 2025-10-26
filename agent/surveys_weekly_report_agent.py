@@ -264,6 +264,68 @@ def upsert_week(agg_week_df: pd.DataFrame) -> int:
         ).execute()
     return len(rows_new)
 
+# --- форматирование периодов и дат ---
+
+RU_MONTH_SHORT = {
+    1: "янв", 2: "фев", 3: "мар", 4: "апр", 5: "май", 6: "июн",
+    7: "июл", 8: "авг", 9: "сен", 10: "окт", 11: "ноя", 12: "дек",
+}
+
+def range_label(start: date, end: date) -> str:
+    """
+    Человеко-читаемый диапазон дат: '13–19 окт 2025'
+    Если месяцы разные: '28 сен – 5 окт 2025'
+    Если годы разные:  '30 дек 2025 – 5 янв 2026'
+    """
+    def _one(d: date, show_year: bool) -> str:
+        m = RU_MONTH_SHORT[d.month]
+        if show_year:
+            return f"{d.day} {m} {d.year}"
+        else:
+            return f"{d.day} {m}"
+
+    same_year = (start.year == end.year)
+    same_month = (start.month == end.month) and same_year
+
+    if same_month:
+        # 13–19 окт 2025
+        return f"{start.day}–{end.day} {RU_MONTH_SHORT[start.month]} {start.year}"
+    else:
+        # 28 сен – 5 окт 2025   (если год тот же)
+        # 30 дек 2025 – 5 янв 2026 (если год другой)
+        left = _one(start, show_year=not same_year)
+        right = _one(end, show_year=True)
+        return f"{left} – {right}"
+
+def pretty_month_label(d: date) -> str:
+    """
+    month_label(d) сейчас даёт что-то вроде 'октябрь 2025'.
+    Нужно 'Октябрь 2025 г.'
+    """
+    ml = month_label(d)  # напр. 'октябрь 2025'
+    if not ml:
+        return ""
+    ml_cap = ml[0].upper() + ml[1:]
+    return f"{ml_cap} г."
+
+def pretty_quarter_label(d: date) -> str:
+    """
+    quarter_label(d) сейчас даёт 'IV кв. 2025'
+    Нужно 'IV квартал 2025 г.'
+    """
+    ql = quarter_label(d)  # напр. 'IV кв. 2025'
+    ql = ql.replace("кв.", "квартал")
+    return f"{ql} г."
+
+def pretty_year_label(d: date) -> str:
+    """
+    year_label(d) сейчас даёт '2025'
+    Нужно '2025 г.'
+    """
+    yl = year_label(d)
+    return f"{yl} г."
+
+
 # =========================
 # Aggregation over periods
 # =========================
@@ -418,67 +480,132 @@ def surveys_aggregate_period(history_df: pd.DataFrame, start: date, end: date) -
 # =========================
 PARAM_TITLES = {
     "overall":        "Итоговая оценка",
-    "spir_checkin":   "СПиР при заезде",
-    "clean_checkin":  "Чистота при заезде",
-    "comfort":        "Комфорт и оснащение",
-    "spir_stay":      "СПиР в проживании",
-    "tech_service":   "ИТС (техслужба)",
-    "housekeeping":   "Уборка в проживании",
+    "spir_checkin":   "Работа СПиР при заезде",
+    "clean_checkin":  "Чистота номера при заезде",
+    "comfort":        "Комфорт и оснащение номера",
+    "spir_stay":      "Работа СПиР во время проживания",
+    "tech_service":   "Работа ИТС",
+    "housekeeping":   "Чистота номера во время проживания",
     "breakfast":      "Завтраки",
     "atmosphere":     "Атмосфера",
     "location":       "Расположение",
     "value":          "Цена/качество",
     "return_intent":  "Готовность вернуться",
-    "nps":            "NPS (1–5)",
+    "nps":            "NPS",
 }
 
+def _to_float_or_none(x):
+    if x is None:
+        return None
+    try:
+        val = float(x)
+        if np.isnan(val):
+            return None
+        return val
+    except Exception:
+        return None
+
 def fmt_avg5(x):
-    if x is None or (isinstance(x, float) and np.isnan(x)):
+    """
+    Возвращает '4.7 /5' или '—'
+    """
+    val = _to_float_or_none(x)
+    if val is None:
         return "—"
-    return f"{float(x):.2f} /5"
+    return f"{val:.1f} /5"
 
 def fmt_int(x):
-    if x is None or (isinstance(x, float) and np.isnan(x)):
+    """
+    Возвращает целое ('5') или '—'
+    """
+    val = _to_float_or_none(x)
+    if val is None:
         return "—"
-    return str(int(x))
+    return str(int(round(val)))
 
 def fmt_nps(x):
-    if x is None or (isinstance(x, float) and np.isnan(x)):
+    """
+    NPS считаем как процент промоутеров минус процент детракторов.
+    В отчёте показываем в процентах, например '60.0%'.
+    """
+    val = _to_float_or_none(x)
+    if val is None:
         return "—"
-    return f"{float(x):.1f}"
+    return f"{val:.1f}%"
 
-def header_block(week_start: date, week_end: date, W: dict, M: dict, Q: dict, Y: dict, T: dict):
-    wl = week_label(week_start, week_end)
+
+def header_block(
+    week_start: date,
+    week_end: date,
+    W: dict,
+    M: dict,
+    Q: dict,
+    Y: dict,
+    T: dict,
+):
+    """
+    Формирует верхнюю текстовую часть письма (заголовок и сводку по периодам).
+    """
+
+    week_lbl    = week_label(week_start, week_end)            # '13–19 окт 2025'
+    month_lbl   = pretty_month_label(week_start)              # 'Октябрь 2025 г.'
+    quarter_lbl = pretty_quarter_label(week_start)            # 'IV квартал 2025 г.'
+    year_lbl    = pretty_year_label(week_start)               # '2025 г.'
 
     parts = []
-    parts.append(f"<h2>ARTSTUDIO Nevsky — Анкеты за неделю {wl}</h2>")
 
+    # Заголовок письма
     parts.append(
-        "<p><b>Неделя:</b> "
-        f"{wl}; анкет: <b>{fmt_int(W['totals']['surveys_total'])}</b>; "
-        f"итоговая: <b>{fmt_avg5(W['totals']['overall5'])}</b>; "
-        f"NPS: <b>{fmt_nps(W['totals']['nps'])}</b>.</p>"
+        f"<h2>ARTSTUDIO Nevsky — анкеты гостей за неделю {week_lbl}</h2>"
     )
 
-    def one_line(name, D):
+    # Краткая сводка по текущей неделе
+    parts.append(
+        "<p>"
+        f"<b>Текущая неделя {week_lbl}:</b> Всего анкет — <b>{fmt_int(W['totals']['surveys_total'])}</b>; "
+        f"Итоговая оценка — <b>{fmt_avg5(W['totals']['overall5'])}</b>; "
+        f"NPS — <b>{fmt_nps(W['totals']['nps'])}</b>."
+        "</p>"
+    )
+
+    # Сводка по крупным периодам
+    def line_period(title, D):
         return (
-            f"<b>{name}:</b> анкет {fmt_int(D['totals']['surveys_total'])}, "
+            f"<b>{title}:</b> анкет {fmt_int(D['totals']['surveys_total'])}, "
             f"итоговая {fmt_avg5(D['totals']['overall5'])}, "
-            f"NPS {fmt_nps(D['totals']['nps'])}"
+            f"NPS {fmt_nps(D['totals']['nps'])}."
         )
 
     parts.append(
         "<p>"
-        + one_line(f"Текущий месяц ({month_label(week_start)})", M) + ";<br>"
-        + one_line(f"Текущий квартал ({quarter_label(week_start)})", Q) + ";<br>"
-        + one_line(f"Текущий год ({year_label(week_start)})", Y) + ";<br>"
-        + one_line("Итого (вся история)", T)
-        + ".</p>"
+        + line_period(f"Текущий месяц: {month_lbl}",   M) + "<br>"
+        + line_period(f"Текущий квартал: {quarter_lbl}", Q) + "<br>"
+        + line_period(f"Текущий год: {year_lbl}",      Y) + "<br>"
+        + line_period("Итого: ",          T)
+        + "</p>"
     )
 
     return "\n".join(parts)
 
-def table_params_block(W_df: pd.DataFrame, M_df: pd.DataFrame, Q_df: pd.DataFrame, Y_df: pd.DataFrame, T_df: pd.DataFrame):
+
+def table_params_block(
+    W_df: pd.DataFrame,
+    M_df: pd.DataFrame,
+    Q_df: pd.DataFrame,
+    Y_df: pd.DataFrame,
+    T_df: pd.DataFrame,
+    week_lbl: str,
+    month_lbl: str,
+    quarter_lbl: str,
+    year_lbl: str,
+    total_lbl: str = "Итого",
+):
+    """
+    Строим основную таблицу параметров. Каждый блок колонок:
+    - Ср. оценка (средняя по шкале /5, округление до десятых)
+    - Ответы (сколько гостей реально ответили на этот вопрос)
+    """
+
     def df_to_map(df):
         mp = {}
         for _, r in df.iterrows():
@@ -511,11 +638,15 @@ def table_params_block(W_df: pd.DataFrame, M_df: pd.DataFrame, Q_df: pd.DataFram
         r = mp.get(param)
         if r is None:
             return "<td>—</td><td>—</td>"
+
         if param == "nps":
+            # для NPS: показываем NPS (%) и число ответов на сам вопрос
             return (
                 f"<td>{fmt_nps(r.get('nps_value'))}</td>"
                 f"<td>{fmt_int(r.get('nps_answers'))}</td>"
             )
+
+        # обычный параметр: средняя /5 и число ответов
         return (
             f"<td>{fmt_avg5(r.get('avg5'))}</td>"
             f"<td>{fmt_int(r.get('answered'))}</td>"
@@ -525,9 +656,8 @@ def table_params_block(W_df: pd.DataFrame, M_df: pd.DataFrame, Q_df: pd.DataFram
     for p in order:
         title = PARAM_TITLES.get(p, p)
         rows_html.append(
-            "<tr><td><b>"
-            + title
-            + "</b></td>"
+            "<tr>"
+            f"<td><b>{title}</b></td>"
             + cell(W, p)
             + cell(M, p)
             + cell(Q, p)
@@ -537,81 +667,83 @@ def table_params_block(W_df: pd.DataFrame, M_df: pd.DataFrame, Q_df: pd.DataFram
         )
 
     html = f"""
-    <h3>Параметры (Неделя / Текущий месяц / Текущий квартал / Текущий год / Итого)</h3>
-    <table border='1' cellspacing='0' cellpadding='6'>
-      <tr>
+    <h3>Ключевые показатели по параметрам качества</h3>
+    <table border='1' cellspacing='0' cellpadding='6' style="border-collapse:collapse;">
+      <tr style="background-color:#f5f5f5;">
         <th rowspan="2">Параметр</th>
-        <th colspan="2">Неделя</th>
-        <th colspan="2">Месяц</th>
-        <th colspan="2">Квартал</th>
-        <th colspan="2">Год</th>
-        <th colspan="2">Итого</th>
+        <th colspan="2">{week_lbl}</th>
+        <th colspan="2">{month_lbl}</th>
+        <th colspan="2">{quarter_lbl}</th>
+        <th colspan="2">{year_lbl}</th>
+        <th colspan="2">{total_lbl}</th>
       </tr>
-      <tr>
-        <th>Ср.</th><th>Ответы</th>
-        <th>Ср.</th><th>Ответы</th>
-        <th>Ср.</th><th>Ответы</th>
-        <th>Ср.</th><th>Ответы</th>
-        <th>Ср.</th><th>Ответы</th>
+      <tr style="background-color:#f5f5f5;">
+        <th>Ср. оценка</th><th>Ответы</th>
+        <th>Ср. оценка</th><th>Ответы</th>
+        <th>Ср. оценка</th><th>Ответы</th>
+        <th>Ср. оценка</th><th>Ответы</th>
+        <th>Ср. оценка</th><th>Ответы</th>
       </tr>
       {''.join(rows_html)}
     </table>
     """
     return html
 
+
 def footnote_block():
     return """
     <hr>
-    <p><i>* Все значения показаны в шкале /5 (1 = плохо, 5 = отлично). Средняя по каждому параметру считается ТОЛЬКО среди гостей, которые ответили на этот вопрос; их количество показано как «Ответы».
-    <br>
-    NPS считается по вопросу «вероятность порекомендовать»: 1–2 — детракторы, 3–4 — нейтралы, 5 — промоутеры. Пустые ответы не учитываются. NPS = %промоутеров − %детракторов (в п.п.).
-    <br>
-    «Итого» — накопленные данные с начала сбора анкет.</i></p>
+    <p style="font-size:12px;color:#666;line-height:1.4;">
+    <b>Пояснения.</b><br>
+    • Все оценки даны по шкале 1–5, где 1 — плохо, 5 — отлично. В отчёте приводится средняя оценка с округлением до 0,1.<br>
+    • «Ответы» — сколько гостей реально ответили на конкретный вопрос (если гость пропустил вопрос, он не учитывается в средней).<br>
+    • NPS рассчитывается по вопросу «порекомендуете ли вы нас?»: 1–2 — детракторы, 3–4 — нейтральные, 5 — промоутеры. Пустые ответы не учитываются.<br>
+    • NPS в отчёте показан в процентах (% промоутеров минус % детракторов). Разница между периодами по NPS указана в п.п. (процентных пунктах).<br>
+    • «Последние 4 недели» — база качества обслуживания до текущей недели. Это помогает отличать разовый всплеск от устойчивой тенденции.
+    </p>
     """
 
-def trends_block(W, Prev, L4):
+def trends_block(
+    W, Prev, L4,
+    cur_range_label: str,
+    prev_range_label: str,
+    l4_range_label: str,
+):
     """
-    Формируем аналитический блок "Динамика и точки внимания".
+    Формирует аналитический раздел "Динамика и точки внимания".
 
-    Аргументы:
-      W    - агрегат текущей недели (dict с ключами "totals", "by_param")
-      Prev - агрегат прошлой недели
-      L4   - агрегат по окну последних 4 недель ДО текущей
-             (то есть baseline, без текущей недели)
-
-    Возвращает:
-      HTML-строку <h3>...</h3><p>...</p> готовую для встраивания в письмо.
+    cur_range_label  — диапазон дат текущей недели (например, '13–19 окт 2025')
+    prev_range_label — диапазон дат прошлой недели
+    l4_range_label   — диапазон базового окна последних 4 недель
     """
 
-    # --- Вспомогательные форматтеры внутри блока ---
+    def _to_float_or_none_local(x):
+        try:
+            val = float(x)
+            if np.isnan(val):
+                return None
+            return val
+        except Exception:
+            return None
 
     def fmt_delta(curr, prev, unit):
         """
-        Возвращает строку вида '+0.12 /5' или '-4.0 п.п.'.
+        Возвращает строку вида '+0.3 /5' или '-4.0 п.п.'.
         Если нет данных, вернёт '—'.
         unit: '/5' или 'п.п.'
         """
-        if curr is None or prev is None:
+        c = _to_float_or_none_local(curr)
+        p = _to_float_or_none_local(prev)
+        if c is None or p is None:
             return "—"
-        try:
-            d = float(curr) - float(prev)
-        except Exception:
-            return "—"
+        d = c - p
         sign = "+" if d >= 0 else ""
         if unit == "/5":
-            return f"{sign}{d:.2f} {unit}"
+            return f"{sign}{d:.1f} {unit}"
         else:
             return f"{sign}{d:.1f} {unit}"
 
     def df_to_map(df):
-        """
-        Превращает DataFrame с by_param в словарь:
-        {
-          "comfort": { "avg5": ..., "answered": ..., ... },
-          ...
-        }
-        Удобно для сравнений по параметрам.
-        """
         mp = {}
         if df is None or len(df) == 0:
             return mp
@@ -619,7 +751,7 @@ def trends_block(W, Prev, L4):
             mp[str(r["param"])] = r.to_dict()
         return mp
 
-    # --- 1. Краткосрочная динамика (неделя vs прошлая неделя) ---
+    # --- краткосрочно: текущая неделя vs прошлая неделя ---
 
     cur_overall  = W["totals"]["overall5"]
     prev_overall = Prev["totals"]["overall5"]
@@ -627,42 +759,53 @@ def trends_block(W, Prev, L4):
     cur_nps   = W["totals"]["nps"]
     prev_nps  = Prev["totals"]["nps"]
 
-    short_overall_line = (
-        f"Итоговая оценка за неделю: {fmt_avg5(cur_overall)} "
-        f"({fmt_delta(cur_overall, prev_overall, '/5')} к прошлой неделе "
-        f"{fmt_avg5(prev_overall)})."
-    )
-
-    short_nps_line = (
+    short_block = (
+        "<p><b>Краткосрочно (неделя "
+        f"{cur_range_label} vs {prev_range_label}):</b><br>"
+        f"Итоговая оценка: {fmt_avg5(cur_overall)} "
+        f"({fmt_delta(cur_overall, prev_overall, '/5')} к предыдущей неделе {fmt_avg5(prev_overall)}).<br>"
         f"NPS: {fmt_nps(cur_nps)} "
-        f"({fmt_delta(cur_nps, prev_nps, 'п.п.')} к прошлой неделе "
-        f"{fmt_nps(prev_nps)})."
+        f"({fmt_delta(cur_nps, prev_nps, 'п.п.')} к предыдущей неделе {fmt_nps(prev_nps)})."
+        "</p>"
     )
 
-    # --- 2. Долгосрочная динамика (неделя vs baseline последних 4 недель) ---
+    # --- долгосрочно: текущая неделя vs среднее за последние 4 недели до неё ---
 
     base_overall = L4["totals"]["overall5"]
     base_nps     = L4["totals"]["nps"]
 
-    long_overall_line = (
-        "Итоговая оценка сейчас "
-        f"{fmt_avg5(cur_overall)} "
-        f"({fmt_delta(cur_overall, base_overall, '/5')} к среднему за последние 4 недели "
-        f"{fmt_avg5(base_overall)})."
-        if base_overall is not None
-        else "Недостаточно данных для долгосрочного сравнения по итоговой оценке."
+    if base_overall is not None:
+        long_overall_line = (
+            f"Итоговая оценка сейчас: {fmt_avg5(cur_overall)} "
+            f"({fmt_delta(cur_overall, base_overall, '/5')} к среднему за последние 4 недели "
+            f"({l4_range_label}): {fmt_avg5(base_overall)})."
+        )
+    else:
+        long_overall_line = (
+            "Недостаточно данных для сравнения итоговой оценки с базовым уровнем последних 4 недель."
+        )
+
+    if base_nps is not None:
+        long_nps_line = (
+            f"NPS сейчас: {fmt_nps(cur_nps)} "
+            f"({fmt_delta(cur_nps, base_nps, 'п.п.')} к среднему за последние 4 недели "
+            f"({l4_range_label}): {fmt_nps(base_nps)})."
+        )
+    else:
+        long_nps_line = (
+            "Недостаточно данных для сравнения NPS с базовым уровнем последних 4 недель."
+        )
+
+    long_block = (
+        "<p><b>Долгосрочно (неделя "
+        f"{cur_range_label} vs среднее за последние 4 недели "
+        f"{l4_range_label}):</b><br>"
+        f"{long_overall_line}<br>"
+        f"{long_nps_line}"
+        "</p>"
     )
 
-    long_nps_line = (
-        "NPS сейчас "
-        f"{fmt_nps(cur_nps)} "
-        f"({fmt_delta(cur_nps, base_nps, 'п.п.')} к среднему за последние 4 недели "
-        f"{fmt_nps(base_nps)})."
-        if base_nps is not None
-        else "Недостаточно данных для долгосрочного сравнения по NPS."
-    )
-
-    # --- 3. Сильные стороны и зоны риска (по параметрам: Неделя vs baseline L4) ---
+    # --- сильные стороны и зоны риска: сравнение параметров Неделя vs L4 ---
 
     Wmap  = df_to_map(W["by_param"])
     L4map = df_to_map(L4["by_param"])
@@ -670,105 +813,72 @@ def trends_block(W, Prev, L4):
     deltas = []
     for p, wrow in Wmap.items():
         if p == "nps":
-            continue  # NPS не сравниваем как /5 параметр
+            continue
         w_avg = wrow.get("avg5")
         l4_avg = L4map.get(p, {}).get("avg5")
-        if (
-            w_avg is None or l4_avg is None
-            or (isinstance(w_avg, float) and np.isnan(w_avg))
-            or (isinstance(l4_avg, float) and np.isnan(l4_avg))
-        ):
+        cw = _to_float_or_none_local(w_avg)
+        cb = _to_float_or_none_local(l4_avg)
+        if cw is None or cb is None:
             continue
-        try:
-            w_avg_f = float(w_avg)
-            l4_avg_f = float(l4_avg)
-        except Exception:
-            continue
-        delta = w_avg_f - l4_avg_f
+        delta = cw - cb
         deltas.append({
             "param": p,
-            "week_avg": w_avg_f,
-            "base_avg": l4_avg_f,
+            "week_avg": cw,
+            "base_avg": cb,
             "delta": delta,
         })
 
-    strengths_html = ""
-    risks_html = ""
+    IMPROVE_THRESHOLD = 0.20
+    DECLINE_THRESHOLD = -0.20
 
-    if not deltas:
-        strengths_html = (
-            "<p><b>Сильные стороны недели:</b><br>"
-            "Недостаточно данных для оценки параметров относительно последних 4 недель.</p>"
+    improved = [d for d in deltas if d["delta"] >= IMPROVE_THRESHOLD]
+    declined = [d for d in deltas if d["delta"] <= DECLINE_THRESHOLD]
+
+    improved.sort(key=lambda x: x["delta"], reverse=True)
+    declined.sort(key=lambda x: x["delta"])
+
+    def fmt_param_line(d):
+        title = PARAM_TITLES.get(d["param"], d["param"])
+        sign = "+" if d["delta"] >= 0 else ""
+        return (
+            f"- {title}: {d['week_avg']:.1f} /5 "
+            f"({sign}{d['delta']:.1f} к среднему за последние 4 недели "
+            f"{l4_range_label}: {d['base_avg']:.1f} /5)"
         )
-        risks_html = (
-            "<p><b>Зоны риска:</b><br>"
-            "Недостаточно данных для оценки параметров относительно последних 4 недель.</p>"
+
+    if improved:
+        strengths_lines = "<br>".join(fmt_param_line(x) for x in improved[:2])
+        strengths_html = (
+            f"<p><b>Сильные стороны недели {cur_range_label}:</b><br>"
+            f"{strengths_lines}</p>"
         )
     else:
-        IMPROVE_THRESHOLD = 0.20   # значимое улучшение
-        DECLINE_THRESHOLD = -0.20  # значимое ухудшение
+        strengths_html = (
+            f"<p><b>Сильные стороны недели {cur_range_label}:</b><br>"
+            "Существенного роста показателей относительно базового уровня последних 4 недель не зафиксировано.</p>"
+        )
 
-        improved = [d for d in deltas if d["delta"] >= IMPROVE_THRESHOLD]
-        declined = [d for d in deltas if d["delta"] <= DECLINE_THRESHOLD]
+    if declined:
+        risks_lines = "<br>".join(fmt_param_line(x) for x in declined[:2])
+        risks_html = (
+            f"<p><b>Зоны риска недели {cur_range_label}:</b><br>"
+            f"{risks_lines}</p>"
+        )
+    else:
+        risks_html = (
+            f"<p><b>Зоны риска недели {cur_range_label}:</b><br>"
+            "Не выявлено значимого снижения показателей относительно базового уровня последних 4 недель.</p>"
+        )
 
-        # самые сильные апгрейды вверху
-        improved.sort(key=lambda x: x["delta"], reverse=True)
-        # самые проблемные просадки вверху
-        declined.sort(key=lambda x: x["delta"])
-
-        def fmt_param_line(d):
-            title = PARAM_TITLES.get(d["param"], d["param"])
-            sign = "+" if d["delta"] >= 0 else ""
-            return (
-                f"- {title}: {d['week_avg']:.2f} /5, "
-                f"{sign}{d['delta']:.2f} к среднему за последние 4 недели "
-                f"({d['base_avg']:.2f} /5)"
-            )
-
-        if improved:
-            top_imp = improved[:2]
-            strengths_lines = "<br>".join(fmt_param_line(x) for x in top_imp)
-            strengths_html = (
-                "<p><b>Сильные стороны недели:</b><br>"
-                f"{strengths_lines}</p>"
-            )
-        else:
-            strengths_html = (
-                "<p><b>Сильные стороны недели:</b><br>"
-                "Существенных улучшений относительно среднего за последние 4 недели не зафиксировано.</p>"
-            )
-
-        if declined:
-            top_decl = declined[:2]
-            risks_lines = "<br>".join(fmt_param_line(x) for x in top_decl)
-            risks_html = (
-                "<p><b>Зоны риска:</b><br>"
-                f"{risks_lines}</p>"
-            )
-        else:
-            risks_html = (
-                "<p><b>Зоны риска:</b><br>"
-                "Нет параметров со значимым ухудшением относительно последних 4 недель.</p>"
-            )
-
-    # --- Собираем HTML-блок целиком ---
-    html = f"""
-    <h3>Динамика и точки внимания</h3>
-
-    <p><b>Краткосрочно (текущая неделя vs прошлая неделя):</b><br>
-    {short_overall_line}<br>
-    {short_nps_line}
-    </p>
-
-    <p><b>Долгосрочно (текущая неделя vs среднее за последние 4 недели):</b><br>
-    {long_overall_line}<br>
-    {long_nps_line}
-    </p>
-
-    {strengths_html}
-    {risks_html}
-    """
+    html = (
+        "<h3>Динамика и точки внимания</h3>"
+        + short_block
+        + long_block
+        + strengths_html
+        + risks_html
+    )
     return html
+
 
 
 # =========================
@@ -1059,6 +1169,7 @@ def main():
     l4_start = w_start - dt.timedelta(days=28)
     l4_end   = w_start - dt.timedelta(days=1)
     L4 = surveys_aggregate_period(hist, l4_start, l4_end)
+    
 
     # периоды: неделя / месяц-to-date / квартал-to-date / год-to-date
     ranges = period_ranges_for_week(w_start)
@@ -1075,10 +1186,28 @@ def main():
     Y = surveys_aggregate_period(hist, ranges["ytd"]["start"], ranges["ytd"]["end"])
     T = surveys_aggregate_period(hist, all_start, all_end)
 
+    # Форматы периодов
+    week_lbl    = week_label(w_start, w_end)                 # '13–19 окт 2025'
+    month_lbl   = pretty_month_label(w_start)                # 'Октябрь 2025 г.'
+    quarter_lbl = pretty_quarter_label(w_start)              # 'IV квартал 2025 г.'
+    year_lbl    = pretty_year_label(w_start)                 # '2025 г.'
+    prev_lbl      = week_label(prev_start, prev_end)
+    l4_lbl        = range_label(l4_start, l4_end)
+
+
+
     # Тело письма
     head  = header_block(w_start, w_end, W, M, Q, Y, T)
-    table = table_params_block(W["by_param"], M["by_param"], Q["by_param"], Y["by_param"], T["by_param"])
-    trends  = trends_block(W, Prev, L4)
+    table = table_params_block(
+    W["by_param"], M["by_param"], Q["by_param"], Y["by_param"], T["by_param"],
+    week_lbl, month_lbl, quarter_lbl, year_lbl, "Итого"
+)
+    trends = trends_block(
+    W, Prev, L4,
+    cur_range_label=week_lbl,
+    prev_range_label=prev_lbl,
+    l4_range_label=l4_lbl,
+)
     html = head + table + trends + footnote_block()
 
     # Построение графиков
