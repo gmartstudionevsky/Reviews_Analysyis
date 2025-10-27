@@ -1,211 +1,240 @@
+# agent/reviews_backfill_agent.py
+#
+# Бэкфилл истории отзывов (2019-2025) в Google Sheets.
+#
+# Что делает:
+#   1. Берёт файл Reviews_2019-25.xls из папки DRIVE_FOLDER_ID в Google Drive.
+#   2. Читает лист "Отзывы".
+#   3. Прогоняет через build_exploded_reviews_df() из text_analytics_core:
+#        - нормализация языка
+#        - тональность (pos/neg/neu)
+#        - аспекты (темы)
+#        - приведение рейтинга к шкале /5
+#        - week_key, month_key, quarter_key, year_key
+#   4. Дедупит (review_id + aspect_code).
+#   5. Строит агрегаты:
+#        a) period_kpi_history: KPI по периодам (неделя / месяц / квартал / год)
+#        b) period_aspects_history: частота аспектов и их тональность по периодам
+#        c) source_history: репутация по источникам (недельная)
+#   6. Полностью ПЕРЕЗАПИСЫВАЕТ в таблице SHEETS_HISTORY_ID вкладки:
+#        - reviews_semantic_history
+#        - period_kpi_history
+#        - period_aspects_history
+#        - source_history
+#
+# Этот скрипт запускается вручную (через отдельный workflow_dispatch или локально).
+# В еженедельном отчёте мы бэкфилл не дергаем.
+
 import os
 import io
 import math
 from datetime import datetime
-from typing import Dict, Any, List, Tuple
+from typing import Any, List, Dict, Tuple
 
 import pandas as pd
 
-from google.oauth2 import service_account
+import json
+from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 
-# Импортируем ядро аналитики текста, которое мы уже разработали
-from agent.text_analytics_core import (
-    TOPIC_SCHEMA,
-    build_exploded_reviews_df,
-)
+
+# =========================
+# Импорт ядра семантики отзывов
+# =========================
+# Нас интересует только build_exploded_reviews_df (и TOPIC_SCHEMA она тянет).
+try:
+    from agent.text_analytics_core import (
+        TOPIC_SCHEMA,
+        build_exploded_reviews_df,
+    )
+except ModuleNotFoundError:
+    # fallback если запускаем модуль локально как script без пакета agent
+    import sys
+    sys.path.append(os.path.dirname(__file__))
+    from text_analytics_core import (
+        TOPIC_SCHEMA,
+        build_exploded_reviews_df,
+    )
 
 
-# ---------------------------
-# Константы / настройки
-# ---------------------------
+# =========================
+# Настройки листов и колонок
+# =========================
 
 SEMANTIC_TAB = "reviews_semantic_history"
-KPI_TAB = "period_kpi_history"
-ASPECTS_TAB = "period_aspects_history"
-SOURCES_TAB = "source_history"
+KPI_TAB      = "period_kpi_history"
+ASPECTS_TAB  = "period_aspects_history"
+SOURCES_TAB  = "source_history"
 
-# Периодические ключи
 PERIOD_LEVELS = [
-    ("week", "week_key"),
-    ("month", "month_key"),
+    ("week",    "week_key"),
+    ("month",   "month_key"),
     ("quarter", "quarter_key"),
-    ("year", "year_key"),
+    ("year",    "year_key"),
 ]
 
+SCOPES = [
+    "https://www.googleapis.com/auth/drive.readonly",
+    "https://www.googleapis.com/auth/spreadsheets",
+]
 
-# ---------------------------
-# Google auth / helpers
-# ---------------------------
+# =========================
+# Авторизация в Google API
+# =========================
 
-def get_google_services(sa_json_path: str):
+def get_google_clients() -> tuple:
     """
-    Возвращает клиенты Drive и Sheets по сервисному аккаунту.
-    Ожидается, что сервисный аккаунт имеет доступ
-    к папке DRIVE_FOLDER_ID (для чтения) и к таблице SHEETS_HISTORY_ID (для записи).
+    Создаёт клиенты DRIVE и SHEETS на основе сервисного аккаунта.
+    Поддерживает два варианта:
+    1. GOOGLE_SERVICE_ACCOUNT_JSON_CONTENT = '{"type":"service_account",...}'
+    2. GOOGLE_SERVICE_ACCOUNT_JSON = путь к sa.json
+    Возвращает (DRIVE, SHEETS).
     """
-    creds = service_account.Credentials.from_service_account_file(
-        sa_json_path,
-        scopes=[
-            "https://www.googleapis.com/auth/drive.readonly",
-            "https://www.googleapis.com/auth/spreadsheets",
-        ],
-    )
-    drive_svc = build("drive", "v3", credentials=creds)
-    sheets_svc = build("sheets", "v4", credentials=creds)
-    return drive_svc, sheets_svc
+    sa_path    = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
+    sa_content = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON_CONTENT")
+
+    if sa_content and sa_content.strip().startswith("{"):
+        creds = Credentials.from_service_account_info(json.loads(sa_content), scopes=SCOPES)
+    else:
+        if not sa_path:
+            raise RuntimeError("No GOOGLE_SERVICE_ACCOUNT_JSON or GOOGLE_SERVICE_ACCOUNT_JSON_CONTENT provided.")
+        creds = Credentials.from_service_account_file(sa_path, scopes=SCOPES)
+
+    drive  = build("drive",  "v3", credentials=creds)
+    sheets = build("sheets", "v4", credentials=creds).spreadsheets()
+    return drive, sheets
 
 
-def drive_download_file_by_name(drive_svc, folder_id: str, target_name: str) -> pd.DataFrame:
+# =========================
+# Drive helpers
+# =========================
+
+def drive_download_reviews_file(drive, folder_id: str, filename: str) -> pd.DataFrame:
     """
-    Ищем в указанной папке Drive файл с именем target_name (точное совпадение),
-    скачиваем, читаем лист 'Отзывы' в pandas DataFrame.
-    Формат ожидается как наш History xls.
+    Находит в папке folder_id файл с именем filename (точное совпадение),
+    скачивает и читает лист 'Отзывы'.
+    Ожидаемый формат столбцов:
+      'Дата', 'Рейтинг', 'Источник', 'Автор', 'Код языка', 'Текст отзыва', 'Наличие ответа'
     """
-    q = (
+    query = (
         f"'{folder_id}' in parents and "
-        f"name = '{target_name}' and "
-        f"mimeType != 'application/vnd.google-apps.folder'"
+        f"name = '{filename}' and "
+        f"mimeType != 'application/vnd.google-apps.folder' and trashed = false"
     )
-    resp = drive_svc.files().list(
-        q=q,
-        fields="files(id, name, mimeType, modifiedTime, size)",
-        orderBy="modifiedTime desc",
+    resp = drive.files().list(
+        q=query,
+        fields="files(id,name,modifiedTime,size)",
         pageSize=5,
+        orderBy="modifiedTime desc",
     ).execute()
     files = resp.get("files", [])
     if not files:
-        raise RuntimeError(f"Не найден файл {target_name} в папке {folder_id}")
+        raise RuntimeError(f"Файл {filename} не найден в папке {folder_id}.")
 
     file_id = files[0]["id"]
 
-    # скачиваем содержимое
-    request = drive_svc.files().get_media(fileId=file_id)
+    req = drive.files().get_media(fileId=file_id)
     buf = io.BytesIO()
-    downloader = MediaIoBaseDownload(buf, request)
+    dl = MediaIoBaseDownload(buf, req)
     done = False
     while not done:
-        status, done = downloader.next_chunk()
+        _, done = dl.next_chunk()
     buf.seek(0)
 
-    # читаем лист "Отзывы"
+    # .xls может требовать движок xlrd → убедимся, что xlrd стоит в requirements
     df = pd.read_excel(buf, sheet_name="Отзывы")
     return df
 
 
-def df_to_values(df: pd.DataFrame) -> List[List[Any]]:
-    """
-    Превращаем DataFrame в values[][] для Sheets API:
-    первая строка — заголовки.
-    NaN превращаем в "".
-    """
-    out = [list(df.columns)]
-    for _, row in df.iterrows():
-        line = []
-        for val in row.tolist():
-            if pd.isna(val):
-                line.append("")
-            else:
-                line.append(val)
-        out.append(line)
-    return out
+# =========================
+# Sheets helpers
+# =========================
 
+def ensure_tab_exists(sheets, spreadsheet_id: str, tab_name: str, header: List[str]):
+    """
+    Убедиться, что вкладка tab_name есть в таблице spreadsheet_id,
+    и записать туда шапку в A1:... .
+    Если вкладки нет — создаём её.
+    """
+    meta = sheets.get(spreadsheetId=spreadsheet_id).execute()
+    existing_tabs = [s["properties"]["title"] for s in meta.get("sheets", [])]
 
-def ensure_sheet_exists(sheets_svc, spreadsheet_id: str, tab_name: str):
-    """
-    Проверяет, что в таблице есть лист с именем tab_name.
-    Если нет — добавляет.
-    Возвращает sheetId.
-    """
-    meta = sheets_svc.spreadsheets().get(
-        spreadsheetId=spreadsheet_id
+    if tab_name not in existing_tabs:
+        sheets.batchUpdate(
+            spreadsheetId=spreadsheet_id,
+            body={"requests":[{"addSheet":{"properties":{"title":tab_name}}}]}
+        ).execute()
+
+    # теперь пишем шапку
+    end_col_letter = chr(ord("A") + len(header) - 1)
+    sheets.values().update(
+        spreadsheetId=spreadsheet_id,
+        range=f"{tab_name}!A1:{end_col_letter}1",
+        valueInputOption="RAW",
+        body={"values":[header]},
     ).execute()
 
-    sheets = meta.get("sheets", [])
-    for s in sheets:
-        title = s["properties"]["title"]
-        if title == tab_name:
-            return s["properties"]["sheetId"]
 
-    # если не нашли — создаём
-    reqs = [
-        {
-            "addSheet": {
-                "properties": {
-                    "title": tab_name,
-                    "gridProperties": {
-                        "rowCount": 1000,
-                        "columnCount": 50,
-                    },
-                }
-            }
-        }
-    ]
-    body = {"requests": reqs}
-    resp = sheets_svc.spreadsheets().batchUpdate(
-        spreadsheetId=spreadsheet_id,
-        body=body,
-    ).execute()
-
-    replies = resp.get("replies", [])
-    if not replies:
-        raise RuntimeError(f"Не удалось создать лист {tab_name}")
-    sheet_id = replies[0]["addSheet"]["properties"]["sheetId"]
-    return sheet_id
-
-
-def clear_and_write_sheet(sheets_svc,
-                          spreadsheet_id: str,
-                          tab_name: str,
-                          df: pd.DataFrame):
+def clear_tab_data(sheets, spreadsheet_id: str, tab_name: str, start_cell: str = "A2"):
     """
-    Полностью очищает вкладку tab_name и заливает df заново.
+    Чистим всё ниже шапки, чтобы залить историю с нуля.
     """
-    ensure_sheet_exists(sheets_svc, spreadsheet_id, tab_name)
-
-    # чистим
-    sheets_svc.spreadsheets().values().clear(
+    sheets.values().clear(
         spreadsheetId=spreadsheet_id,
-        range=f"{tab_name}!A:ZZ",
+        range=f"{tab_name}!{start_cell}:ZZ",
         body={},
     ).execute()
 
-    # пишем
-    values = df_to_values(df)
-    sheets_svc.spreadsheets().values().update(
+
+def append_df_to_sheet(sheets, spreadsheet_id: str, tab_name: str, df: pd.DataFrame, columns: List[str]):
+    """
+    Добавляет df в конец вкладки tab_name,
+    значения колонок идут в указанном порядке.
+    Преобразует NaN → "".
+    """
+    if df.empty:
+        return
+
+    rows = []
+    for _, r in df.iterrows():
+        row_out = []
+        for col in columns:
+            val = r.get(col, "")
+            if pd.isna(val):
+                row_out.append("")
+            else:
+                row_out.append(val)
+        rows.append(row_out)
+
+    sheets.values().append(
         spreadsheetId=spreadsheet_id,
-        range=f"{tab_name}!A1",
+        range=f"{tab_name}!A2",
         valueInputOption="RAW",
-        body={"values": values},
+        body={"values": rows},
     ).execute()
 
 
-# ---------------------------
-# Агрегации
-# ---------------------------
+# =========================
+# Агрегация для KPI
+# =========================
 
 def build_per_review_df(exploded_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Делаем сводку: одна строка = один отзыв.
-    Нам нужно для kpi-шек по периодам и источникам.
-
-    Возвращает:
-    review_id, date, week_key, month_key, quarter_key, year_key,
-    source, rating_5, sentiment
+    Одна строка на отзыв.
+    Возвращает DataFrame с колонками:
+        review_id, date, week_key, month_key, quarter_key, year_key,
+        source, rating_5, sentiment
     """
     if exploded_df.empty:
-        cols = [
-            "review_id", "date", "week_key", "month_key",
-            "quarter_key", "year_key", "source",
-            "rating_5", "sentiment"
-        ]
-        return pd.DataFrame(columns=cols)
+        return pd.DataFrame(columns=[
+            "review_id","date","week_key","month_key","quarter_key","year_key",
+            "source","rating_5","sentiment"
+        ])
 
-    # sentiment у нас один на отзыв (по нашему пайплайну),
-    # rating_5 — усредним, если вдруг есть микс значений для одного отзыва.
     per_review = (
-        exploded_df.groupby("review_id").agg({
+        exploded_df.groupby("review_id")
+        .agg({
             "date": "first",
             "week_key": "first",
             "month_key": "first",
@@ -214,7 +243,8 @@ def build_per_review_df(exploded_df: pd.DataFrame) -> pd.DataFrame:
             "source": "first",
             "rating_5": "mean",
             "sentiment": "first",
-        }).reset_index()
+        })
+        .reset_index()
     )
 
     return per_review
@@ -222,20 +252,14 @@ def build_per_review_df(exploded_df: pd.DataFrame) -> pd.DataFrame:
 
 def compute_period_kpi_history(exploded_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Строим KPI по периодам на всех уровнях:
-    - week_key
-    - month_key
-    - quarter_key
-    - year_key
-
-    Возвращаем поля:
-    period_type, period_key,
-    reviews_count,
-    avg_rating_5,
-    share_pos,
-    share_neg
+    KPI по каждому периодическому ключу:
+      period_type ('week'/'month'/'quarter'/'year'),
+      period_key  ('2025-W42', '2025-10', ...),
+      reviews_count,
+      avg_rating_5,
+      share_pos,
+      share_neg
     """
-
     per_review = build_per_review_df(exploded_df)
 
     rows = []
@@ -267,43 +291,34 @@ def compute_period_kpi_history(exploded_df: pd.DataFrame) -> pd.DataFrame:
                 "share_neg": share_neg,
             })
 
-    kpi_df = pd.DataFrame(rows, columns=[
+    out_df = pd.DataFrame(rows, columns=[
         "period_type",
         "period_key",
         "reviews_count",
         "avg_rating_5",
         "share_pos",
         "share_neg",
-    ])
-
-    # сортируем по period_type, а потом по ключу
-    # ключи могут быть вида '2025-W42' / '2025-10' / '2025-Q4' / '2025'
-    # сортируем просто лексикографически внутри типа
-    kpi_df = kpi_df.sort_values(
-        by=["period_type", "period_key"],
+    ]).sort_values(
+        by=["period_type","period_key"],
         ascending=[True, True],
         ignore_index=True,
     )
 
-    return kpi_df
+    return out_df
 
 
 def compute_period_aspects_history(exploded_df: pd.DataFrame) -> pd.DataFrame:
     """
     По каждому периоду и аспекту считаем:
-    - сколько уникальных отзывов упомянули аспект,
-    - долю позитивных упоминаний,
-    - долю негативных упоминаний.
-
-    Возвращаем:
-    period_type,
-    period_key,
-    aspect_code,
-    mentions_reviews,
-    pos_share,
-    neg_share
+        mentions_reviews  — сколько уникальных отзывов упомянули аспект
+        pos_share / neg_share — доля позитивных / негативных упоминаний
+    Возвращает столбцы:
+        period_type, period_key,
+        aspect_code,
+        mentions_reviews,
+        pos_share,
+        neg_share
     """
-
     rows = []
 
     for period_type, col in PERIOD_LEVELS:
@@ -314,21 +329,21 @@ def compute_period_aspects_history(exploded_df: pd.DataFrame) -> pd.DataFrame:
         if tmp.empty:
             continue
 
-        # считаем уникальные упоминания аспектов в разрезе (aspect_code, sentiment, period_key)
+        # (period_key, aspect_code, sentiment, review_id)
         grp = (
             tmp.groupby([col, "aspect_code", "sentiment", "review_id"])
                .size()
                .reset_index(name="cnt")
         )
 
-        # теперь сворачиваем по периоду+аспекту+sentiment → уникальных отзывов
+        # агрегируем по (period_key, aspect_code, sentiment)
         agg_mentions = (
             grp.groupby([col, "aspect_code", "sentiment"])["review_id"]
                .nunique()
                .reset_index(name="review_mentions")
         )
 
-        # сделаем сводную по sentiment
+        # сводная по sentiment
         pivot = agg_mentions.pivot_table(
             index=[col, "aspect_code"],
             columns="sentiment",
@@ -337,10 +352,9 @@ def compute_period_aspects_history(exploded_df: pd.DataFrame) -> pd.DataFrame:
             aggfunc="sum",
         )
 
-        # гарантируем столбцы
-        for need_col in ["pos", "neg", "neu"]:
-            if need_col not in pivot.columns:
-                pivot[need_col] = 0
+        for need in ["pos","neg","neu"]:
+            if need not in pivot.columns:
+                pivot[need] = 0
 
         pivot["mentions_total"] = (
             pivot["pos"] + pivot["neg"] + pivot["neu"]
@@ -351,20 +365,15 @@ def compute_period_aspects_history(exploded_df: pd.DataFrame) -> pd.DataFrame:
 
         pivot = pivot.reset_index()
 
-        for _, row in pivot.iterrows():
-            period_key = row[col]
-            aspect_code = row["aspect_code"]
-            mentions_reviews = row["mentions_total"]
-            pos_share = row["pos_share"]
-            neg_share = row["neg_share"]
-
+        for _, r in pivot.iterrows():
+            period_key = r[col]
             rows.append({
                 "period_type": period_type,
                 "period_key": period_key,
-                "aspect_code": aspect_code,
-                "mentions_reviews": int(mentions_reviews),
-                "pos_share": pos_share,
-                "neg_share": neg_share,
+                "aspect_code": r["aspect_code"],
+                "mentions_reviews": int(r["mentions_total"]),
+                "pos_share": r["pos_share"],
+                "neg_share": r["neg_share"],
             })
 
     out_df = pd.DataFrame(rows, columns=[
@@ -374,10 +383,8 @@ def compute_period_aspects_history(exploded_df: pd.DataFrame) -> pd.DataFrame:
         "mentions_reviews",
         "pos_share",
         "neg_share",
-    ])
-
-    out_df = out_df.sort_values(
-        by=["period_type", "period_key", "mentions_reviews"],
+    ]).sort_values(
+        by=["period_type","period_key","mentions_reviews"],
         ascending=[True, True, False],
         ignore_index=True,
     )
@@ -387,44 +394,23 @@ def compute_period_aspects_history(exploded_df: pd.DataFrame) -> pd.DataFrame:
 
 def compute_source_history_weekly(exploded_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Собираем статистику по источникам в недельном разрезе.
-    (Недели нам нужны и для трендов, и для динамки каналов/площадок)
-
-    Возвращаем:
-    week_key,
-    source,
-    reviews_count,
-    avg_rating_5,
-    share_pos,
-    share_neg
+    История по источникам (недели):
+        week_key,
+        source,
+        reviews_count,
+        avg_rating_5,
+        share_pos,
+        share_neg
     """
-
-    if exploded_df.empty:
-        return pd.DataFrame(columns=[
-            "week_key",
-            "source",
-            "reviews_count",
-            "avg_rating_5",
-            "share_pos",
-            "share_neg",
-        ])
-
     per_review = build_per_review_df(exploded_df)
-
-    # если у каких-то отзывов нет week_key (нет даты) — пропустим
     tmp = per_review.dropna(subset=["week_key"]).copy()
     if tmp.empty:
         return pd.DataFrame(columns=[
-            "week_key",
-            "source",
-            "reviews_count",
-            "avg_rating_5",
-            "share_pos",
-            "share_neg",
+            "week_key","source","reviews_count","avg_rating_5","share_pos","share_neg"
         ])
 
     rows = []
-    for (week_key, source), gdf in tmp.groupby(["week_key", "source"]):
+    for (week_key, source), gdf in tmp.groupby(["week_key","source"]):
         cnt = len(gdf)
         avg_rating_5 = gdf["rating_5"].dropna().mean()
 
@@ -438,22 +424,15 @@ def compute_source_history_weekly(exploded_df: pd.DataFrame) -> pd.DataFrame:
             "week_key": week_key,
             "source": source,
             "reviews_count": cnt,
-            "avg_rating_5": round(avg_rating_5, 4) if avg_rating_5 == avg_rating_5 else "",
+            "avg_rating_5": round(avg_rating_5,4) if avg_rating_5 == avg_rating_5 else "",
             "share_pos": share_pos,
             "share_neg": share_neg,
         })
 
     out_df = pd.DataFrame(rows, columns=[
-        "week_key",
-        "source",
-        "reviews_count",
-        "avg_rating_5",
-        "share_pos",
-        "share_neg",
-    ])
-
-    out_df = out_df.sort_values(
-        by=["week_key", "reviews_count"],
+        "week_key","source","reviews_count","avg_rating_5","share_pos","share_neg"
+    ]).sort_values(
+        by=["week_key","reviews_count"],
         ascending=[True, False],
         ignore_index=True,
     )
@@ -461,77 +440,91 @@ def compute_source_history_weekly(exploded_df: pd.DataFrame) -> pd.DataFrame:
     return out_df
 
 
-# ---------------------------
-# Основной пайплайн backfill
-# ---------------------------
+# =========================
+# Основной сценарий backfill
+# =========================
 
-def run_reviews_backfill():
+def run_backfill():
     """
-    Основной сценарий бэкфилла:
-    1. Получаем Reviews_2019-25.xls с Google Drive.
+    1. Скачиваем Reviews_2019-25.xls.
     2. Читаем лист "Отзывы".
-    3. Прогоняем через build_exploded_reviews_df -> получаем exploded_df.
-    4. Дедуп по (review_id, aspect_code) и сортировка по дате.
-    5. Считаем периодические агрегаты:
-       - KPI по периодам (неделя/месяц/квартал/год)
-       - Частоту аспектов по периодам
-       - Источники по неделям
-    6. Всё заливаем в гугл-таблицу SHEETS_HISTORY_ID
-       в разные вкладки.
+    3. Парсим в exploded_df (отзыв × аспект).
+    4. Дедупим.
+    5. Считаем агрегаты.
+    6. Полностью перезаписываем 4 вкладки в SHEETS_HISTORY_ID.
     """
+    DRIVE_FOLDER_ID   = os.environ["DRIVE_FOLDER_ID"]
+    SHEETS_HISTORY_ID = os.environ["SHEETS_HISTORY_ID"]
 
-    drive_folder_id = os.environ["DRIVE_FOLDER_ID"]
-    sheets_history_id = os.environ["SHEETS_HISTORY_ID"]
-    sa_json_path = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
+    drive, sheets = get_google_clients()
 
-    drive_svc, sheets_svc = get_google_services(sa_json_path)
-
-    # 1. скачиваем историческую выгрузку
-    raw_reviews_df = drive_download_file_by_name(
-        drive_svc=drive_svc,
-        folder_id=drive_folder_id,
-        target_name="Reviews_2019-25.xls",
+    # 1. выкачиваем xls из Google Drive
+    raw_reviews_df = drive_download_reviews_file(
+        drive=drive,
+        folder_id=DRIVE_FOLDER_ID,
+        filename="Reviews_2019-25.xls",
     )
 
-    # 2. строим exploded_df через наш текстовый пайплайн
+    # 2. семантический разбор
     exploded_df = build_exploded_reviews_df(
         raw_reviews_df=raw_reviews_df,
         topic_schema=TOPIC_SCHEMA,
         add_rating_5scale=True,
     )
 
+    # Если пусто - тоже должны залить пустые вкладки с шапками
     if exploded_df.empty:
-        # Если вообще ничего не распарсили — всё равно создаём пустые вкладки
-        empty_semantic = pd.DataFrame(columns=[
+        print("[WARN] exploded_df пустой, но всё равно создаём вкладки с пустыми данными.")
+        semantic_out = pd.DataFrame(columns=[
             "review_id","date","week_key","month_key","quarter_key","year_key",
             "source","rating_5","sentiment","aspect_code","text",
         ])
-        clear_and_write_sheet(sheets_svc, sheets_history_id, SEMANTIC_TAB, empty_semantic)
-        clear_and_write_sheet(sheets_svc, sheets_history_id, KPI_TAB, pd.DataFrame(columns=[
+        kpi_df = pd.DataFrame(columns=[
             "period_type","period_key","reviews_count","avg_rating_5","share_pos","share_neg",
-        ]))
-        clear_and_write_sheet(sheets_svc, sheets_history_id, ASPECTS_TAB, pd.DataFrame(columns=[
+        ])
+        aspects_df = pd.DataFrame(columns=[
             "period_type","period_key","aspect_code","mentions_reviews","pos_share","neg_share",
-        ]))
-        clear_and_write_sheet(sheets_svc, sheets_history_id, SOURCES_TAB, pd.DataFrame(columns=[
+        ])
+        sources_df = pd.DataFrame(columns=[
             "week_key","source","reviews_count","avg_rating_5","share_pos","share_neg",
-        ]))
-        return
+        ])
+    else:
+        # 3. дедуп: один отзыв × аспект только один раз
+        exploded_df = exploded_df.drop_duplicates(
+            subset=["review_id","aspect_code"]
+        ).reset_index(drop=True)
 
-    # 3. дедуп (review_id, aspect_code), чтобы один отзыв × аспект был один раз
-    exploded_df = exploded_df.drop_duplicates(
-        subset=["review_id", "aspect_code"]
-    ).reset_index(drop=True)
+        exploded_df = exploded_df.sort_values(
+            by=["date","review_id","aspect_code"],
+            ascending=[True,True,True],
+        ).reset_index(drop=True)
 
-    # сортировка для стабильности
-    exploded_df = exploded_df.sort_values(
-        by=["date","review_id","aspect_code"],
-        ascending=[True, True, True],
-        ignore_index=True,
-    )
+        # 4. данные для SEMANTIC_TAB
+        semantic_out = exploded_df[[
+            "review_id",
+            "date",
+            "week_key",
+            "month_key",
+            "quarter_key",
+            "year_key",
+            "source",
+            "rating_5",
+            "sentiment",
+            "aspect_code",
+            "text",
+        ]].copy()
 
-    # 4. готовим фрейм для выгрузки в SEMANTIC_TAB
-    semantic_out = exploded_df[[
+        # дату приводим к строке, чтобы гугл не наигрался с таймзонами
+        semantic_out["date"] = semantic_out["date"].dt.strftime("%Y-%m-%d %H:%M:%S")
+
+        # 5. агрегаты
+        kpi_df     = compute_period_kpi_history(exploded_df)
+        aspects_df = compute_period_aspects_history(exploded_df)
+        sources_df = compute_source_history_weekly(exploded_df)
+
+    # 6. запись во вкладки гугл-таблицы
+    # 6.1 SEMANTIC_TAB
+    semantic_header = [
         "review_id",
         "date",
         "week_key",
@@ -543,26 +536,52 @@ def run_reviews_backfill():
         "sentiment",
         "aspect_code",
         "text",
-    ]].copy()
+    ]
+    ensure_tab_exists(sheets, SHEETS_HISTORY_ID, SEMANTIC_TAB, semantic_header)
+    clear_tab_data(sheets, SHEETS_HISTORY_ID, SEMANTIC_TAB, start_cell="A2")
+    append_df_to_sheet(sheets, SHEETS_HISTORY_ID, SEMANTIC_TAB, semantic_out, semantic_header)
 
-    # Приведём дату к строке, иначе Google Sheets может странно съесть таймзону из tz-naive
-    semantic_out["date"] = semantic_out["date"].dt.strftime("%Y-%m-%d %H:%M:%S")
+    # 6.2 KPI_TAB
+    kpi_header = [
+        "period_type",
+        "period_key",
+        "reviews_count",
+        "avg_rating_5",
+        "share_pos",
+        "share_neg",
+    ]
+    ensure_tab_exists(sheets, SHEETS_HISTORY_ID, KPI_TAB, kpi_header)
+    clear_tab_data(sheets, SHEETS_HISTORY_ID, KPI_TAB, start_cell="A2")
+    append_df_to_sheet(sheets, SHEETS_HISTORY_ID, KPI_TAB, kpi_df, kpi_header)
 
-    # 5. KPI по периодам
-    kpi_df = compute_period_kpi_history(exploded_df)
+    # 6.3 ASPECTS_TAB
+    aspects_header = [
+        "period_type",
+        "period_key",
+        "aspect_code",
+        "mentions_reviews",
+        "pos_share",
+        "neg_share",
+    ]
+    ensure_tab_exists(sheets, SHEETS_HISTORY_ID, ASPECTS_TAB, aspects_header)
+    clear_tab_data(sheets, SHEETS_HISTORY_ID, ASPECTS_TAB, start_cell="A2")
+    append_df_to_sheet(sheets, SHEETS_HISTORY_ID, ASPECTS_TAB, aspects_df, aspects_header)
 
-    # 6. Аспекты по периодам
-    aspects_df = compute_period_aspects_history(exploded_df)
+    # 6.4 SOURCES_TAB
+    sources_header = [
+        "week_key",
+        "source",
+        "reviews_count",
+        "avg_rating_5",
+        "share_pos",
+        "share_neg",
+    ]
+    ensure_tab_exists(sheets, SHEETS_HISTORY_ID, SOURCES_TAB, sources_header)
+    clear_tab_data(sheets, SHEETS_HISTORY_ID, SOURCES_TAB, start_cell="A2")
+    append_df_to_sheet(sheets, SHEETS_HISTORY_ID, SOURCES_TAB, sources_df, sources_header)
 
-    # 7. Источники по неделям
-    sources_df = compute_source_history_weekly(exploded_df)
-
-    # 8. Заливка в Sheets
-    clear_and_write_sheet(sheets_svc, sheets_history_id, SEMANTIC_TAB, semantic_out)
-    clear_and_write_sheet(sheets_svc, sheets_history_id, KPI_TAB, kpi_df)
-    clear_and_write_sheet(sheets_svc, sheets_history_id, ASPECTS_TAB, aspects_df)
-    clear_and_write_sheet(sheets_svc, sheets_history_id, SOURCES_TAB, sources_df)
+    print("[INFO] Backfill по отзывам завершён успешно.")
 
 
 if __name__ == "__main__":
-    run_reviews_backfill()
+    run_backfill()
