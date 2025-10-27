@@ -1,225 +1,19 @@
 # agent/text_analytics_core.py
+# !!! ВАЖНО !!!
+# 1. ВСТАВЬ словари из dictionary_text_analytics_core.py
+#    (POSITIVE_WORDS_STRONG, POSITIVE_WORDS_SOFT, NEGATIVE_WORDS_SOFT,
+#     NEGATIVE_WORDS_STRONG, NEUTRAL_WORDS, TOPIC_SCHEMA)
+#    прямо сюда, над блоком "HELPERS".
 #
-# Назначение:
-# - Нормализовать отзывы (язык, текст, оценка)
-# - Разметить каждый отзыв по темам/подтемам/аспектам
-# - Определить тональность внутри этих тем
-#
-# Это ядро семантики. На нем будут строиться:
-# - Картина качества и тем (сводная таблица по категориям)
-# - Динамика и вклад недели
-# - Причины проблем с заселением
-# - Цитаты гостей
-#
-# Совместимо с Python 3.11
+# 2. Остальной код не трогать: он опирается на эти константы,
+#    но сам словарь не меняет.
 
 from __future__ import annotations
-from typing import List, Dict, Any, Optional, Tuple
-import re
-import math
-import json
-import hashlib
-import unicodedata
+from typing import Any, Dict, List, Tuple
 from datetime import datetime
 import pandas as pd
-import numpy as np
-from dataclasses import dataclass
+import re, unicodedata, hashlib, json
 
-
-###############################################################################
-# 0. Нормализация языка и текста
-###############################################################################
-
-# Мы не можем полагаться на "Код языка" из таблицы,
-# потому что он может быть нестабильным (ru vs uk vs mix, en-US vs en, и т.д.).
-# Подход:
-# - нормализуем код до базового вида ('ru','en','tr','ar','zh','other')
-# - если не уверены, пытаемся угадать по алфавиту/символам
-# - дальше работаем с text_ru (будет русская версия текста)
-#   Для не-русских языков пока текст не переводим реально, но оставляем интерфейс,
-#   чтобы потом встроить перевод и улучшить качество классификации.
-#
-
-CYRILLIC_RE = re.compile(r"[А-Яа-яЁё]")
-ARABIC_RE = re.compile(r"[\u0600-\u06FF]")
-CJK_RE = re.compile(r"[\u4E00-\u9FFF]")  # базовый китайский диапазон
-TURKISH_HINTS = re.compile(r"[ıİğĞşŞçÇöÖüÜ]")
-
-def normalize_lang(raw_lang: Optional[str], text: str) -> str:
-    """
-    Приводим код языка к одной из категорий: ru, en, tr, ar, zh, other.
-    Используем эвристику по коду и по тексту.
-    """
-    if raw_lang is None:
-        raw_lang = ""
-    raw_lang_low = raw_lang.lower()
-
-    # явные матчеры
-    if raw_lang_low.startswith("ru") or raw_lang_low.startswith("uk") or raw_lang_low.startswith("be"):
-        return "ru"
-    if raw_lang_low.startswith("en"):
-        return "en"
-    if raw_lang_low.startswith("tr"):
-        return "tr"
-    if raw_lang_low.startswith("ar"):
-        return "ar"
-    if raw_lang_low.startswith("zh") or raw_lang_low.startswith("cn") or raw_lang_low.startswith("ch"):
-        return "zh"
-
-    # эвристика по символам
-    if CYRILLIC_RE.search(text):
-        return "ru"
-    if ARABIC_RE.search(text):
-        return "ar"
-    if CJK_RE.search(text):
-        return "zh"
-    if TURKISH_HINTS.search(text):
-        return "tr"
-
-    # латиница по умолчанию -> en (лучше чем other)
-    if re.search(r"[A-Za-z]", text):
-        return "en"
-
-    return "other"
-
-
-def translate_to_ru(text: str, lang: str) -> str:
-    """
-    Псевдо-перевод частых сервисных слов в «условно русский словарь».
-    Это НЕ машинный перевод и он специально очень узкий.
-
-    Логика:
-    - Если в тексте уже есть кириллица — возвращаем как есть.
-    - Если язык не ru — делаем лексическую подмену типичных отельных слов
-      (wifi → вайфай, breakfast → завтрак, noisy → шумно и т.д.).
-    Это повышает шанс, что русские паттерны сработают одинаково для
-    англ/тур/прочих отзывов.
-    """
-    if not text:
-        return ""
-
-    # если кириллица уже есть — просто вернуть
-    if lang == "ru" or CYRILLIC_RE.search(text):
-        return text
-
-    # словарь частых соответствий
-    lex_map = {
-        # английский
-        r"\bwifi\b": "вайфай",
-        r"\bwi[- ]?fi\b": "вайфай",
-        r"\binternet\b": "интернет",
-        r"\bbreakfast\b": "завтрак",
-        r"\bstaff\b": "персонал",
-        r"\breception\b": "ресепшен",
-        r"\bcheck[- ]?in\b": "заселение",
-        r"\bcheckin\b": "заселение",
-        r"\bcheck[- ]?out\b": "выезд",
-        r"\broom\b": "номер",
-        r"\bclean\b": "чисто",
-        r"\bdirty\b": "грязно",
-        r"\bnoise[y]?\b": "шумно",
-        r"\bnoisy\b": "шумно",
-        r"\blocation\b": "расположение",
-        r"\bexpensive\b": "дорого",
-        r"\bprice\b": "цена",
-        r"\bvalue for money\b": "соотношение цена качество",
-        r"\bbad value\b": "не соответствует цене",
-        r"\bair ?conditioning\b": "кондиционер",
-        r"\bheating\b": "отопление",
-
-        # турецкий
-        r"\bwifi\b": "вайфай",
-        r"\binternet\b": "интернет",
-        r"\bkahvalt[ıi]\b": "завтрак",
-        r"\bpersonel\b": "персонал",
-        r"\btemiz\b": "чисто",
-        r"\bkirli\b": "грязно",
-        r"\bgürült[üu]\b": "шумно",
-        r"\bkonum\b": "расположение",
-        r"\bpahalı\b": "дорого",
-    }
-
-    out = text
-    for pat, repl in lex_map.items():
-        out = re.sub(pat, repl, out, flags=re.IGNORECASE)
-
-    return out
-
-# Нормализация текста
-
-WI_FI_UNIFY = re.compile(r"\b(wi[\s\-]?[fi]|вай[\s\-]?[фа]й)\b", re.IGNORECASE)
-MULTISPACE = re.compile(r"\s+")
-URL = re.compile(r"https?://\S+|www\.\S+")
-EMAIL = re.compile(r"\b[\w.\-+%]+@[\w.\-]+\.[A-Za-z]{2,}\b")
-PHONE = re.compile(r"\+?\d[\d\-\s()]{6,}\d")
-HTML = re.compile(r"<[^>]+>")
-
-def normalize_text_basic(text: str, lang: str) -> str:
-    """
-    ОЧИСТКА:
-    - убираем html-теги, url, e-mail, телефоны;
-    - нормализуем юникод (NFKC);
-    - приводим к lower;
-    - унифицируем написание 'wi-fi'/'wifi'/'вай фай' -> 'wi-fi';
-    - схлопываем лишние пробелы.
-    Это делается ДО анализа тональности и тем.
-    """
-    if not text:
-        return ""
-    t = str(text)
-    t = unicodedata.normalize("NFKC", t)
-    t = HTML.sub(" ", t)
-    t = URL.sub(" ", t)
-    t = EMAIL.sub(" ", t)
-    t = PHONE.sub(" ", t)
-    t = t.lower()
-    t = WI_FI_UNIFY.sub("wi-fi", t)
-    t = MULTISPACE.sub(" ", t).strip()
-    return t
-
-
-###############################################################################
-# 1. Нормализация рейтинга и базовая тональность
-###############################################################################
-
-def normalize_rating_to_10(raw_rating: Any) -> Optional[float]:
-    """
-    Приводим рейтинг отзыва к 10-балльной шкале.
-    Предполагаем, что:
-    - если оценка <= 5 -> это пятибалльная шкала -> умножаем на 2
-    - если оценка <= 10 -> уже десятибалльная -> оставляем
-    - если оценка > 10 и <= 100 -> проценты, делим на 10
-    - иначе None
-
-    Возвращает float или None.
-    """
-    if raw_rating is None:
-        return None
-    try:
-        r = float(str(raw_rating).replace(",", "."))
-    except ValueError:
-        return None
-
-    if r <= 0:
-        return None
-    if r <= 5:      # предположим 1..5
-        return r * 2.0
-    if r <= 10:     # предположим 1..10
-        return r
-    if r <= 100:    # проценты
-        return r / 10.0
-
-    # что-то странное
-    return None
-
-
-# Словари слов для тональности.
-# Это упрощённый эвристический sentiment. Мы будем использовать его
-# в качестве дополнительного сигнала при оценке негатива внутри подтем.
-#
-# В перспективе это место, куда можно воткнуть ML-модель:
-# - например, дообучить классификатор тональности по размеченным отзывам.
-#
 ###############################################################################
 # Тональность: расширенные словари
 ###############################################################################
@@ -388,151 +182,6 @@ NEUTRAL_WORDS = {
     ],
 }
 
-def _get_lexicons_for_lang(lang: str) -> Tuple[List[str], List[str], List[str], List[str], List[str]]:
-    """
-    Возвращает кортеж списков regex:
-    (strong_neg, soft_neg, strong_pos, soft_pos, neutrals)
-    с fallback на английский, если языка нет явно.
-    """
-    key = lang if lang in NEGATIVE_WORDS_STRONG else "en"
-
-    strong_neg = NEGATIVE_WORDS_STRONG.get(key, [])
-    soft_neg   = NEGATIVE_WORDS_SOFT.get(key, [])
-    strong_pos = POSITIVE_WORDS_STRONG.get(key, [])
-    soft_pos   = POSITIVE_WORDS_SOFT.get(key, [])
-    neutrals   = NEUTRAL_WORDS.get(key, [])
-
-    return (strong_neg, soft_neg, strong_pos, soft_pos, neutrals)
-
-
-# Негаторы (языковые частицы отрицания)
-RU_NEG = r"(не|без)\s+"
-EN_NEG = r"(not|no|without|never)\s+"
-TR_NEG = r"(değil|yok|olm[aı]yor)\s+"
-
-def _negated(text: str, lang: str, term_regex: str) -> bool:
-    """
-    True, если перед term_regex стоит отрицание.
-    Т.е. 'не грязно' не считаем грязью, 'not dirty' не считаем грязью.
-    """
-    if lang == "ru":
-        return re.search(rf"{RU_NEG}\w{{0,3}}(?:{term_regex})", text, flags=re.IGNORECASE) is not None
-    if lang == "tr":
-        return re.search(rf"{TR_NEG}\w{{0,3}}(?:{term_regex})", text, flags=re.IGNORECASE) is not None
-    # fallback → английский
-    return re.search(rf"{EN_NEG}\w{{0,3}}(?:{term_regex})", text, flags=re.IGNORECASE) is not None
-
-
-def _match_any(patterns: List[str], text: str) -> bool:
-    for pat in patterns:
-        if re.search(pat, text, flags=re.IGNORECASE):
-            return True
-    return False
-
-
-def detect_sentiment_label(text: str, lang: str, fallback_rating10: Optional[float]) -> str:
-    """
-    Общая тональность отзыва.
-    Приоритет:
-    1. сильный негатив (учитывая negation — 'не грязно' не считается)
-    2. мягкий негатив
-    3. сильный позитив (если 'не хорошо' → трактуем как мягкий негатив)
-    4. мягкий позитив
-    5. нейтральные маркеры
-    6. fallback по рейтингу /10
-    """
-    (strong_neg, soft_neg, strong_pos, soft_pos, neutrals) = _get_lexicons_for_lang(lang)
-
-    # 1. сильный негатив
-    for rgx in strong_neg:
-        if re.search(rgx, text, flags=re.IGNORECASE) and not _negated(text, lang, rgx):
-            return "neg"
-
-    # 2. мягкий негатив
-    for rgx in soft_neg:
-        if re.search(rgx, text, flags=re.IGNORECASE) and not _negated(text, lang, rgx):
-            return "neg"
-
-    # 3. сильный позитив
-    for rgx in strong_pos:
-        if re.search(rgx, text, flags=re.IGNORECASE):
-            # если "не отлично" -> это жалоба
-            if _negated(text, lang, rgx):
-                return "neg"
-            return "pos"
-
-    # 4. мягкий позитив
-    for rgx in soft_pos:
-        if re.search(rgx, text, flags=re.IGNORECASE):
-            if _negated(text, lang, rgx):
-                return "neg"
-            return "pos"
-
-    # 5. явная нейтральная лексика
-    for rgx in neutrals:
-        if re.search(rgx, text, flags=re.IGNORECASE):
-            return "neu"
-
-    # 6. fallback по рейтингу
-    if fallback_rating10 is not None:
-        if fallback_rating10 >= 9.0:
-            return "pos"
-        if fallback_rating10 <= 6.0:
-            return "neg"
-
-    return "neu"
-
-
-def detect_subtopic_sentiment(text: str, lang: str, subtopic_patterns: Optional[List[str]] = None) -> str:
-    """
-    Тональность по конкретной подтеме.
-    Если subtopic_patterns даны, смотрим окно ±40 символов вокруг каждого совпадения,
-    иначе смотрим весь текст.
-    """
-    if not text:
-        return "neu"
-
-    # соберём кандидаты-фрагменты
-    candidates: List[str] = [text]
-    if subtopic_patterns:
-        spans: List[str] = []
-        for pat in subtopic_patterns:
-            for m in re.finditer(pat, text, flags=re.IGNORECASE):
-                s, e = m.span()
-                spans.append(text[max(0, s - 40): min(len(text), e + 40)])
-        if spans:
-            candidates = spans
-
-    (strong_neg, soft_neg, strong_pos, soft_pos, neutrals) = _get_lexicons_for_lang(lang)
-
-    for chunk in candidates:
-        # сильный негатив
-        for rgx in strong_neg:
-            if re.search(rgx, chunk, flags=re.IGNORECASE) and not _negated(chunk, lang, rgx):
-                return "neg"
-        # мягкий негатив
-        for rgx in soft_neg:
-            if re.search(rgx, chunk, flags=re.IGNORECASE) and not _negated(chunk, lang, rgx):
-                return "neg"
-        # сильный позитив
-        for rgx in strong_pos:
-            if re.search(rgx, chunk, flags=re.IGNORECASE):
-                if _negated(chunk, lang, rgx):
-                    return "neg"
-                return "pos"
-        # мягкий позитив
-        for rgx in soft_pos:
-            if re.search(rgx, chunk, flags=re.IGNORECASE):
-                if _negated(chunk, lang, rgx):
-                    return "neg"
-                return "pos"
-        # нейтрально
-        for rgx in neutrals:
-            if re.search(rgx, chunk, flags=re.IGNORECASE):
-                return "neu"
-
-    return "neu"
-
 ###############################################################################
 # 2. Схема тем (Категория -> Подтемы -> Аспекты)
 ###############################################################################
@@ -546,16 +195,6 @@ def detect_subtopic_sentiment(text: str, lang: str, subtopic_patterns: Optional[
 #           "display": человекочитаемое имя
 #           "patterns": словарь {lang_code: [regex,...]} для выявления упоминаний
 #           "aspects": список ярлыков причин/контекстов (необязательно)
-#
-# Пример:
-#   "checkin_speed": гость долго ждал заселения
-#       aspects: ["staff_slow", "room_not_ready", "tech_access_issue"]
-#
-# В дальнейшем aspects помогут нам текстом объяснить:
-# "заселение страдало не из-за персонала, а из-за того, что номер был не готов"
-#
-# Сейчас дадим базовые паттерны. Потом мы можем расширять массивы regex,
-# не ломая остальной код.
 
 TOPIC_SCHEMA: Dict[str, Dict[str, Any]] = {
     "staff_spir": {
@@ -2962,53 +2601,76 @@ TOPIC_SCHEMA: Dict[str, Dict[str, Any]] = {
     }
 }
 
-# ========= [EXPORT] semantic row factory (вставить НИЖЕ словаря тем) =================
-import json, re, hashlib, unicodedata
-from datetime import datetime
-import pandas as pd
-from typing import Any, Dict, List
 
-# --- Базовая очистка текста (без изменения твоих словарей)
-_MULTI_WS  = re.compile(r"\s+")
-_URL       = re.compile(r"https?://\S+|www\.\S+")
-_EMAIL_RE  = re.compile(r"\b[\w.\-+%]+@[\w.\-]+\.[A-Za-z]{2,}\b")
-_PHONE_RE  = re.compile(r"\+?\d[\d\-\s()]{6,}\d")
-_HTML_RE   = re.compile(r"<[^>]+>")
-_WIFI_UNI  = re.compile(r"\b(wi[\s\-]?fi|вай[\s\-]?[фа]й)\b", re.IGNORECASE)
+###############################################################################
+# >>> ТВОИ СЛОВАРИ ДОЛЖНЫ БЫТЬ ВСТАВЛЕНЫ ВЫШЕ ЭТОГО КОММЕНТАРИЯ <<<
+###############################################################################
 
-def _clean_text(x: str) -> str:
-    if not x:
+# =========================
+# HELPERS: нормализация текста / даты / языка
+# =========================
+
+_RE_MULTI_WS  = re.compile(r"\s+")
+_RE_URL       = re.compile(r"https?://\S+|www\.\S+")
+_RE_EMAIL     = re.compile(r"\b[\w.\-+%]+@[\w.\-]+\.[A-Za-z]{2,}\b")
+_RE_PHONE     = re.compile(r"\+?\d[\d\-\s()]{6,}\d")
+_RE_HTML      = re.compile(r"<[^>]+>")
+_RE_WIFI      = re.compile(r"\b(wi[\s\-]?fi|вай[\s\-]?[фо]й)\b", re.IGNORECASE)
+
+def clean_text(raw: str) -> str:
+    """
+    Приводим отзыв к "технической" форме:
+    - режем HTML, ссылки, мыло, телефон
+    - унифицируем регистрацию (wi-fi)
+    - нижний регистр
+    Это всё нужно для устойчивого матчинга regex-паттернов.
+    """
+    if not raw:
         return ""
-    t = unicodedata.normalize("NFKC", str(x))
-    t = _HTML_RE.sub(" ", t)
-    t = _URL.sub(" ", t)
-    t = _EMAIL_RE.sub(" ", t)
-    t = _PHONE_RE.sub(" ", t)
+    t = unicodedata.normalize("NFKC", str(raw))
+    t = _RE_HTML.sub(" ", t)
+    t = _RE_URL.sub(" ", t)
+    t = _RE_EMAIL.sub(" ", t)
+    t = _RE_PHONE.sub(" ", t)
     t = t.lower()
-    t = _WIFI_UNI.sub("wi-fi", t)
-    t = _MULTI_WS.sub(" ", t).strip()
+    t = _RE_WIFI.sub("wi-fi", t)
+    t = _RE_MULTI_WS.sub(" ", t).strip()
     return t
 
-# --- Дата: поддержка dd.mm.yyyy, yyyy-mm-dd, datetime и Excel-serial
-def _parse_date_any(x: Any) -> datetime:
+
+def parse_date_any(x: Any) -> datetime:
+    """
+    Поддерживаем:
+    - dd.mm.yyyy
+    - yyyy-mm-dd
+    - datetime
+    - excel-serial (число дней c 1899-12-30)
+    """
     if isinstance(x, datetime):
         return x.replace(tzinfo=None)
-    # Excel serial?
+
+    # excel serial?
     if isinstance(x, (int, float)) and not pd.isna(x):
         try:
-            # Excel day 0 = 1899-12-30 (правильный origin для pandas)
-            ts = pd.Timestamp("1899-12-30") + pd.to_timedelta(float(x), unit="D")
+            base = pd.Timestamp("1899-12-30")
+            ts = base + pd.to_timedelta(float(x), unit="D")
             return ts.to_pydatetime().replace(tzinfo=None)
         except Exception:
             pass
-    # Общий путь
+
+    # попытка нормального парсинга
     try:
-        return pd.to_datetime(x, errors="raise", dayfirst=True).to_pydatetime().replace(tzinfo=None)
+        return (
+            pd.to_datetime(x, errors="raise", dayfirst=True)
+            .to_pydatetime()
+            .replace(tzinfo=None)
+        )
     except Exception:
-        # в крайнем случае — сегодня (но лучше логировать в агенте)
+        # fallback: текущее время (чтобы не падать вообще)
         return datetime.utcnow().replace(tzinfo=None)
 
-def _derive_period_keys(dt: datetime) -> Dict[str, str]:
+
+def derive_period_keys(dt: datetime) -> Dict[str, str]:
     iso_y, iso_w, _ = dt.isocalendar()
     q = (dt.month - 1)//3 + 1
     return {
@@ -3018,3200 +2680,324 @@ def _derive_period_keys(dt: datetime) -> Dict[str, str]:
         "year_key":    f"{dt.year:04d}",
     }
 
-def _review_id(dt: datetime, source: str, raw_text: str) -> str:
-    base = f"{dt.date().isoformat()}|{source}|{(raw_text or '')[:200]}"
-    return hashlib.sha1(base.encode("utf-8")).hexdigest()
 
-# --- Локальная тональность по подтеме (приоритет: neg strong -> neg soft -> pos strong -> pos soft -> neu)
-def _subtopic_sentiment(text: str, lang: str, sub_patterns: Dict[str, List[str]]) -> str:
-    lang_key = lang if lang in NEGATIVE_WORDS_STRONG else "en"
-
-    def _has_any(rgx_list, s: str) -> bool:
-        for rgx in rgx_list:
-            if re.search(rgx, s, flags=re.IGNORECASE):
-                return True
-        return False
-
-    # окно ±40 символов вокруг совпадений подтемы
-    windows: List[str] = []
-    pats = sub_patterns.get(lang, []) or sub_patterns.get("ru", []) or sub_patterns.get("en", [])
-    for p in pats:
-        for m in re.finditer(p, text, flags=re.IGNORECASE):
-            s, e = m.span()
-            windows.append(text[max(0, s-40): min(len(text), e+40)])
-    if not windows:
-        windows = [text]
-
-    for chunk in windows:
-        if _has_any(NEGATIVE_WORDS_STRONG.get(lang_key, []), chunk): return "neg"
-        if _has_any(NEGATIVE_WORDS_SOFT.get(lang_key, []),   chunk): return "neg"
-        if _has_any(POSITIVE_WORDS_STRONG.get(lang_key, []), chunk): return "pos"
-        if _has_any(POSITIVE_WORDS_SOFT.get(lang_key, []),   chunk): return "pos"
-    return "neu"
-
-# --- Главная функция экспорта одной строки семантики
-def build_semantic_row(review_raw: Dict[str, Any]) -> Dict[str, Any]:
+def normalize_lang(lang_hint: str, text: str) -> str:
     """
-    На входе: {'date','source','rating_raw','text','lang_hint'}
-    На выходе: одна строка для reviews_semantic_raw.
+    Простейший хелпер:
+    - если lang_hint есть -> берём его (ru/en/tr/ar/zh и т.д.) в нижнем регистре
+    - иначе: heuristic fallback "ru" если есть кириллица, "zh" если китайские иероглифы,
+      иначе "en".
     """
-    raw_text = (review_raw.get("text") or "").strip()
-    lang_hint = (review_raw.get("lang_hint") or "").strip()
-    source    = (review_raw.get("source") or "").strip()
-
-    # язык -> легкая русификация
-    lang = normalize_lang(lang_hint, raw_text)
-    text_basic = _clean_text(raw_text)
-    text_ru = translate_to_ru(text_basic, lang)  # не меняет кириллицу
-
-    rating10 = normalize_rating_to_10(review_raw.get("rating_raw"))
-    try:
-        overall = detect_sentiment_label(text_ru, lang)  # твоя функция из словарей
-    except Exception:
-        overall = "neu"
-
-    # темы/аспекты
-    topics_all, topics_pos, topics_neg = set(), set(), set()
-    # защитимся, если TOPIC_SCHEMA не импортирован
-    schema = globals().get("TOPIC_SCHEMA", {}) or {}
-    for t_key, t_def in schema.items():
-        subs = (t_def or {}).get("subtopics", {}) or {}
-        for s_key, s_def in subs.items():
-            pats = (s_def or {}).get("patterns", {}) or {}
-            # есть совпадение?
-            lang_pats = pats.get(lang) or pats.get("ru") or pats.get("en") or []
-            if not lang_pats:
-                continue
-            matched = any(re.search(p, text_ru, flags=re.IGNORECASE) for p in lang_pats)
-            if not matched:
-                continue
-            # локальная тональность подтемы
-            sent_local = _subtopic_sentiment(text_ru, lang, pats)
-            aspects = (s_def or {}).get("aspects") or [f"{t_key}.{s_key}"]
-            aspect = aspects[0]
-            topics_all.add(aspect)
-            if sent_local == "pos":
-                topics_pos.add(aspect)
-            elif sent_local == "neg":
-                topics_neg.add(aspect)
-
-    # сопряжённые пары (ко-упоминания)
-    pair_tags: List[Dict[str, str]] = []
-    if topics_all:
-        pairs = build_cooccurrence_pairs(sorted(list(topics_all)))
-        for a, b in pairs:
-            a_pos, a_neg = (a in topics_pos), (a in topics_neg)
-            b_pos, b_neg = (b in topics_pos), (b in topics_neg)
-            if a_neg and b_neg:
-                cat = "systemic_risk"
-            elif (a_pos and b_neg) or (b_pos and a_neg):
-                cat = "expectations_conflict"
-            elif a_pos and b_pos:
-                cat = "loyalty_driver"
-            else:
-                continue
-            pair_tags.append({"a": a, "b": b, "cat": cat})
-
-    # цитаты (1–3 предложения)
-    quotes = []
-    for part in re.split(r"[.!?…]+[\s\n]+", text_ru):
-        p = part.strip()
-        if 15 <= len(p) <= 300:
-            quotes.append(p)
-        if len(quotes) >= 3:
-            break
-
-    dt = _parse_date_any(review_raw.get("date"))
-    per = _derive_period_keys(dt)
-    rid = _review_id(dt, source, raw_text)
-
-    return {
-        "review_id": rid,
-        "date": dt.date().isoformat(),
-        "week_key": per["week_key"],
-        "month_key": per["month_key"],
-        "quarter_key": per["quarter_key"],
-        "year_key": per["year_key"],
-        "source": source,
-        "rating10": rating10,
-        "sentiment_overall": overall,
-        "topics_pos": json.dumps(sorted(list(topics_pos)), ensure_ascii=False),
-        "topics_neg": json.dumps(sorted(list(topics_neg)), ensure_ascii=False),
-        "topics_all": json.dumps(sorted(list(topics_all)), ensure_ascii=False),
-        "pair_tags": json.dumps(pair_tags, ensure_ascii=False),
-        "quote_candidates": json.dumps(quotes, ensure_ascii=False),
-    }
-# ========= [/EXPORT] =================================================================
-
-
-
-import re
-from typing import Dict, Any, List
-
-# 1. Человекочитаемые подписи для аспектов.
-#    Всё, что мы точно хотим красиво выводить в отчёте.
-#    Если какого-то аспекта здесь нет, мы сгенерируем fallback из subtopic_display.
-ASPECT_LABEL_OVERRIDES: Dict[str, str] = {
-    # Техническое состояние / вода
-    "hot_water_ok": "Стабильная горячая вода",
-    "no_hot_water": "Не было горячей воды / перебои с горячей водой",
-    "water_pressure_ok": "Хорошее давление воды",
-    "weak_pressure": "Слабый напор воды",
-    "shower_ok": "Душ исправен",
-    "shower_broken": "Проблемы с душем",
-    "leak_water": "Течи воды / подтекает",
-    "bathroom_flooding": "Вода на полу после душа",
-    "drain_clogged": "Плохой слив / засор",
-    "drain_smell": "Неприятный запах из слива/канализации",
-
-    # Оборудование номера
-    "ac_working_device": "Кондиционер работает",
-    "ac_broken": "Кондиционер не работает / сломан",
-    "heating_working_device": "Отопление работает",
-    "heating_broken": "Нет отопления / не работает обогрев",
-    "tv_working": "Телевизор исправен",
-    "tv_broken": "Телевизор не работает",
-    "fridge_working": "Холодильник работает",
-    "fridge_broken": "Холодильник не работает / не холодит",
-    "kettle_working": "Чайник исправен",
-    "kettle_broken": "Чайник не работает",
-    "appliances_ok": "Техника и оснащение исправны",
-    "socket_danger": "Опасные розетки (люфт, искрит)",
-    "door_secure": "Дверь закрывается надёжно",
-    "door_not_closing": "Дверь плохо закрывается / не фиксируется",
-    "lock_broken": "Проблемы с замком / не закрывается",
-    "felt_safe": "Гости чувствуют себя в безопасности",
-    "felt_unsafe": "Гости не чувствуют себя в безопасности",
-    "furniture_broken": "Сломанная мебель / износ",
-    "room_worn_out": "Номер визуально уставший / требует ремонта",
-
-    # Wi-Fi
-    "wifi_fast": "Быстрый Wi-Fi",
-    "internet_stable": "Стабильный интернет",
-    "good_for_work": "Интернет подходит для удалённой работы",
-    "wifi_down": "Wi-Fi не работал",
-    "wifi_slow": "Медленный Wi-Fi",
-    "wifi_unstable": "Нестабильный Wi-Fi / обрывы",
-    "wifi_hard_to_connect": "Сложно подключиться к Wi-Fi / пароль не работает",
-    "internet_not_suitable_for_work": "Интернет не подходит для удалённой работы",
-
-    # Шум инженерки
-    "ac_quiet": "Кондиционер работает тихо",
-    "ac_noisy": "Шумный кондиционер",
-    "fridge_quiet": "Холодильник не шумит",
-    "fridge_noisy": "Шумный холодильник",
-    "pipes_noise": "Шум в трубах / стояке",
-    "ventilation_noisy": "Шумная вентиляция/вентилятор",
-    "night_mechanical_hum": "Гул оборудования ночью",
-    "tech_noise_sleep_issue": "Шум техники мешал спать",
-    "no_tech_noise_night": "Ночью тихо (нет шума техники)",
-
-    # Лифт
-    "elevator_working": "Лифт работает",
-    "elevator_broken": "Лифт не работает",
-    "elevator_stuck": "Гости застревали в лифте",
-    "luggage_easy": "Удобно с багажом (лифт/доступ)",
-    "no_elevator_heavy_bags": "Тяжело с багажом из-за лифта/лестниц",
-
-    # Завтрак — вкус и качество
-    "breakfast_tasty": "Завтрак вкусный",
-    "breakfast_bad_taste": "Невкусный завтрак / проблемы со вкусом",
-    "food_fresh": "Свежие продукты",
-    "food_not_fresh": "Несвежие продукты / вкус «вчерашний»",
-    "food_hot_served_hot": "Горячее подано горячим",
-    "food_cold": "Горячее подано холодным",
-    "coffee_good": "Кофе нормального качества",
-    "coffee_bad": "Плохой кофе",
-
-    # Завтрак — выбор
-    "breakfast_variety_good": "Хороший выбор на завтраке",
-    "buffet_rich": "Полноценный/богатый шведский стол",
-    "fresh_fruit_available": "Есть свежие фрукты",
-    "pastries_available": "Есть выпечка/сладкое",
-    "breakfast_variety_poor": "Слабый выбор на завтраке",
-    "breakfast_repetitive": "Одно и то же каждый день",
-    "hard_to_find_food": "Сложно найти что поесть",
-
-    # Завтрак — сервис персонала
-    "breakfast_staff_friendly": "Персонал завтрака дружелюбный",
-    "breakfast_staff_attentive": "Персонал завтрака внимательный/заботливый",
-    "buffet_refilled_quickly": "Блюда оперативно пополняют",
-    "tables_cleared_fast": "Столы быстро убирают",
-    "breakfast_staff_rude": "Персонал завтрака неприветливый/грубый",
-    "no_refill_food": "Еду не пополняют, подносы пустые",
-    "tables_left_dirty": "Столы остаются грязными",
-    "ignored_requests": "Просьбы гостей игнорировали",
-
-    # Завтрак — организация потока
-    "food_enough_for_all": "Еды хватает всем",
-    "kept_restocking": "Постоянно пополняют еду",
-    "tables_available": "Есть свободные столы",
-    "no_queue": "Без очередей/толпы",
-    "breakfast_flow_ok": "Завтрак организован удобно",
-    "food_ran_out": "К моменту прихода еды почти не осталось",
-    "not_restocked": "Пустые лотки не пополняли",
-    "had_to_wait_food": "Приходилось ждать, пока вынесут еду",
-    "no_tables_available": "Некуда сесть на завтраке",
-    "long_queue": "Очередь/давка на завтраке",
-
-    # Завтрак — чистота
-    "breakfast_area_clean": "Зона завтрака чистая/аккуратная",
-    "tables_cleaned_quickly": "Столы на завтраке быстро протирают",
-    "dirty_tables": "Грязные/липкие столы",
-    "dirty_dishes_left": "Грязная посуда не убрана",
-    "buffet_area_messy": "Грязно/неаккуратно у раздачи",
-
-    # Цена
-    "good_value": "Хорошее соотношение цена/качество",
-    "worth_the_price": "Стоит своих денег",
-    "affordable_for_level": "Недорого для такого уровня",
-    "overpriced": "Слишком дорого для такого уровня",
-    "not_worth_price": "Не стоит своих денег",
-    "expected_better_for_price": "Ожидали выше уровень за эту цену",
-
-    # Ожидания vs цена
-    "photos_misleading": "Фото/описание обещали больше, чем в реальности",
-    "quality_below_expectation": "Уровень ниже ожидаемого за эти деньги",
-
-    # Локация / окружение
-    "great_location": "Отличное расположение",
-    "central_convenient": "Близко к центру / всё рядом",
-    "near_transport": "Удобно по транспорту (метро/транспорт рядом)",
-    "area_has_food_shops": "Рядом кафе и магазины",
-    "location_inconvenient": "Неудобная локация",
-    "far_from_center": "Далеко от центра/основных точек",
-    "nothing_around": "Вокруг почти ничего нет",
-
-    # Безопасность района / подъезд
-    "area_safe": "В районе безопасно / спокойно",
-    "area_quiet_at_night": "Тихо в районе ночью",
-    "entrance_clean": "Чистый/нормальный вход",
-    "area_unsafe": "Небезопасный район / стрёмно",
-    "uncomfortable_at_night": "Неуютно выходить вечером / страшно ночью",
-    "entrance_dirty": "Грязный/неприятный вход/подъезд",
-    "people_loitering": "Неприятный контингент у входа",
-
-    # Навигация/доступ
-    "easy_to_find": "Легко найти адрес и вход",
-    "clear_instructions": "Понятные инструкции по доступу и заселению",
-    "luggage_access_ok": "Удобно заходить с багажом с улицы",
-    "hard_to_find_entrance": "Сложно найти вход / адрес / подъезд",
-    "confusing_access": "Неочевидно, как попасть внутрь",
-    "no_signage": "Нет нормальной навигации/вывесок",
-    "luggage_access_hard": "Тяжело с багажом с улицы/по лестнице",
-
-    # Атмосфера / вайб
-    "cozy_atmosphere": "Уютно, домашняя атмосфера",
-    "nice_design": "Красивый / стильный интерьер",
-    "good_vibe": "Приятная атмосфера, «хочется остаться»",
-    "not_cozy": "Неуютно / холодная атмосфера",
-    "gloomy_feel": "Мрачно / давит / депрессивно",
-    "dated_look": "Уставший / старый визуально вид",
-    "soulless_feel": "Без души / нет ощущения «добро пожаловать»",
-
-    # Запахи общих зон
-    "fresh_smell_common": "Приятный запах / свежо в коридорах",
-    "no_bad_smell": "Нет неприятного запаха в общих зонах",
-    "bad_smell_common": "Неприятный запах в коридорах",
-    "cigarette_smell": "Запах сигарет в общих зонах",
-    "sewage_smell": "Запах канализации в общих зонах",
-    "musty_smell": "Запах сырости / плесени / затхлости",
-}
-
-
-# 2. Эвристика полярности аспекта.
-#    Возвращает "pos" / "neg" / "neutral".
-def infer_polarity(aspect_code: str) -> str:
-    positive_markers = [
-        "ok", "good", "fast", "friendly", "attentive",
-        "clean", "cleaned", "refilled", "enough", "available",
-        "quiet", "safe", "secure", "working", "tasty",
-        "fresh", "hot_served_hot", "great", "worth", "value",
-        "easy", "cozy", "nice", "flow_ok", "no_queue",
-        "no_bad_smell", "kept_restocking", "tables_available",
-        "luggage_access_ok", "area_safe", "entrance_clean",
-        "central", "near_transport", "good_vibe",
-    ]
-    negative_markers = [
-        "no_",  # e.g. no_hot_water / no_refill_food / no_tables_available
-        "not_", "slow", "dirty", "broken", "unsafe",
-        "hard", "hard_to", "unsafe", "unfriendly", "rude",
-        "smell", "smelly", "bad", "overpriced", "ran_out",
-        "repetitive", "poor", "cold", "leak", "clog",
-        "flood", "noisy", "stuck", "queue", "long_queue",
-        "uncomfortable", "confusing", "gloomy", "dated",
-        "soulless", "people_loitering", "luggage_access_hard",
-        "area_unsafe", "entrance_dirty", "far_from_center",
-        "nothing_around", "not_worth_price", "expected_better",
-    ]
-
-    a = aspect_code.lower()
-
-    # если начинается с no_ или contains obvious negative first -> считаем отрицательно
-    if any(marker in a for marker in negative_markers):
-        return "neg"
-
-    # если содержит позитивные маркеры -> считаем позитивно
-    if any(marker in a for marker in positive_markers):
-        return "pos"
-
-    # по умолчанию
-    return "neutral"
-
-
-# 3. Генерация реестра аспектов на основе TOPIC_SCHEMA и ASPECT_LABEL_OVERRIDES
-def build_aspect_registry(topic_schema: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
-    """
-    Превращает TOPIC_SCHEMA в плоский словарь аспектов.
-    Ключ словаря = код аспекта (например "wifi_unstable").
-    Значение = метаданные: тема, подтема, красивая подпись, полярность.
-    """
-    registry: Dict[str, Dict[str, Any]] = {}
-
-    for topic_key, topic_block in topic_schema.items():
-        topic_display = topic_block.get("display", topic_key)
-
-        subtopics: Dict[str, Any] = topic_block.get("subtopics", {})
-        for sub_key, sub_block in subtopics.items():
-            sub_display = sub_block.get("display", sub_key)
-
-            aspects: List[str] = sub_block.get("aspects", [])
-            for aspect_code in aspects:
-                label = ASPECT_LABEL_OVERRIDES.get(
-                    aspect_code,
-                    f"{sub_display}: {aspect_code}"
-                )
-                registry[aspect_code] = {
-                    "topic_key": topic_key,
-                    "topic_display": topic_display,
-                    "subtopic_key": sub_key,
-                    "subtopic_display": sub_display,
-                    "label": label,
-                    "polarity": infer_polarity(aspect_code),
-                }
-
-    return registry
-
-
-# 4. Вспомогательная функция — сгруппировать аспекты в управленческие группы
-#    Это пригодится, чтобы потом в отчёте выводить не просто список тегов,
-#    а блоками по зонам ответственности (Завтрак, Wi-Fi, Вода, Локация и т.д.).
-def group_aspects_by_topic(registry: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
-    """
-    Возвращает структуру вида:
-    {
-        "breakfast": {
-            "topic_display": "Завтрак и питание",
-            "aspects": ["breakfast_tasty", "food_not_fresh", ...]
-        },
-        "tech_state": {
-            "topic_display": "Техническое состояние и инфраструктура",
-            "aspects": ["wifi_unstable", "no_hot_water", ...]
-        },
-        ...
-    }
-    """
-    grouped: Dict[str, Dict[str, Any]] = {}
-    for aspect_code, meta in registry.items():
-        k = meta["topic_key"]
-        if k not in grouped:
-            grouped[k] = {
-                "topic_display": meta["topic_display"],
-                "aspects": [],
-            }
-        grouped[k]["aspects"].append(aspect_code)
-    return grouped
-
-
-# 5. Агрегация по аспектам для заданного периода.
-#    Предполагаем, что у нас уже есть "взорванный" датафрейм отзывов,
-#    где каждая строка = один (review_id, aspect_code, sentiment_label, period_key).
-#
-#    sentiment_label должен быть 'pos'/'neg'/'neu' после тонального анализа.
-#
-#    Возвращаем сводку:
-#    - сколько упоминаний аспекта,
-#    - доля негатива и позитива,
-#    - чтобы потом ранжировать и говорить
-#      «Топ факторов негатива недели» и «Ключевые плюсы недели».
-#
-
-# ====== [ADD BELOW TOPIC_SCHEMA] ==================================================
-# Лёгкая нормализация текста и ID/даты + фабрика строки семантики
-
-import json, hashlib, unicodedata
-from datetime import datetime
-
-WI_FI_UNIFY = re.compile(r"\b(wi[\s\-]?fi|вай[\s\-]?фай)\b", re.IGNORECASE)
-MULTISPACE = re.compile(r"\s+")
-URL = re.compile(r"https?://\S+|www\.\S+")
-EMAIL = re.compile(r"\b[\w.\-+%]+@[\w.\-]+\.[A-Za-z]{2,}\b")
-PHONE = re.compile(r"\+?\d[\d\-\s()]{6,}\d")
-HTML = re.compile(r"<[^>]+>")
-
-def _normalize_text_basic_v2(text: str) -> str:
-    if not text:
-        return ""
-    t = unicodedata.normalize("NFKC", str(text))
-    t = HTML.sub(" ", t)
-    t = URL.sub(" ", t)
-    t = EMAIL.sub(" ", t)
-    t = PHONE.sub(" ", t)
-    t = t.lower()
-    t = WI_FI_UNIFY.sub("wi-fi", t)
-    t = MULTISPACE.sub(" ", t).strip()
-    return t
-
-def _parse_date_to_datetime_v2(date_raw: Any) -> datetime:
-    """
-    Парсим dd.mm.yyyy / yyyy-mm-dd / dd/mm/yyyy и Excel-serial (float/int).
-    Всегда dayfirst=True.
-    """
-    if isinstance(date_raw, datetime):
-        return date_raw.replace(tzinfo=None)
-    # Excel serial number?
-    if isinstance(date_raw, (int, float)) and not pd.isna(date_raw):
-        try:
-            # Excel считает от 1899-12-30
-            return (pd.Timestamp("1899-12-30") + pd.to_timedelta(float(date_raw), unit="D")).to_pydatetime()
-        except Exception:
-            pass
-    try:
-        return pd.to_datetime(date_raw, dayfirst=True, errors="raise").to_pydatetime().replace(tzinfo=None)
-    except Exception:
-        return datetime.utcnow().replace(tzinfo=None)
-
-def _derive_period_keys_v2(dt: datetime) -> Dict[str, str]:
-    iso_year, iso_week, _ = dt.isocalendar()
-    q = (dt.month - 1) // 3 + 1
-    return {
-        "week_key": f"{iso_year:04d}-W{iso_week:02d}",
-        "month_key": f"{dt.year:04d}-{dt.month:02d}",
-        "quarter_key": f"{dt.year:04d}-Q{q}",
-        "year_key": f"{dt.year:04d}",
-    }
-
-def _build_review_id_v2(dt: datetime, source: str, raw_text: str) -> str:
-    base = f"{dt.date().isoformat()}|{source}|{(raw_text or '')[:200]}"
-    return hashlib.sha1(base.encode("utf-8")).hexdigest()
-
-# Негаторы для локальной оценки подтем
-_RU_NEG = r"(не|без)\s+"
-_EN_NEG = r"(not|no|without|never)\s+"
-_TR_NEG = r"(değil|yok|olm[aeı]yor)\s+"
-
-def _negated_v2(text: str, lang: str, term_regex: str) -> bool:
-    if lang == "ru":
-        return re.search(rf"{_RU_NEG}\w{{0,3}}(?:{term_regex})", text, flags=re.IGNORECASE) is not None
-    if lang == "tr":
-        return re.search(rf"{_TR_NEG}\w{{0,3}}(?:{term_regex})", text, flags=re.IGNORECASE) is not None
-    return re.search(rf"{_EN_NEG}\w{{0,3}}(?:{term_regex})", text, flags=re.IGNORECASE) is not None
-
-def _detect_subtopic_sentiment_v2(text: str, lang: str, patterns: Dict[str, List[str]]) -> str:
-    """
-    Смотрим окно ±40 символов вокруг совпадений подтемы и применяем приоритет:
-    strong-neg -> soft-neg -> strong-pos -> soft-pos -> neu (с учётом negation).
-    Используем уже имеющиеся лексиконы из файла (POSITIVE_WORDS_*, NEGATIVE_WORDS_*).
-    """
-    lang_key = lang if lang in NEGATIVE_WORDS_STRONG else "en"
-    spans: List[str] = []
-    pats = patterns.get(lang, []) or patterns.get("en", [])
-    for pat in pats:
-        for m in re.finditer(pat, text, flags=re.IGNORECASE):
-            s, e = m.span()
-            spans.append(text[max(0, s-40): min(len(text), e+40)])
-    if not spans:
-        spans = [text]
-
-    def has(rgx_list, chunk) -> bool:
-        for rgx in rgx_list:
-            if re.search(rgx, chunk, flags=re.IGNORECASE):
-                if _negated_v2(chunk, lang, rgx):
-                    # «не хорошо» трактуем как негатив
-                    return False
-                return True
-        return False
-
-    for ch in spans:
-        if has(NEGATIVE_WORDS_STRONG.get(lang_key, []), ch): return "neg"
-        if has(NEGATIVE_WORDS_SOFT.get(lang_key, []), ch):   return "neg"
-        if has(POSITIVE_WORDS_STRONG.get(lang_key, []), ch): return "pos"
-        if has(POSITIVE_WORDS_SOFT.get(lang_key, []), ch):   return "pos"
-        for rgx in NEUTRAL_WORDS.get(lang_key, []):
-            if re.search(rgx, ch, flags=re.IGNORECASE): return "neu"
-    return "neu"
-
-def build_semantic_row(review_raw: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    1 отзыв -> 1 нормализованная строка для reviews_semantic_raw:
-    { review_id, date, week_key, month_key, quarter_key, year_key,
-      source, rating10, sentiment_overall,
-      topics_pos, topics_neg, topics_all, pair_tags, quote_candidates }
-    """
-    raw_text = (review_raw.get("text") or "").strip()
-    lang_hint = (review_raw.get("lang_hint") or "").strip()
-    source    = (review_raw.get("source") or "").strip()
-
-    lang_norm = normalize_lang(lang_hint, raw_text)
-    text_clean = _normalize_text_basic_v2(raw_text)
-    # псевдо-перевод оставляем как есть (в модуле он безопасный)
-    _ = translate_to_ru(text_clean, lang_norm)
-
-    rating10 = normalize_rating_to_10(review_raw.get("rating_raw"))
-    # общая тональность как была (без падения на None)
-    try:
-        sentiment_overall = detect_sentiment_label(text_clean, lang_norm)
-    except Exception:
-        sentiment_overall = "neu"
-
-    # темы/аспекты
-    topics_all: set[str] = set()
-    topics_pos: set[str] = set()
-    topics_neg: set[str] = set()
-
-    # соберём флаги для каждой подтемы по схеме
-    for topic_key, tdef in TOPIC_SCHEMA.items():
-        for sub_key, sdef in tdef.get("subtopics", {}).items():
-            patterns = sdef.get("patterns", {})
-            pats = patterns.get(lang_norm) or patterns.get("en") or []
-            if not pats:
-                continue
-            # совпадение есть?
-            matched = any(re.search(p, text_clean, flags=re.IGNORECASE) for p in pats)
-            if not matched:
-                continue
-
-            sent_local = _detect_subtopic_sentiment_v2(text_clean, lang_norm, patterns)
-            aspects = sdef.get("aspects") or [f"{topic_key}.{sub_key}"]
-            # нормализуем ключ аспекта
-            aspect = aspects[0]
-            topics_all.add(aspect)
-            if sent_local == "pos":
-                topics_pos.add(aspect)
-            elif sent_local == "neg":
-                topics_neg.add(aspect)
-
-    # пары (ко-упоминания) на основе уже имеющейся функции
-    pair_tags: List[Dict[str, str]] = []
-    if topics_all:
-        pairs = build_cooccurrence_pairs(sorted(list(topics_all)))
-        for a, b in pairs:
-            # классификация связок
-            a_pos, a_neg = (a in topics_pos), (a in topics_neg)
-            b_pos, b_neg = (b in topics_pos), (b in topics_neg)
-            if a_neg and b_neg:
-                cat = "systemic_risk"
-            elif (a_pos and b_neg) or (b_pos and a_neg):
-                cat = "expectations_conflict"
-            elif a_pos and b_pos:
-                cat = "loyalty_driver"
-            else:
-                continue
-            pair_tags.append({"a": a, "b": b, "cat": cat})
-
-    # цитаты — 1–3 предложения из очищенного текста
-    quotes = []
-    for part in re.split(r"[.!?…]+[\s\n]+", text_clean):
-        p = part.strip()
-        if 15 <= len(p) <= 300:
-            quotes.append(p)
-        if len(quotes) >= 3:
-            break
-
-    # дата/периоды/id
-    dt = _parse_date_to_datetime_v2(review_raw.get("date"))
-    per = _derive_period_keys_v2(dt)
-    review_id = _build_review_id_v2(dt, source, raw_text)
-
-    return {
-        "review_id": review_id,
-        "date": dt.date().isoformat(),
-        "week_key": per["week_key"],
-        "month_key": per["month_key"],
-        "quarter_key": per["quarter_key"],
-        "year_key": per["year_key"],
-        "source": source,
-        "rating10": rating10,
-        "sentiment_overall": sentiment_overall,
-        "topics_pos": json.dumps(sorted(list(topics_pos)), ensure_ascii=False),
-        "topics_neg": json.dumps(sorted(list(topics_neg)), ensure_ascii=False),
-        "topics_all": json.dumps(sorted(list(topics_all)), ensure_ascii=False),
-        "pair_tags": json.dumps(pair_tags, ensure_ascii=False),
-        "quote_candidates": json.dumps(quotes, ensure_ascii=False),
-    }
-# ====== [/ADD] ====================================================================
-
-
-def aggregate_aspects_for_period(df_exploded,
-                                 period_key_col: str,
-                                 current_period_key: str,
-                                 registry: Dict[str, Dict[str, Any]]):
-    """
-    df_exploded: DataFrame со столбцами:
-        - aspect_code : str
-        - sentiment   : {'pos','neg','neu'}
-        - {period_key_col} : например 'week_key' / '2025-W42'
-        - review_id   : id отзыва (для подсчёта уникальных отзывов по аспекту)
-
-    period_key_col: имя столбца периода для группировки, например 'week_key'
-    current_period_key: значение периода, например '2025-W42'
-    registry: выход из build_aspect_registry()
-
-    Возвращает DataFrame с колонками:
-        aspect_code
-        mentions_reviews  - уникальных отзывов, где аспект встречался
-        pos_share         - доля позитивных употреблений
-        neg_share         - доля негативных употреблений
-        topic_display
-        subtopic_display
-        label
-        polarity_hint     - polarity из реестра ('pos'/'neg'/'neutral')
-    """
-
-    import pandas as pd
-
-    cur = df_exploded[df_exploded[period_key_col] == current_period_key].copy()
-
-    # считаем по отзывам (уникальным), а не по количеству предложений
-    grp = (
-        cur.groupby(["aspect_code", "sentiment", "review_id"])
-           .size()
-           .reset_index()
-    )
-
-    # теперь считаем, сколько отзывов упомянули аспект хотя бы один раз
-    mentions = (
-        grp.groupby(["aspect_code", "sentiment"])["review_id"]
-           .nunique()
-           .reset_index(name="review_mentions")
-    )
-
-    # сводим в wide: pos / neg / neu отдельно
-    pivot = mentions.pivot_table(
-        index="aspect_code",
-        columns="sentiment",
-        values="review_mentions",
-        fill_value=0,
-        aggfunc="sum",
-    )
-
-    pivot = pivot.rename(columns={
-        "pos": "mentions_pos",
-        "neg": "mentions_neg",
-        "neu": "mentions_neu",
-    })
-
-    pivot["mentions_total"] = (
-        pivot.get("mentions_pos", 0)
-        + pivot.get("mentions_neg", 0)
-        + pivot.get("mentions_neu", 0)
-    )
-
-    # доля позитива / негатива от всех упоминаний аспекта
-    pivot["pos_share"] = pivot["mentions_pos"] / pivot["mentions_total"].replace(0, 1)
-    pivot["neg_share"] = pivot["mentions_neg"] / pivot["mentions_total"].replace(0, 1)
-
-    pivot = pivot.reset_index()
-
-    # присоединяем человекочитаемые подписи и метаданные
-    meta_df = []
-    for aspect_code, meta in registry.items():
-        meta_df.append({
-            "aspect_code": aspect_code,
-            "topic_display": meta["topic_display"],
-            "subtopic_display": meta["subtopic_display"],
-            "label": meta["label"],
-            "polarity_hint": meta["polarity"],
-        })
-    meta_df = pd.DataFrame(meta_df)
-
-    out = pivot.merge(meta_df, on="aspect_code", how="left")
-
-    # сортируем по полной значимости аспекта в этом периоде
-    out = out.sort_values(
-        by=["mentions_total", "mentions_neg", "mentions_pos"],
-        ascending=[False, False, False],
-        ignore_index=True,
-    )
-
-    return out
-
-import re
-import uuid
-import pandas as pd
-from datetime import datetime
-from typing import Dict, Any, List, Tuple
-
-
-# -------------------------------------------------
-# 1. Нормализация языка
-# -------------------------------------------------
-
-LANG_MAP_EXPLICIT = {
-    "ru": "ru", "ru-ru": "ru", "russian": "ru",
-    "ua": "ru", "uk": "ru", "ukrainian": "ru",  # частая путаница кириллицы как "украинский"
-    "en": "en", "en-us": "en", "en-gb": "en", "english": "en",
-    "tr": "tr", "turkish": "tr",
-    "ar": "ar", "arabic": "ar",
-    "zh": "zh", "cn": "zh", "zh-cn": "zh", "chinese": "zh", "zh-hans": "zh",
-    "zh-hant": "zh", "zh-tw": "zh",
-}
-
-CYRILLIC_RE = re.compile(r"[а-яё]", re.IGNORECASE)
-ARABIC_RE = re.compile(r"[\u0600-\u06FF]")
-HANZI_RE = re.compile(r"[\u4e00-\u9fff]")
-TURKISH_HINT_RE = re.compile(r"[çğıöşü]", re.IGNORECASE)
-
-def normalize_lang(raw_code: str, text: str) -> str:
-    """
-    Приводим язык к одному из {ru,en,tr,ar,zh,other}
-    Используем сначала код из источника, потом эвристику по алфавиту.
-    """
-    if raw_code:
-        c = raw_code.strip().lower()
-        if c in LANG_MAP_EXPLICIT:
-            return LANG_MAP_EXPLICIT[c]
-
-    t = text or ""
-    # эвристики
-    if CYRILLIC_RE.search(t):
+    if lang_hint:
+        return lang_hint.strip().lower()
+
+    # кириллица?
+    if re.search(r"[а-яё]", text, flags=re.IGNORECASE):
         return "ru"
-    if ARABIC_RE.search(t):
-        return "ar"
-    if HANZI_RE.search(t):
+    # китайские иероглифы?
+    if re.search(r"[\u4e00-\u9fff]", text):
         return "zh"
-    if TURKISH_HINT_RE.search(t):
+    # арабская письменность?
+    if re.search(r"[\u0600-\u06FF]", text):
+        return "ar"
+    # турецкие диакритики?
+    if re.search(r"[ğüşöıçİĞÜŞÖÇ]", text):
         return "tr"
 
-    # если есть явные английские слова типа "the", "and", "was", "great"
-    if re.search(r"\b(the|and|was|were|is|are|very|really|great|good|bad|price)\b", t.lower()):
-        return "en"
-
-    return "other"
+    return "en"
 
 
-# -------------------------------------------------
-# 2. Тональность (sentiment)
-# -------------------------------------------------
-
-# Регэкспы для позитивной / негативной окраски.
-# Мы не пытаемся грамматически распарсить фразу,
-# просто считаем "кол-во попаданий сильных позитивных и негативных маркеров".
-SENTIMENT_LEXICON: Dict[str, Dict[str, List[re.Pattern]]] = {
-    "ru": {
-        "pos": [
-            re.compile(r"\bотличн\w+\b", re.I),
-            re.compile(r"\bпрекрасн\w+\b", re.I),
-            re.compile(r"\bсупер\b", re.I),
-            re.compile(r"\bклассн\w+\b", re.I),
-            re.compile(r"\bвеликолепн\w+\b", re.I),
-            re.compile(r"\bпонравил\w+\b", re.I),
-            re.compile(r"\bочень вкусн\w+\b", re.I),
-            re.compile(r"\bочень уютн\w+\b", re.I),
-            re.compile(r"\bдружелюбн\w+\b", re.I),
-            re.compile(r"\bвежлив\w+\b", re.I),
-            re.compile(r"\bчисто\b", re.I),
-            re.compile(r"\bсвежо\b", re.I),
-            re.compile(r"\bуютн\w+\b", re.I),
-            re.compile(r"\bстильн\w+\b", re.I),
-            re.compile(r"\bкрасив\w+\b", re.I),
-            re.compile(r"\bвсё было хорошо\b", re.I),
-            re.compile(r"\bвсё понравил\w+\b", re.I),
-            re.compile(r"\bрекомендую\b", re.I),
-            re.compile(r"\bвернусь\b", re.I),
-        ],
-        "neg": [
-            re.compile(r"\bужасн\w+\b", re.I),
-            re.compile(r"\bотвратительн\w+\b", re.I),
-            re.compile(r"\bстр(е|ё)мн\w+\b", re.I),
-            re.compile(r"\bгрязн\w+\b", re.I),
-            re.compile(r"\bвоняет\b", re.I),
-            re.compile(r"\bвонь\b", re.I),
-            re.compile(r"\bгрязный подъезд\b", re.I),
-            re.compile(r"\bслишком дорог\w+\b", re.I),
-            re.compile(r"\bдорого\b", re.I),
-            re.compile(r"\bне стоит (этих|своих) денег\b", re.I),
-            re.compile(r"\bне оправдывает цен\w+\b", re.I),
-            re.compile(r"\bпроблемы с\b", re.I),
-            re.compile(r"\bне работал\w*\b", re.I),
-            re.compile(r"\bсломан\w+\b", re.I),
-            re.compile(r"\bхолодн(о|ый|ая)\b", re.I),
-            re.compile(r"\bшумн\w+\b", re.I),
-            re.compile(r"\bнеуютн\w+\b", re.I),
-            re.compile(r"\bне понравил\w+\b", re.I),
-            re.compile(r"\bразочарован\w*\b", re.I),
-        ],
-    },
-    "en": {
-        "pos": [
-            re.compile(r"\bgreat\b", re.I),
-            re.compile(r"\bexcellent\b", re.I),
-            re.compile(r"\bwonderful\b", re.I),
-            re.compile(r"\bamazing\b", re.I),
-            re.compile(r"\bdelicious\b", re.I),
-            re.compile(r"\btasty\b", re.I),
-            re.compile(r"\bcozy\b", re.I),
-            re.compile(r"\bclean\b", re.I),
-            re.compile(r"\bfriendly staff\b", re.I),
-            re.compile(r"\bhelpful\b", re.I),
-            re.compile(r"\bworth the price\b", re.I),
-            re.compile(r"\bgood value\b", re.I),
-            re.compile(r"\bperfect location\b", re.I),
-            re.compile(r"\bwould stay again\b", re.I),
-            re.compile(r"\bwe loved\b", re.I),
-        ],
-        "neg": [
-            re.compile(r"\bterrible\b", re.I),
-            re.compile(r"\bawful\b", re.I),
-            re.compile(r"\bhorrible\b", re.I),
-            re.compile(r"\bdisgusting\b", re.I),
-            re.compile(r"\bdirty\b", re.I),
-            re.compile(r"\bsmelled bad\b", re.I),
-            re.compile(r"\bbad smell\b", re.I),
-            re.compile(r"\boverpriced\b", re.I),
-            re.compile(r"\btoo expensive\b", re.I),
-            re.compile(r"\bnot worth\b", re.I),
-            re.compile(r"\bno hot water\b", re.I),
-            re.compile(r"\bnoisy\b", re.I),
-            re.compile(r"\bunsafe\b", re.I),
-            re.compile(r"\bwe will not come back\b", re.I),
-        ],
-    },
-    "tr": {
-        "pos": [
-            re.compile(r"\bharika\b", re.I),
-            re.compile(r"\bçok iyi\b", re.I),
-            re.compile(r"\bmükemmel\b", re.I),
-            re.compile(r"\blezzetli\b", re.I),
-            re.compile(r"\btemizdi\b", re.I),
-            re.compile(r"\btemiz\b", re.I),
-            re.compile(r"\bgüvenliydi\b", re.I),
-            re.compile(r"\bgüzel konum\b", re.I),
-            re.compile(r"\bpersonel çok nazik\b", re.I),
-            re.compile(r"\bparasına değer\b", re.I),
-        ],
-        "neg": [
-            re.compile(r"\bberbat\b", re.I),
-            re.compile(r"\bkorkunç\b", re.I),
-            re.compile(r"\bkirli\b", re.I),
-            re.compile(r"\bpis kokuyordu\b", re.I),
-            re.compile(r"\bpahalı\b", re.I),
-            re.compile(r"\bçok pahalı\b", re.I),
-            re.compile(r"\bdeğmez\b", re.I),
-            re.compile(r"\bgürültülü\b", re.I),
-            re.compile(r"\bgüvensiz\b", re.I),
-            re.compile(r"\byavaş internet\b", re.I),
-        ],
-    },
-    "ar": {
-        "pos": [
-            re.compile(r"كتير حلو", re.I),
-            re.compile(r"كتير نظيف", re.I),
-            re.compile(r"نضيف", re.I),
-            re.compile(r"مرتاح", re.I),
-            re.compile(r"مرتاحين", re.I),
-            re.compile(r"أمان", re.I),
-            re.compile(r"طَيّب", re.I),
-            re.compile(r"زاكي", re.I),
-            re.compile(r"منيح", re.I),
-        ],
-        "neg": [
-            re.compile(r"وسخ", re.I),
-            re.compile(r"ريحة بشعة", re.I),
-            re.compile(r"ريحة مجاري", re.I),
-            re.compile(r"غالي", re.I),
-            re.compile(r"غالي عالفاضي", re.I),
-            re.compile(r"مو آمن", re.I),
-            re.compile(r"مو مريح", re.I),
-            re.compile(r"زحمة", re.I),
-            re.compile(r"كنا مستائين", re.I),
-        ],
-    },
-    "zh": {
-        "pos": [
-            re.compile(r"很好", re.I),
-            re.compile(r"很棒", re.I),
-            re.compile(r"很舒服", re.I),
-            re.compile(r"很干净", re.I),
-            re.compile(r"干净", re.I),
-            re.compile(r"安全", re.I),
-            re.compile(r"方便", re.I),
-            re.compile(r"位置很好", re.I),
-            re.compile(r"很好吃", re.I),
-        ],
-        "neg": [
-            re.compile(r"很脏", re.I),
-            re.compile(r"脏", re.I),
-            re.compile(r"臭", re.I),
-            re.compile(r"味道很差", re.I),
-            re.compile(r"太贵", re.I),
-            re.compile(r"不值", re.I),
-            re.compile(r"吵", re.I),
-            re.compile(r"很吵", re.I),
-            re.compile(r"不安全", re.I),
-        ],
-    },
-    # если язык нераспознан → базовая англо-ориентированная схема
-    "other": {
-        "pos": [
-            re.compile(r"\bgreat\b", re.I),
-            re.compile(r"\bexcellent\b", re.I),
-            re.compile(r"\bgood\b", re.I),
-            re.compile(r"\bclean\b", re.I),
-            re.compile(r"\bcozy\b", re.I),
-            re.compile(r"\bworth\b", re.I),
-        ],
-        "neg": [
-            re.compile(r"\bbad\b", re.I),
-            re.compile(r"\bdirty\b", re.I),
-            re.compile(r"\bsmell\b", re.I),
-            re.compile(r"\bexpensive\b", re.I),
-            re.compile(r"\bnoisy\b", re.I),
-            re.compile(r"\bnot worth\b", re.I),
-        ],
-    },
-}
-
-
-def detect_sentiment_label(text: str, lang: str, rating10: float | None = None) -> str:
+def translate_to_ru(text: str, lang: str) -> str:
     """
-    Общая тональность отзыва.
-    Негаторы гасят "ложные" срабатывания (не грязно → не негатив),
-    а "не хорошо" интерпретируется как мягкий негатив.
+    Stub. Важно: мы НЕ зовём внешние API.
+    Для русского текста возвращаем как есть.
+    Для всего остального возвращаем как есть тоже.
+    Почему так: нам не нужна сейчас "идеальная" машинная локализация,
+    главное — чтобы выражения из твоего словаря ловились.
+    При желании тут можно будет добавить словарный мини-перевод.
     """
-    if not text:
-        return "neu"
-
-    strong_neg, soft_neg, strong_pos, soft_pos, neutrals = _get_lexicons_for_lang(lang)
-
-    # strong neg
-    for rgx in strong_neg:
-        if re.search(rgx, text, re.I) and not _negated(text, lang, rgx):
-            return "neg"
-
-    # soft neg
-    for rgx in soft_neg:
-        if re.search(rgx, text, re.I) and not _negated(text, lang, rgx):
-            return "neg"
-
-    # strong pos (с проверкой negation)
-    for rgx in strong_pos:
-        if re.search(rgx, text, re.I):
-            if _negated(text, lang, rgx):
-                return "neg"
-            return "pos"
-
-    # soft pos
-    for rgx in soft_pos:
-        if re.search(rgx, text, re.I):
-            if _negated(text, lang, rgx):
-                return "neg"
-            return "pos"
-
-    # neutrals
-    for rgx in neutrals:
-        if re.search(rgx, text, re.I):
-            return "neu"
-
-    # fallback по оценке
-    if rating10 is not None:
-        if rating10 >= 9.0:
-            return "pos"
-        if rating10 <= 6.0:
-            return "neg"
-
-    return "neu"
+    return text
 
 
-
-# -------------------------------------------------
-# 3. Вспомогательные функции для периодов
-# -------------------------------------------------
-
-def get_period_keys(dt: datetime) -> Dict[str, str]:
+def normalize_rating_to_10(rating_raw: Any) -> float:
     """
-    Возвращает словарь с ключами периода для отзыва:
-    - week_key: 'YYYY-Www'
-    - month_key: 'YYYY-MM'
-    - quarter_key: 'YYYY-Qn'
-    - year_key: 'YYYY'
+    Booking и т.п. обычно уже /10.
+    Если вдруг рейтинг в диапазоне [1..5] -> домножаем на 2.
+    Всё остальное пытаемся привести к float или None.
     """
-    iso_year, iso_week, _ = dt.isocalendar()  # (year, week, weekday)
-    month_key = f"{dt.year:04d}-{dt.month:02d}"
-
-    # квартал по месяцу
-    q = (dt.month - 1) // 3 + 1
-    quarter_key = f"{dt.year:04d}-Q{q}"
-
-    return {
-        "week_key": f"{iso_year:04d}-W{iso_week:02d}",
-        "month_key": month_key,
-        "quarter_key": quarter_key,
-        "year_key": f"{dt.year:04d}",
-    }
-
-
-# -------------------------------------------------
-# 4. Матчинг подтем (subtopics) и маппинг в аспекты
-# -------------------------------------------------
-
-def match_subtopics_for_review(
-    text: str,
-    lang: str,
-    topic_schema: Dict[str, Dict[str, Any]]
-) -> List[Tuple[str, str]]:
-    """
-    Возвращает список (topic_key, subtopic_key) которые сработали в этом отзыве.
-    Если по языку нет паттернов -> не матчим эту подтему.
-    """
-    hits: List[Tuple[str, str]] = []
-    if not text:
-        return hits
-
-    for topic_key, topic_block in topic_schema.items():
-        subtopics = topic_block.get("subtopics", {})
-        for sub_key, sub_block in subtopics.items():
-            patterns = sub_block.get("patterns", {})
-            lang_patterns = patterns.get(lang, [])
-            if not lang_patterns:
-                # если нет паттернов на этом языке - пропускаем
-                continue
-            for pat in lang_patterns:
-                # pat в схеме у нас как raw string/regex source
-                # нужно скомпилить
-                if isinstance(pat, str):
-                    rgx = re.compile(pat, re.IGNORECASE | re.UNICODE | re.MULTILINE)
-                else:
-                    # если вдруг кто-то положит ужеcompiled re.Pattern
-                    rgx = pat
-                if rgx.search(text):
-                    hits.append((topic_key, sub_key))
-                    break  # достаточно одного попадания для данной подтемы
-    return hits
-
-
-def aspects_from_subtopic_by_sentiment(
-    topic_schema: Dict[str, Dict[str, Any]],
-    topic_key: str,
-    subtopic_key: str,
-    sentiment_label: str,
-) -> List[str]:
-    """
-    У подтемы есть список aspects (включающий и позитивные, и негативные формулировки).
-    Мы фильтруем эти аспекты по полярности (infer_polarity) так, чтобы
-    не приписывать позитивный тег при явно негативном отзыве и наоборот.
-    Нейтральные аспекты считаем для всех типов sent (если они вообще появятся).
-    """
-    sub_block = topic_schema[topic_key]["subtopics"][subtopic_key]
-    aspects_all = sub_block.get("aspects", [])
-
-    filtered: List[str] = []
-    for a in aspects_all:
-        pol = infer_polarity(a)  # 'pos' / 'neg' / 'neutral'
-        if pol == "neutral":
-            filtered.append(a)
-        elif pol == sentiment_label:
-            filtered.append(a)
-        # иначе не добавляем
-    return filtered
-
-
-# -------------------------------------------------
-# 5. Основная функция построения exploded-DF
-# -------------------------------------------------
-
-def build_exploded_reviews_df(
-    raw_reviews_df: pd.DataFrame,
-    topic_schema: Dict[str, Dict[str, Any]],
-    add_rating_5scale: bool = True,
-) -> pd.DataFrame:
-    """
-    Превращает сырые отзывы (как в выгрузке Reviews_dd-mm-yyyy.xls)
-    в "взорванный" датафрейм аспектов.
-
-    Ожидаемые столбцы raw_reviews_df:
-        - 'Дата' (или 'date') : строка даты
-        - 'Рейтинг' (или 'rating') : float/int
-        - 'Источник' (или 'source')
-        - 'Автор' (или 'author')
-        - 'Код языка' (или 'lang_code')
-        - 'Текст отзыва' (или 'text')
-        - (опционально) 'Наличие ответа' (ignored here)
-
-    Возвращаем DataFrame со столбцами:
-        review_id          уникальный id отзыва (str)
-        source             площадка
-        date               datetime
-        week_key, month_key, quarter_key, year_key
-        rating_raw         исходная оценка
-        rating_5           оценка приведённая к шкале 1–5 (если add_rating_5scale=True)
-        lang               нормализованный язык ('ru','en','tr','ar','zh','other')
-        aspect_code        код аспекта (wifi_unstable, breakfast_tasty, ...)
-        sentiment          'pos'/'neg'/'neu' (тональность отзыва в целом)
-        text               полный текст отзыва (для референса анализа)
-
-    Важно: одна строка = один (review_id, aspect_code) для данного периода.
-    Если один и тот же аспект ловится много раз в одном отзыве, мы оставляем его один раз.
-    """
-
-    # нормализуем имена столбцов к удобным
-    cols_map = {
-        'Дата': 'date',
-        'Рейтинг': 'rating_raw',
-        'Источник': 'source',
-        'Автор': 'author',
-        'Код языка': 'lang_code',
-        'Текст отзыва': 'text',
-        'Наличие ответа': 'responded',
-        'rating': 'rating_raw',
-        'date': 'date',
-        'source': 'source',
-        'author': 'author',
-        'lang_code': 'lang_code',
-        'text': 'text',
-    }
-    df = raw_reviews_df.rename(columns={c: cols_map.get(c, c) for c in raw_reviews_df.columns})
-
-    # убедимся, что обязательные столбцы есть
-    required_cols = ["date", "rating_raw", "source", "author", "lang_code", "text"]
-    for rc in required_cols:
-        if rc not in df.columns:
-            # если чего-то нет (например lang_code), добавим пустой
-            df[rc] = df.get(rc, "")
-
-    # приводим дату к datetime
-    def parse_date_safe(x):
-        if isinstance(x, datetime):
-            return x
-        if pd.isna(x):
-            return None
-        # пробуем несколько форматов
-        for fmt in ("%d.%m.%Y", "%Y-%m-%d", "%d/%m/%Y", "%d.%m.%y"):
-            try:
-                return datetime.strptime(str(x), fmt)
-            except ValueError:
-                continue
-        # last resort: let pandas try
-        try:
-            return pd.to_datetime(x)
-        except Exception:
-            return None
-
-    df["date"] = df["date"].apply(parse_date_safe)
-
-    # фильтруем пустые тексты
-    df = df[~(df["text"].isna() | (df["text"].astype(str).str.strip() == ""))].copy()
-
-    # создаём review_id, если в исходниках его нет
-    # (делаем детерминированно через hash конкатенации текста+даты+автора+source)
-    if "review_id" not in df.columns:
-        def make_id(row):
-            base = f"{row.get('source','')}|{row.get('author','')}|{row.get('date','')}|{row.get('text','')}"
-            # короткий uuid5-like (без crypto)
-            return str(uuid.uuid5(uuid.NAMESPACE_URL, base))
-        df["review_id"] = df.apply(make_id, axis=1)
-
-    # нормализуем язык
-    df["lang"] = df.apply(
-        lambda r: normalize_lang(str(r.get("lang_code", "")), str(r.get("text", ""))),
-        axis=1
-    )
-
-    # определяем тональность ВСЕГО отзыва
-    df["sentiment"] = df.apply(
-        lambda r: detect_sentiment_label(str(r.get("text", "")), r.get("lang", "other")),
-        axis=1
-    )
-
-    # периодические ключи
-    period_keys = df["date"].apply(lambda d: get_period_keys(d) if pd.notna(d) else {
-        "week_key": None,
-        "month_key": None,
-        "quarter_key": None,
-        "year_key": None,
-    })
-    df = pd.concat([df, period_keys.apply(pd.Series)], axis=1)
-
-    # опционально нормализуем рейтинг в 5-балльную шкалу
-    # Логика:
-    # - если rating_raw <=5 → считаем, что это уже 5-балльная
-    # - если rating_raw <=10 → делим на 2
-    def to_5scale(x):
-        try:
-            val = float(x)
-        except Exception:
-            return None
-        if val <= 5:
-            return val
-        if val <= 10:
-            return val / 2.0
-        # если внезапно другая шкала — приводить не будем
+    if rating_raw is None or (isinstance(rating_raw, float) and pd.isna(rating_raw)):
         return None
 
-    if add_rating_5scale:
-        df["rating_5"] = df["rating_raw"].apply(to_5scale)
-    else:
-        df["rating_5"] = None
+    try:
+        val = float(str(rating_raw).replace(",", "."))
+    except Exception:
+        return None
 
-    # теперь извлекаем подтемы → аспекты
-    exploded_rows: List[Dict[str, Any]] = []
+    if 1.0 <= val <= 5.0:
+        return round(val * 2.0, 2)
 
-    for _, row in df.iterrows():
-        rid = row["review_id"]
-        txt = str(row["text"])
-        lang = row["lang"]
-        sent_label = row["sentiment"]
+    # допустим 0..10
+    if 0.0 <= val <= 10.0:
+        return round(val, 2)
 
-        wk = row["week_key"]
-        mk = row["month_key"]
-        qk = row["quarter_key"]
-        yk = row["year_key"]
-
-        src = row["source"]
-        dt  = row["date"]
-        rating_raw = row["rating_raw"]
-        rating_5 = row["rating_5"]
-
-        # какие подтемы сработали
-        subtopic_hits = match_subtopics_for_review(
-            text=txt,
-            lang=lang,
-            topic_schema=topic_schema
-        )
-
-        # для каждой подтемы — берём аспекты соответствующей полярности
-        aspects_all: List[str] = []
-        for (topic_key, sub_key) in subtopic_hits:
-            a_list = aspects_from_subtopic_by_sentiment(
-                topic_schema=topic_schema,
-                topic_key=topic_key,
-                subtopic_key=sub_key,
-                sentiment_label=sent_label,
-            )
-            aspects_all.extend(a_list)
-
-        # дедуп по аспектам
-        aspects_all = sorted(set(aspects_all))
-
-        # теперь формируем финальные строки
-        for aspect_code in aspects_all:
-            exploded_rows.append({
-                "review_id": rid,
-                "source": src,
-                "date": dt,
-                "week_key": wk,
-                "month_key": mk,
-                "quarter_key": qk,
-                "year_key": yk,
-                "rating_raw": rating_raw,
-                "rating_5": rating_5,
-                "lang": lang,
-                "aspect_code": aspect_code,
-                "sentiment": sent_label,
-                "text": txt,
-            })
-
-    exploded_df = pd.DataFrame(exploded_rows)
-
-    # если не нашли ни одной темы в отзыве, он не попадает в exploded_df.
-    # это норм, но для прозрачности можно (по желанию) включить "generic" аспект
-    # вроде "unclassified_positive"/"unclassified_negative", если нужно покрыть всё 100%.
-    # Пока не добавляем.
-
-    return exploded_df
+    return None
 
 
-###############################################################################
-# 3. Классификация тем для одного отзыва
-###############################################################################
+# =========================
+# SENTIMENT: общая тональность и тональность подтемы
+# =========================
 
-@dataclass
-class TopicHit:
-    category: str           # "cleanliness"
-    category_display: str   # "Чистота"
-    subtopic: str           # "arrival_clean"
-    subtopic_display: str   # "Чистота номера при заезде"
-    aspects: List[str]      # ["room_not_ready", ...] - может быть []
-    sentiment: str          # 'pos'/'neg'/'neu' для этой подтемы (эвристика)
-    rating10: Optional[float]  # нормализованная оценка гостя
-    lang: str               # нормализованный язык ("ru","en","tr","ar","zh","other")
-
-
-def _match_any_pattern(patterns: List[str], text: str) -> bool:
-    for pat in patterns:
-        if re.search(pat, text, flags=re.IGNORECASE):
-            return True
-    return False
-
-
-def detect_subtopic_sentiment(text: str, lang: str, subtopic_patterns: Dict[str, List[str]]) -> str:
+def detect_sentiment_label(text_ru: str, lang: str) -> str:
     """
-    Эвристика тональности по конкретной подтеме:
-    - если явно есть негатив-слова => neg
-    - иначе если есть позитив-слова => pos
-    - иначе neu
-    (на практике можно доработать весами, но пока достаточно)
+    Грубая общая тональность всего отзыва.
+    Приоритет:
+    1) сильный негатив
+    2) сильный позитив
+    3) мягкий негатив
+    4) мягкий позитив
+    5) нейтральный словарь
+    иначе — 'neu'
     """
-    lang_key = lang if lang in NEGATIVE_WORDS else "en"
+    l = lang if lang in NEGATIVE_WORDS_STRONG else "en"
 
-    # негатив приоритетнее
-    for pat in NEGATIVE_WORDS.get(lang_key, []):
-        if re.search(pat, text, flags=re.IGNORECASE):
-            return "neg"
+    def any_match(patterns: List[str]) -> bool:
+        for pat in patterns:
+            if re.search(pat, text_ru, flags=re.IGNORECASE):
+                return True
+        return False
 
-    for pat in POSITIVE_WORDS.get(lang_key, []):
-        if re.search(pat, text, flags=re.IGNORECASE):
-            return "pos"
+    # 1. сильный негатив
+    if any_match(NEGATIVE_WORDS_STRONG.get(l, [])):
+        return "neg"
+
+    # 2. сильный позитив
+    if any_match(POSITIVE_WORDS_STRONG.get(l, [])):
+        return "pos"
+
+    # 3. мягкий негатив
+    if any_match(NEGATIVE_WORDS_SOFT.get(l, [])):
+        return "neg"
+
+    # 4. мягкий позитив
+    if any_match(POSITIVE_WORDS_SOFT.get(l, [])):
+        return "pos"
+
+    # 5. нейтральщина
+    if any_match(NEUTRAL_WORDS.get(l, [])):
+        return "neu"
 
     return "neu"
 
 
-def classify_review_topics(
-    text_original: str,
-    lang_norm: str,
-    rating10: Optional[float],
-) -> List[TopicHit]:
+def detect_subtopic_sentiment(text_ru: str, lang: str, subtopic_patterns: Dict[str, List[str]]) -> str:
     """
-    Находит все (category, subtopic), которые встречаются в отзыве.
-    Возвращает список TopicHit.
-    1. По каждому subtopic проверяем регэкспы данного языка (если их нет - fallback en)
-    2. Для срабатывающих подтем определяем тональность по этой подтеме.
-    """
-
-    hits: List[TopicHit] = []
-
-    for cat_key, cat_obj in TOPIC_SCHEMA.items():
-        cat_disp = cat_obj["display"]
-        for sub_key, sub_obj in cat_obj["subtopics"].items():
-            sub_disp = sub_obj["display"]
-            patterns_by_lang = sub_obj.get("patterns", {})
-
-            # набор паттернов для языка, либо fallback en, либо пусто
-            pats = patterns_by_lang.get(lang_norm) \
-                or patterns_by_lang.get("en") \
-                or []
-
-            if not pats:
-                continue
-
-            if _match_any_pattern(pats, text_original):
-                sub_sent = detect_subtopic_sentiment(
-                    text_original,
-                    lang_norm,
-                    patterns_by_lang
-                )
-                aspects_list = sub_obj.get("aspects", [])
-                hits.append(
-                    TopicHit(
-                        category=cat_key,
-                        category_display=cat_disp,
-                        subtopic=sub_key,
-                        subtopic_display=sub_disp,
-                        aspects=aspects_list,
-                        sentiment=sub_sent,
-                        rating10=rating10,
-                        lang=lang_norm,
-                    )
-                )
-
-    return hits
-
-
-###############################################################################
-# 4. Предобработка датафрейма отзывов
-###############################################################################
-
-def preprocess_reviews_df(df_raw: pd.DataFrame) -> pd.DataFrame:
-    """
-    Приводим исходную выгрузку отзывов к нормализованному датафрейму,
-    готовому для дальнейшей агрегации.
-
-    Ожидаемые входные столбцы (текущая логика выгрузки):
-    - "Дата"
-    - "Рейтинг"
-    - "Источник"
-    - "Автор"
-    - "Код языка"
-    - "Текст отзыва"
-    - "Наличие ответа"
-
-    Возвращаем датафрейм со столбцами:
-    - date                (datetime64[ns])
-    - source              (str)
-    - author              (str)
-    - lang_raw            (str)
-    - lang_norm           (str in ["ru","en","tr","ar","zh","other"])
-    - text_orig           (str)
-    - text_ru             (str)  # сейчас = text_orig или "переведенный" текст
-    - rating_raw          (float|None)
-    - rating10            (float|None)
-    - sentiment_overall   ('pos'/'neg'/'neu')
-    - reply_present       (bool)  # Наличие ответа
-    - topics              (list[TopicHit]) -- пока пустой, заполним дальше отдельно
-    """
-
-    # Копия, не мутируем вход
-    df = df_raw.copy()
-
-    # нормализуем названия столбцов, чтобы не зависеть от регистра и пробелов
-    rename_map = {}
-    for col in df.columns:
-        norm_col = col.strip().lower()
-        if norm_col.startswith("дата"):
-            rename_map[col] = "date"
-        elif "рейтинг" in norm_col:
-            rename_map[col] = "rating_raw"
-        elif "источник" in norm_col:
-            rename_map[col] = "source"
-        elif "автор" in norm_col:
-            rename_map[col] = "author"
-        elif "код языка" in norm_col or "язык" in norm_col:
-            rename_map[col] = "lang_raw"
-        elif "текст" in norm_col:
-            rename_map[col] = "text_orig"
-        elif "налич" in norm_col and "ответ" in norm_col:
-            rename_map[col] = "reply_present"
-    df = df.rename(columns=rename_map)
-
-    # Пробуем привести date к datetime
-    if "date" in df.columns:
-        df["date"] = pd.to_datetime(df["date"], errors="coerce")
-
-    # reply_present -> bool
-    if "reply_present" in df.columns:
-        df["reply_present"] = df["reply_present"].astype(str).str.lower().isin(["1", "true", "yes", "да", "y"])
-
-    # Язык
-    if "lang_raw" not in df.columns:
-        df["lang_raw"] = ""
-    df["lang_raw"] = df["lang_raw"].astype(str)
-    df["text_orig"] = df.get("text_orig", "").astype(str)
-
-    df["lang_norm"] = [
-        normalize_lang(lr, txt) for lr, txt in zip(df["lang_raw"], df["text_orig"])
-    ]
-
-    # Нормализация рейтинга
-    df["rating10"] = df.get("rating_raw", None).apply(normalize_rating_to_10)
-
-    # Нормализация текста
-    text_clean = normalize_text_basic(text, lang_norm)
-
-    # text_ru (потом сюда можно будет подвесить реальный перевод)
-    df["text_ru"] = [
-        translate_to_ru(txt, lg) for txt, lg in zip(df["text_clean"], df["lang_norm"])
-    ]
-
-    # sentiment_overall
-    df["sentiment_overall"] = [
-        detect_sentiment_label(txt, lg, rt)
-        for txt, lg, rt in zip(df["text_ru"], df["lang_norm"], df["rating10"])
-    ]
-
-    # заглушка для topics - заполним во второй фазе (агрегация)
-    df["topics"] = [[] for _ in range(len(df))]
-
-    return df
-
-
-def annotate_topics(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    На входе df после preprocess_reviews_df.
-    Для каждой строки вызываем classify_review_topics и заполняем df["topics"].
-    """
-    if "text_ru" not in df.columns or "lang_norm" not in df.columns:
-        raise ValueError("DataFrame must be preprocessed before annotate_topics")
-
-    topics_all = []
-    for txt, lang, r10 in zip(df["text_ru"], df["lang_norm"], df["rating10"]):
-        hits = classify_review_topics(txt, lang, r10)
-        topics_all.append(hits)
-
-    df = df.copy()
-    df["topics"] = topics_all
-    return df
-
-###############################################################################
-# 5. Что дальше
-###############################################################################
-
-# На следующем шаге мы будем реализовывать:
-#
-# - агрегатор по неделе / месяцу / кварталу / году:
-#   build_period_aggregates(df)
-#   -> метрики по категориям и подтемам:
-#       mentions, доля от всех отзывов, средний rating10 по упоминавшим,
-#       доля негатива, и т.д.
-#
-# - baseline за последние 8 недель:
-#   чтобы понимать "обычный" уровень частоты темы и качества,
-#   чтобы находить отклонения недели.
-#
-# - функцию select_hot_topics(...) и prepare_trend_narrative(...),
-#   которая будет строить "Существенные отклонения этой недели по темам"
-#   в том формате, который мы уже обсудили:
-#
-#   Ниже исторического уровня — «Чистота номера при заезде» (−0.4),
-#   «Заселение и проживание» (−0.3).
-#
-#   Выше исторического уровня — «Персонал (СПиР)» (+0.5), «Локация и окружение» (+0.4).
-#
-# - генератор объяснений причин по заселению:
-#   типа "Задержки при заселении в основном вызваны неготовностью номера
-#   (претензии к чистоте перед заездом) и техническими сложностями с доступом".
-#
-# - выбор цитат гостей (позитив/негатив по ключевым темам)
-#   для блока «Голос гостей», с меткой языка и источника.
-#
-# Всё это будет использовать df["topics"] и TOPIC_SCHEMA выше.
-
-###############################################################################
-# 6. Вспомогательные метки периодов (неделя, месяц, квартал, год)
-###############################################################################
-
-def iso_year_week(dt: pd.Timestamp) -> str:
-    """
-    Вернёт ключ недели формата '2025-W42'.
-    week = ISO week number (понедельник - первый день недели).
-    """
-    if pd.isna(dt):
-        return ""
-    iso = dt.isocalendar()  # pandas >= 1.1: (year, week, weekday)
-    return f"{iso.year}-W{iso.week:02d}"
-
-
-def quarter_label(dt: pd.Timestamp) -> str:
-    """
-    Вернёт метку квартала для человека и для аналитики:
-    Q1, Q2, Q3, Q4
-    """
-    if pd.isna(dt):
-        return ""
-    q = (dt.month - 1) // 3 + 1
-    return f"Q{q}"
-
-
-def enrich_time_keys(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Добавляет вспомогательные колонки period_key на уровне строки отзыва:
-    - week_key       : '2025-W42'
-    - month_key      : '2025-10'
-    - quarter_key    : '2025-Q4'
-    - year_key       : '2025'
-    Это пригодится и для baseline, и для агрегации периодов.
-    """
-    out = df.copy()
-    out["week_key"] = out["date"].apply(lambda d: iso_year_week(d) if pd.notna(d) else "")
-    out["month_key"] = out["date"].dt.strftime("%Y-%m")
-    out["year_key"] = out["date"].dt.strftime("%Y")
-    out["quarter_key"] = out["date"].apply(
-        lambda d: f"{d.year}-{quarter_label(d)}" if pd.notna(d) else ""
-    )
-    return out
-
-
-###############################################################################
-# 7. Взрыв тем (explode topics)
-###############################################################################
-
-def explode_topics(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    На входе df после annotate_topics (у каждой строки отзывов есть list[TopicHit] в df["topics"]).
-    Разворачиваем в формат "одна строка = одна (отзыв, подтема)".
-
-    Возвращаем датафрейм со столбцами:
-    - idx (индекс исходного отзыва) - чтобы потом джойнить при необходимости
-    - date, week_key, month_key, quarter_key, year_key
-    - source
-    - rating10
-    - sentiment_overall
-    - category, category_display
-    - subtopic, subtopic_display
-    - subtopic_sentiment ('pos'/'neg'/'neu' внутри этой подтемы)
-    - aspects (список аспектов влияния)
-    """
-    rows = []
-
-    for idx, row in df.iterrows():
-        topics: List[TopicHit] = row.get("topics", [])
-        if not topics:
-            continue
-        for hit in topics:
-            rows.append({
-                "idx": idx,
-                "date": row["date"],
-                "week_key": row["week_key"],
-                "month_key": row["month_key"],
-                "quarter_key": row["quarter_key"],
-                "year_key": row["year_key"],
-                "source": row.get("source", ""),
-                "rating10": row.get("rating10", None),
-                "sentiment_overall": row.get("sentiment_overall", "neu"),
-
-                "category": hit.category,
-                "category_display": hit.category_display,
-                "subtopic": hit.subtopic,
-                "subtopic_display": hit.subtopic_display,
-                "subtopic_sentiment": hit.sentiment,   # эвристика по подтеме
-                "aspects": hit.aspects,               # список причинных аспектов
-            })
-
-    if not rows:
-        # Нет попаданий тем вообще
-        return pd.DataFrame(columns=[
-            "idx","date","week_key","month_key","quarter_key","year_key","source","rating10","sentiment_overall",
-            "category","category_display","subtopic","subtopic_display","subtopic_sentiment","aspects"
-        ])
-
-    exploded = pd.DataFrame(rows)
-
-    return exploded
-
-
-###############################################################################
-# 8. Агрегация тем за период
-###############################################################################
-
-@dataclass
-class TopicAggregate:
-    # Это агрегат для одной темы (категории или подтемы) в рамках одного периода.
-    mentions: int                       # сколько отзывов упоминали эту тему
-    share_pct: float                    # какая доля отзывов периода упомянула эту тему, %
-    avg_rating10: Optional[float]       # средний рейтинг10 среди упомянувших (NaN -> None)
-    neg_share_pct: float                # % негативных упоминаний этой темы
-    aspects_counter: Dict[str, int]     # какие аспекты фигурировали и сколько раз (для причин заселения и т.п.)
-
-    # поля для сравнения с baseline
-    trend_importance_pp: Optional[float]    # дельта share_pct vs baseline (в п.п.)
-    trend_quality_diff: Optional[float]     # дельта avg_rating10 vs baseline (в баллах)
-
-
-def _calc_topic_aggregate(
-    df_period: pd.DataFrame,
-    df_total_reviews_in_period: pd.DataFrame,
-    group_cols: List[str],
-) -> pd.DataFrame:
-    """
-    Универсальная вспомогательная функция.
-
-    df_period: exploded topics, но уже отфильтрованный на интересующий период
-    df_total_reviews_in_period: просто df отзывов за период (после preprocess+annotate+enrich_time_keys)
-
-    group_cols: ["category","category_display"] или
-                ["category","category_display","subtopic","subtopic_display"]
-
-    Возвращает агрегацию по этим ключам с полями:
-    - mentions
-    - share_pct
-    - avg_rating10
-    - neg_share_pct
-    - aspects_counter (dict)
-    """
-    if df_period.empty:
-        # вернём пустой df с ожидаемыми колонками
-        cols = group_cols + ["mentions","share_pct","avg_rating10","neg_share_pct","aspects_counter"]
-        return pd.DataFrame(columns=cols)
-
-    # Сколько всего отзывов в периоде (не строк в df_period, а реальных отзывов)
-    total_reviews = df_total_reviews_in_period["idx"].nunique()
-
-    # Группируем по теме
-    grp = df_period.groupby(group_cols, dropna=False)
-
-    out_rows = []
-    for gkey, subdf in grp:
-        # gkey может быть либо str, либо tuple
-        if not isinstance(gkey, tuple):
-            gkey = (gkey,)
-
-        # сколько отзывов упомянули эту тему (уникальных idx)
-        mentions = subdf["idx"].nunique()
-
-        # доля отзывов периода, где эта тема всплыла
-        share_pct = (mentions / total_reviews * 100.0) if total_reviews > 0 else 0.0
-
-        # средняя оценка среди отзывов, где тема упомянута
-        avg_rating10 = subdf.drop_duplicates("idx")["rating10"].astype(float).replace({None: np.nan}).mean()
-        if math.isnan(avg_rating10):
-            avg_rating10 = None
-
-        # негативные упоминания подтемы:
-        # считаем долю подстрок, где subtopic_sentiment == "neg"
-        neg_mentions = (subdf["subtopic_sentiment"] == "neg").sum()
-        total_mentions = len(subdf)
-        neg_share_pct = (neg_mentions / total_mentions * 100.0) if total_mentions else 0.0
-
-        # собрать аспекты влияния
-        all_aspects = []
-        for arr in subdf["aspects"]:
-            if isinstance(arr, list):
-                all_aspects.extend(arr)
-        # посчитаем сколько каких аспектов
-        aspects_counter = {}
-        for a in all_aspects:
-            aspects_counter[a] = aspects_counter.get(a, 0) + 1
-
-        out_row = dict(zip(group_cols, gkey))
-        out_row.update({
-            "mentions": mentions,
-            "share_pct": share_pct,
-            "avg_rating10": avg_rating10,
-            "neg_share_pct": neg_share_pct,
-            "aspects_counter": aspects_counter,
-        })
-        out_rows.append(out_row)
-
-    res = pd.DataFrame(out_rows)
-    return res
-
-
-def aggregate_period_topics(
-    df_reviews: pd.DataFrame,
-    df_topics_exploded: pd.DataFrame,
-    period_filter: pd.Series,
-    period_level: str,
-) -> Dict[str, pd.DataFrame]:
-    """
-    Строит агрегаты по категориям и подтемам для выбранного периода.
-
-    Вход:
-      df_reviews          - датафрейм отзывов после preprocess+annotate+enrich_time_keys,
-                            со столбцами (idx,date,rating10,week_key,...,topics)
-      df_topics_exploded  - explode_topics(df_reviews)
-      period_filter       - булева маска по df_reviews (True = отзыв входит в период)
-      period_level        - строка-индикатор для отладки, типа "week" / "month" / "year"
-
-    Выход:
-      {
-        "by_category": DataFrame[
-           category, category_display,
-           mentions, share_pct, avg_rating10, neg_share_pct, aspects_counter
-        ],
-        "by_subtopic": DataFrame[
-           category, category_display, subtopic, subtopic_display,
-           mentions, share_pct, avg_rating10, neg_share_pct, aspects_counter
-        ],
-        "total_reviews": int
-      }
-
-    """
-    # Оставляем только нужные отзывы
-    df_rev_period = df_reviews[period_filter].copy()
-    if df_rev_period.empty:
-        return {
-            "by_category": pd.DataFrame(columns=[
-                "category","category_display",
-                "mentions","share_pct","avg_rating10","neg_share_pct","aspects_counter"
-            ]),
-            "by_subtopic": pd.DataFrame(columns=[
-                "category","category_display","subtopic","subtopic_display",
-                "mentions","share_pct","avg_rating10","neg_share_pct","aspects_counter"
-            ]),
-            "total_reviews": 0,
-        }
-
-    idx_set = set(df_rev_period.index.tolist())
-
-    # отфильтруем explode по тем же отзывам
-    df_topics_period = df_topics_exploded[df_topics_exploded["idx"].isin(idx_set)].copy()
-
-    # агрегат по категориям
-    by_cat = _calc_topic_aggregate(
-        df_topics_period,
-        df_rev_period.reset_index(names="idx"),
-        ["category","category_display"],
-    )
-
-    # агрегат по подтемам
-    by_sub = _calc_topic_aggregate(
-        df_topics_period,
-        df_rev_period.reset_index(names="idx"),
-        ["category","category_display","subtopic","subtopic_display"],
-    )
-
-    return {
-        "by_category": by_cat,
-        "by_subtopic": by_sub,
-        "total_reviews": df_rev_period["idx"].nunique(),
-    }
-
-
-###############################################################################
-# 9. Базовая линия (baseline) по последним N неделям
-###############################################################################
-
-def get_recent_weeks_baseline(
-    df_reviews: pd.DataFrame,
-    df_topics_exploded: pd.DataFrame,
-    current_week_key: str,
-    n_weeks: int = 8,
-) -> Dict[str, pd.DataFrame]:
-    """
-    Строим baseline по последним n_weeks ПОЛНЫХ недель ДО текущей недели.
-    То есть если текущая неделя = 2025-W42,
-    то baseline = [W34..W41] (8 предыдущих).
-
-    Мы считаем ту же агрегацию по категориям и подтемам, но усредняем
-    доли/оценки по этим неделям.
-
-    Результат:
-      {
-        "by_category": DataFrame[
-            category, category_display,
-            base_share_pct, base_avg_rating10
-        ],
-        "by_subtopic": DataFrame[
-            category, category_display, subtopic, subtopic_display,
-            base_share_pct, base_avg_rating10
-        ]
-      }
-    """
-
-    # 1. Определим список предыдущих недель
-    #    Преобразуем week_key вида "2025-W42" в (year, week_int)
-    def parse_week_key(wk: str) -> Tuple[int,int]:
-        # "2025-W42" -> (2025,42)
-        m = re.match(r"(\d{4})-W(\d{2})$", wk)
-        if not m:
-            return (0,0)
-        return (int(m.group(1)), int(m.group(2)))
-
-    cur_y, cur_w = parse_week_key(current_week_key)
-    if cur_y == 0:
-        # нет валидной недели -> пусто
-        return {
-            "by_category": pd.DataFrame(columns=[
-                "category","category_display","base_share_pct","base_avg_rating10"
-            ]),
-            "by_subtopic": pd.DataFrame(columns=[
-                "category","category_display","subtopic","subtopic_display",
-                "base_share_pct","base_avg_rating10"
-            ])
-        }
-
-    # Генерируем список n_weeks предыдущих ключей.
-    # Учитываем переход года назад (W01 предыдущего года и т.д.).
-    prev_weeks = []
-    y, w = cur_y, cur_w
-    for _ in range(n_weeks):
-        # шаг назад на неделю
-        w -= 1
-        if w <= 0:
-            y -= 1
-            # сколько недель в том годе? ISO: обычно 52 или 53
-            # небольшая утилита:
-            last_week = pd.Timestamp(f"{y}-12-28").isocalendar().week
-            w = last_week
-        prev_weeks.append(f"{y}-W{w:02d}")
-
-    # теперь фильтруем df_reviews по этим неделям
-    mask_baseline = df_reviews["week_key"].isin(prev_weeks)
-    df_reviews_base = df_reviews[mask_baseline].copy()
-
-    if df_reviews_base.empty:
-        return {
-            "by_category": pd.DataFrame(columns=[
-                "category","category_display","base_share_pct","base_avg_rating10"
-            ]),
-            "by_subtopic": pd.DataFrame(columns=[
-                "category","category_display","subtopic","subtopic_display",
-                "base_share_pct","base_avg_rating10"
-            ])
-        }
-
-    df_topics_base = df_topics_exploded[df_topics_exploded["week_key"].isin(prev_weeks)].copy()
-
-    # baseline мы считаем так:
-    #   для каждой недели считаем агрегацию категорий и подтем,
-    #   потом усредняем эти метрики по неделям.
-    #
-    # То есть мы не просто свалили все недели в одну кучу (иначе 1 огромная неделя убьёт структуру),
-    # а усреднили по неделям, чтобы получить "типичную неделю".
-
-    def agg_one_week(week_id: str):
-        mask_w = df_reviews["week_key"] == week_id
-        return aggregate_period_topics(
-            df_reviews=df_reviews,
-            df_topics_exploded=df_topics_exploded,
-            period_filter=mask_w,
-            period_level="week",
-        )
-
-    per_week_cats = []
-    per_week_subs = []
-
-    for wk in prev_weeks:
-        wk_res = agg_one_week(wk)
-        cat_df = wk_res["by_category"].copy()
-        cat_df["week_key"] = wk
-        per_week_cats.append(cat_df)
-
-        sub_df = wk_res["by_subtopic"].copy()
-        sub_df["week_key"] = wk
-        per_week_subs.append(sub_df)
-
-    if per_week_cats:
-        cats_all = pd.concat(per_week_cats, ignore_index=True)
-    else:
-        cats_all = pd.DataFrame(columns=[
-            "category","category_display",
-            "mentions","share_pct","avg_rating10","neg_share_pct","aspects_counter","week_key"
-        ])
-
-    if per_week_subs:
-        subs_all = pd.concat(per_week_subs, ignore_index=True)
-    else:
-        subs_all = pd.DataFrame(columns=[
-            "category","category_display","subtopic","subtopic_display",
-            "mentions","share_pct","avg_rating10","neg_share_pct","aspects_counter","week_key"
-        ])
-
-    # усредняем по неделям (groupby category / subtopic)
-    def avg_over_weeks(df_in: pd.DataFrame, group_cols: List[str]) -> pd.DataFrame:
-        if df_in.empty:
-            cols = group_cols + ["base_share_pct","base_avg_rating10"]
-            return pd.DataFrame(columns=cols)
-
-        # среднее share_pct по неделям и среднее avg_rating10 по неделям
-        grouped = df_in.groupby(group_cols, dropna=False).agg({
-            "share_pct": "mean",
-            "avg_rating10": "mean",
-        }).reset_index()
-
-        grouped = grouped.rename(columns={
-            "share_pct": "base_share_pct",
-            "avg_rating10": "base_avg_rating10",
-        })
-        return grouped
-
-    base_cat = avg_over_weeks(
-        cats_all,
-        ["category","category_display"],
-    )
-
-    base_sub = avg_over_weeks(
-        subs_all,
-        ["category","category_display","subtopic","subtopic_display"],
-    )
-
-    return {
-        "by_category": base_cat,
-        "by_subtopic": base_sub,
-    }
-
-
-###############################################################################
-# 10. Обогащение текущей недели baseline-метриками
-###############################################################################
-
-def merge_with_baseline(
-    cur_df: pd.DataFrame,
-    base_df: pd.DataFrame,
-    key_cols: List[str],
-) -> pd.DataFrame:
-    """
-    Присоединяет baseline к текущей агрегации,
-    и считает тренды:
-      trend_importance_pp = share_pct - base_share_pct
-      trend_quality_diff  = avg_rating10 - base_avg_rating10
-    """
-    if cur_df.empty:
-        cols = key_cols + [
-            "mentions","share_pct","avg_rating10","neg_share_pct","aspects_counter",
-            "base_share_pct","base_avg_rating10",
-            "trend_importance_pp","trend_quality_diff",
-        ]
-        return pd.DataFrame(columns=cols)
-
-    out = cur_df.merge(
-        base_df,
-        how="left",
-        on=key_cols,
-        suffixes=("", "_base")
-    )
-
-    out["trend_importance_pp"] = out["share_pct"] - out["base_share_pct"]
-    out["trend_quality_diff"] = out["avg_rating10"] - out["base_avg_rating10"]
-
-    return out
-
-
-###############################################################################
-# 11. Главный хелпер для периода с baseline
-###############################################################################
-
-def build_period_analysis(
-    df_reviews: pd.DataFrame,
-    df_topics_exploded: pd.DataFrame,
-    period_filter: pd.Series,
-    period_level: str,
-    current_week_key: str,
-    baseline_dict: Dict[str, pd.DataFrame],
-) -> Dict[str, Any]:
-    """
-    Возвращает полную картину по периоду:
-      - агрегаты категорий и подтем за период
-      - baseline-сравнение (только для недели — но мы можем применять и к другим периодам при желании)
-      - общее число отзывов
-
-    Структура результата:
-      {
-        "total_reviews": int,
-        "by_category": DataFrame[
-            category, category_display,
-            mentions, share_pct, avg_rating10, neg_share_pct, aspects_counter,
-            base_share_pct, base_avg_rating10,
-            trend_importance_pp, trend_quality_diff
-        ],
-        "by_subtopic": DataFrame[
-            ... то же самое но с subtopic ...
-        ]
-      }
-
-    Пояснение:
-    - Для недельного периода мы будем заполнять baseline
-    - Для месяца/квартала/года baseline можем не присоединять,
-      или присоединить ту же baseline (это допустимо, но не критично в тексте).
-    """
-    # 1. Агрегация по периоду
-    agg_dict = aggregate_period_topics(
-        df_reviews=df_reviews,
-        df_topics_exploded=df_topics_exploded,
-        period_filter=period_filter,
-        period_level=period_level,
-    )
-
-    by_cat_cur = agg_dict["by_category"]
-    by_sub_cur = agg_dict["by_subtopic"]
-    total_reviews = agg_dict["total_reviews"]
-
-    # 2. Склеиваем baseline с текущей метрикой,
-    #    чтобы получить тренды (importances / quality diffs).
-    # baseline_dict:
-    #   {
-    #     "by_category": ...,
-    #     "by_subtopic": ...
-    #   }
-    #
-    # Если baseline пустой (например, первая неделя сбора данных),
-    # merge_with_baseline аккуратно отдаст NaN -> trend_importance_pp/quality_diff станут NaN.
-    by_cat_full = merge_with_baseline(
-        by_cat_cur,
-        baseline_dict.get("by_category", pd.DataFrame()),
-        ["category","category_display"],
-    )
-
-    by_sub_full = merge_with_baseline(
-        by_sub_cur,
-        baseline_dict.get("by_subtopic", pd.DataFrame()),
-        ["category","category_display","subtopic","subtopic_display"],
-    )
-
-    return {
-        "total_reviews": total_reviews,
-        "by_category": by_cat_full,
-        "by_subtopic": by_sub_full,
-    }
-
-
-###############################################################################
-# 12. Обёртка: готовим все периоды разом
-###############################################################################
-
-def prepare_all_period_summaries(
-    df_raw_reviews: pd.DataFrame,
-) -> Dict[str, Any]:
-    """
-    Главная точка входа для weekly_report_agent в будущем.
-
-    На вход:
-      df_raw_reviews — это исходный датафрейм с колонками выгрузки
-      (Дата, Рейтинг, Источник, Код языка, Текст отзыва, ...)
-
-    Шаги:
-      1. preprocess_reviews_df -> нормализация текста, оценок, языка
-      2. enrich_time_keys -> добавляем week_key, month_key, quarter_key, year_key
-      3. annotate_topics -> вытягиваем topics (List[TopicHit]) по каждой строке
-      4. explode_topics -> раздуваем по подтемам
-      5. считаем baseline по последним 8 неделям
-      6. для пяти периодов строим сводки:
-         - this_week        (по текущей неделе = последняя неделя в данных)
-         - month_to_date    (все отзывы с начала месяца этого конца недели)
-         - quarter_to_date
-         - year_to_date
-         - all_time         (всё)
-
-    Возвращаем структуру:
-      {
-        "ref": {
-            "week_key": ...,
-            "week_range": (start_date, end_date),
-            "month_label": "Октябрь 2025 г.",
-            "quarter_label": "IV кв. 2025 г.",
-            "year_label": "2025 г.",
-            "alltime_label": "Итого",
-        },
-        "this_week": { ... build_period_analysis(...) ... },
-        "mtd":       { ... },
-        "qtd":       { ... },
-        "ytd":       { ... },
-        "alltime":   { ... },
-        "df_reviews": df_reviews,               # нормализованный df
-        "df_topics_exploded": df_topics_exploded
-      }
-
-    ВАЖНО:
-    - Здесь мы не делаем HTML и не пишем письмо.
-    - Это чистый аналитический слой, чтобы агент мог красиво отрисовать.
-    """
-
-    # 1. preprocess
-    df_reviews = preprocess_reviews_df(df_raw_reviews)
-
-    # индексация для дальнейшего удобства (уникальный idx)
-    df_reviews = df_reviews.reset_index(drop=True)
-    df_reviews["idx"] = df_reviews.index
-
-    # 2. time keys
-    df_reviews = enrich_time_keys(df_reviews)
-
-    # 3. topics
-    df_reviews = annotate_topics(df_reviews)
-
-    # 4. explode
-    df_topics_exploded = explode_topics(df_reviews)
-
-    if df_reviews.empty:
-        # Пустые данные — вернём заготовку
-        return {
-            "ref": {},
-            "this_week": {},
-            "mtd": {},
-            "qtd": {},
-            "ytd": {},
-            "alltime": {},
-            "df_reviews": df_reviews,
-            "df_topics_exploded": df_topics_exploded,
-        }
-
-    # Опорная "текущая неделя" — это последняя неделя, которая есть в данных.
-    # Берем по максимальной дате.
-    last_date = df_reviews["date"].max()
-    cur_week_key = iso_year_week(last_date)
-    cur_month_key = last_date.strftime("%Y-%m")          # "2025-10"
-    cur_year_key = last_date.strftime("%Y")              # "2025"
-    cur_quarter_key = f"{last_date.year}-{quarter_label(last_date)}"
-
-    # Границы недели (понедельник-воскресенье) по last_date
-    # NOTE: pandas weekday(): Monday=0, Sunday=6
-    wd = last_date.weekday()
-    week_start = (last_date - pd.Timedelta(days=wd)).normalize()
-    week_end = (week_start + pd.Timedelta(days=6)).normalize()
-
-    # Аналогично month-start
-    month_start = last_date.replace(day=1).normalize()
-    # quarter-start
-    q = (last_date.month - 1)//3 + 1
-    q_start_month = 3*(q-1)+1
-    quarter_start = last_date.replace(month=q_start_month, day=1).normalize()
-    # year-start
-    year_start = last_date.replace(month=1, day=1).normalize()
-
-    # Метки для подписи периодов в письме
-    # Неделя: "13–19 окт 2025 г."
-    # Месяц: "Октябрь 2025 г."
-    # Квартал: "IV кв. 2025 г."
-    # Год: "2025 г."
-    # Итого: "Итого"
-    MONTH_NAMES_RU = {
-        1:"январь",2:"февраль",3:"март",4:"апрель",5:"май",6:"июнь",
-        7:"июль",8:"август",9:"сентябрь",10:"октябрь",11:"ноябрь",12:"декабрь"
-    }
-    MONTH_NAMES_RU_GEN = {
-        1:"января",2:"февраля",3:"марта",4:"апреля",5:"мая",6:"июня",
-        7:"июля",8:"августа",9:"сентября",10:"октября",11:"ноября",12:"декабря"
-    }
-    # квартал в человекочитаемой форме
-    QUARTER_NAME_RU = {
-        1:"I кв.", 2:"II кв.", 3:"III кв.", 4:"IV кв."
-    }
-
-    # Неделя: "13–19 окт 2025 г."
-    def format_week_range(d1: pd.Timestamp, d2: pd.Timestamp) -> str:
-        # пример: 13–19 окт 2025 г.
-        # берём день начала, день конца, месяц конца в родительном ("октября") и год
-        m = MONTH_NAMES_RU_GEN[d2.month]
-        return f"{d1.day}–{d2.day} {m} {d2.year} г."
-
-    # Месяц: "Октябрь 2025 г."
-    def format_month_label(d: pd.Timestamp) -> str:
-        m = MONTH_NAMES_RU[d.month].capitalize()
-        return f"{m} {d.year} г."
-
-    # Квартал: "IV кв. 2025 г."
-    def format_quarter_label(d: pd.Timestamp) -> str:
-        qq = (d.month - 1)//3 + 1
-        return f"{QUARTER_NAME_RU[qq]} {d.year} г."
-
-    # Год: "2025 г."
-    def format_year_label(d: pd.Timestamp) -> str:
-        return f"{d.year} г."
-
-    # 5. baseline: последние 8 недель ДО текущей
-    baseline = get_recent_weeks_baseline(
-        df_reviews=df_reviews,
-        df_topics_exploded=df_topics_exploded,
-        current_week_key=cur_week_key,
-        n_weeks=8,
-    )
-
-    # 6. Создаём маски для периодов
-
-    # Текущая неделя = все отзывы с week_key == cur_week_key
-    mask_week = (df_reviews["week_key"] == cur_week_key)
-
-    # Месяц-to-date = с month_start по last_date
-    mask_mtd = (df_reviews["date"] >= month_start) & (df_reviews["date"] <= last_date)
-
-    # Квартал-to-date
-    mask_qtd = (df_reviews["date"] >= quarter_start) & (df_reviews["date"] <= last_date)
-
-    # Год-to-date
-    mask_ytd = (df_reviews["date"] >= year_start) & (df_reviews["date"] <= last_date)
-
-    # Вся история
-    mask_all = pd.Series(True, index=df_reviews.index)
-
-    # 7. Сводки по периодам
-    this_week = build_period_analysis(
-        df_reviews=df_reviews,
-        df_topics_exploded=df_topics_exploded,
-        period_filter=mask_week,
-        period_level="week",
-        current_week_key=cur_week_key,
-        baseline_dict=baseline,
-    )
-    mtd = build_period_analysis(
-        df_reviews=df_reviews,
-        df_topics_exploded=df_topics_exploded,
-        period_filter=mask_mtd,
-        period_level="mtd",
-        current_week_key=cur_week_key,
-        baseline_dict=baseline,
-    )
-    qtd = build_period_analysis(
-        df_reviews=df_reviews,
-        df_topics_exploded=df_topics_exploded,
-        period_filter=mask_qtd,
-        period_level="qtd",
-        current_week_key=cur_week_key,
-        baseline_dict=baseline,
-    )
-    ytd = build_period_analysis(
-        df_reviews=df_reviews,
-        df_topics_exploded=df_topics_exploded,
-        period_filter=mask_ytd,
-        period_level="ytd",
-        current_week_key=cur_week_key,
-        baseline_dict=baseline,
-    )
-    alltime = build_period_analysis(
-        df_reviews=df_reviews,
-        df_topics_exploded=df_topics_exploded,
-        period_filter=mask_all,
-        period_level="alltime",
-        current_week_key=cur_week_key,
-        baseline_dict=baseline,
-    )
-
-    result = {
-        "ref": {
-            "week_key": cur_week_key,
-            "week_range": (week_start, week_end),
-            "week_label": f"Итоги недели {format_week_range(week_start, week_end)}",
-            "month_label": format_month_label(last_date),
-            "quarter_label": format_quarter_label(last_date),
-            "year_label": format_year_label(last_date),
-            "alltime_label": "Итого",
-
-            # Эти метки пойдут потом во врезки текста
-            "week_start": week_start,
-            "week_end": week_end,
-            "month_start": month_start,
-            "quarter_start": quarter_start,
-            "year_start": year_start,
-            "last_date": last_date,
-        },
-        "this_week": this_week,
-        "mtd": mtd,
-        "qtd": qtd,
-        "ytd": ytd,
-        "alltime": alltime,
-        "df_reviews": df_reviews,
-        "df_topics_exploded": df_topics_exploded,
-    }
-
-    return result
-
-###############################################################################
-# 13. Форматирование чисел для отчёта
-###############################################################################
-
-def fmt_score(v: Optional[float]) -> str:
-    """
-    Возвращает строку с округлением до десятых или '—', если нет данных.
-    Пример: 9.06 -> '9.1'
-    """
-    if v is None or (isinstance(v, float) and math.isnan(v)):
-        return "—"
-    try:
-        return f"{float(v):.1f}"
-    except Exception:
-        return "—"
-
-def fmt_pct(v: Optional[float]) -> str:
-    """
-    Округляет до десятых и добавляет %.
-    12.345 -> '12.3 %'
-    """
-    if v is None or (isinstance(v, float) and math.isnan(v)):
-        return "—"
-    try:
-        return f"{float(v):.1f} %"
-    except Exception:
-        return "—"
-
-def safe_get(series: pd.Series, default=None):
-    """
-    Утилита, чтобы безопасно доставать значения из Series.loc[...] без KeyError.
-    """
-    try:
-        return series.iloc[0]
-    except Exception:
-        return default
-###############################################################################
-# 14. Выбор "ключевых" тем недели и формирование отклонений
-###############################################################################
-
-def pick_key_topics_for_week(
-    by_cat_week: pd.DataFrame,
-    by_sub_week: pd.DataFrame,
-    min_mentions: int = 2,
-    quality_drop_thr: float = -0.3,
-    quality_rise_thr: float = 0.3,
-    importance_rise_thr_pp: float = 5.0,
-    importance_fall_thr_pp: float = -10.0,
-) -> Dict[str, Any]:
-    """
-    Анализирует сводку текущей недели (by_category и by_subtopic)
-    и выбирает:
-    - темы, которые просели по качеству
-    - темы, которые выросли по качеству
-    - темы, которые резко чаще упоминаются (гостей волнует)
-    - темы, которые сейчас почти не волнуют (молчание)
-    
-    Возвращает словарь с полями:
-      {
-        "weaker": [ { "name": "...", "delta_quality": -0.4 }, ... ],
-        "stronger": [ { "name": "...", "delta_quality": +0.5 }, ... ],
-        "hot_attention": [ { "name": "...", "delta_importance_pp": +7.5 }, ... ],
-        "calm_down": [ { "name": "...", "delta_importance_pp": -12.0 }, ... ]
-      }
-
-    Здесь "name" — человекочитаемое имя (category_display).
-    """
-    weaker = []
-    stronger = []
-    hot_attention = []
-    calm_down = []
-
-    # Мы смотрим на уровень КАТЕГОРИЙ, потому что это управленческий уровень.
-    dfc = by_cat_week.copy()
-
-    if dfc.empty:
-        return {
-            "weaker": weaker,
-            "stronger": stronger,
-            "hot_attention": hot_attention,
-            "calm_down": calm_down,
-        }
-
-    # оставим только значимые темы
-    dfc = dfc[dfc["mentions"] >= min_mentions].copy()
-
-    for _, row in dfc.iterrows():
-        name = row["category_display"]
-        dq = row.get("trend_quality_diff", np.nan)
-        di = row.get("trend_importance_pp", np.nan)
-        neg_share = row.get("neg_share_pct", 0.0)
-
-        # просадка качества
-        if not pd.isna(dq) and dq <= quality_drop_thr:
-            weaker.append({
-                "name": name,
-                "delta_quality": dq,
-            })
-
-        # рост качества
-        if not pd.isna(dq) and dq >= quality_rise_thr:
-            stronger.append({
-                "name": name,
-                "delta_quality": dq,
-            })
-
-        # рост важности темы (гостей волнует чаще обычного).
-        # Если важность растёт и при этом негатив высокий — это "горит".
-        if not pd.isna(di) and di >= importance_rise_thr_pp:
-            hot_attention.append({
-                "name": name,
-                "delta_importance_pp": di,
-                "neg_share_pct": neg_share,
-            })
-
-        # падение важности темы + нет негатива -> спокойная зона.
-        if (
-            not pd.isna(di)
-            and di <= importance_fall_thr_pp
-            and (neg_share is not None)
-            and (neg_share < 10.0)  # низкий негатив
-        ):
-            calm_down.append({
-                "name": name,
-                "delta_importance_pp": di,
-            })
-
-    return {
-        "weaker": weaker,
-        "stronger": stronger,
-        "hot_attention": hot_attention,
-        "calm_down": calm_down,
-    }
-###############################################################################
-# 15. Анализ причинно-следственных связей
-###############################################################################
-
-import itertools
-import math
-import pandas as pd
-from typing import Dict, Any, List, Tuple
-
-
-def build_cooccurrence_pairs(
-    df_exploded: pd.DataFrame,
-    period_key_col: str,
-    current_period_key: str,
-    min_pair_reviews: int = 2,
-    min_pair_share: float = 0.05,
-) -> pd.DataFrame:
-    """
-    Строит ко-упоминания аспектов (пары аспектов, которые часто встречаются вместе в одном отзыве)
-    за конкретный период.
-
-    df_exploded: DataFrame со столбцами:
-        - review_id: str / int
-        - aspect_code: str
-        - sentiment: {'pos','neg','neu'}
-        - {period_key_col}: например 'week_key', 'month_key', ...
-
-    period_key_col: имя столбца с ключом периода ('week_key' и т.д.)
-    current_period_key: значение периода (например '2025-W42' или '2025-10')
-    min_pair_reviews: минимальное число уникальных отзывов,
-                      в которых пара встретилась, чтобы считать её значимой
-    min_pair_share: минимальная доля от общего числа отзывов периода,
-                    в которых эта пара встретилась (например, 0.05 = 5%)
-
-    Возвращает DataFrame с колонками:
-        left_aspect
-        right_aspect
-        pair_reviews         — в скольких отзывах встречалась такая пара
-        pair_share           — доля отзывов периода, где пара упомянута
-        left_sentiment_neg_share / _pos_share — характер левой темы
-        right_sentiment_neg_share / _pos_share — характер правой темы
-    """
-
-    # ограничиваемся текущим периодом
-    cur = df_exploded[df_exploded[period_key_col] == current_period_key].copy()
-
-    # собираем для каждого review_id список аспектов, уникальных внутри этого отзыва
-    review_aspects = (
-        cur.groupby("review_id")["aspect_code"]
-           .apply(lambda s: sorted(set(s)))
-           .reset_index()
-    )
-
-    # считаем общее число отзывов в периоде
-    total_reviews_period = review_aspects["review_id"].nunique()
-    if total_reviews_period == 0:
-        return pd.DataFrame(columns=[
-            "left_aspect", "right_aspect",
-            "pair_reviews", "pair_share",
-            "left_sentiment_pos_share", "left_sentiment_neg_share",
-            "right_sentiment_pos_share", "right_sentiment_neg_share",
-        ])
-
-    # генерим пары аспектов внутри каждого отзыва
-    # пример: ['no_hot_water','overpriced','hard_to_find_entrance']
-    #   -> ('no_hot_water','overpriced'), ('no_hot_water','hard_to_find_entrance'), ...
-    pairs_list: List[Tuple[str, str]] = []
-    for _, row in review_aspects.iterrows():
-        aspects_for_review = row["aspect_code"]
-        if len(aspects_for_review) < 2:
-            continue
-        for a, b in itertools.combinations(aspects_for_review, 2):
-            left, right = sorted((a, b))
-            pairs_list.append((left, right))
-
-    if not pairs_list:
-        return pd.DataFrame(columns=[
-            "left_aspect", "right_aspect",
-            "pair_reviews", "pair_share",
-            "left_sentiment_pos_share", "left_sentiment_neg_share",
-            "right_sentiment_pos_share", "right_sentiment_neg_share",
-        ])
-
-    pairs_df = pd.DataFrame(pairs_list, columns=["left_aspect", "right_aspect"])
-
-    # сколько уникальных отзывов упоминали ту или иную пару
-    # нам нужно посчитать не количество строк в pairs_list,
-    # а количество review_id, где пара встречалась хотя бы раз.
-    # Для этого сначала построим mapping от review_id к сету пар:
-    review_pairs = []
-    for _, row in review_aspects.iterrows():
-        aspects_for_review = row["aspect_code"]
-        rid = row["review_id"]
-        for a, b in itertools.combinations(aspects_for_review, 2):
-            left, right = sorted((a, b))
-            review_pairs.append((rid, left, right))
-    review_pairs_df = pd.DataFrame(review_pairs, columns=["review_id", "left_aspect", "right_aspect"])
-
-    pair_reviews = (
-        review_pairs_df
-        .groupby(["left_aspect", "right_aspect"])["review_id"]
-        .nunique()
-        .reset_index(name="pair_reviews")
-    )
-
-    # добавляем долю отзывов
-    pair_reviews["pair_share"] = pair_reviews["pair_reviews"] / float(total_reviews_period)
-
-    # фильтруем только значимые по частоте связи
-    pair_reviews = pair_reviews[
-        (pair_reviews["pair_reviews"] >= min_pair_reviews) &
-        (pair_reviews["pair_share"]  >= min_pair_share)
-    ].copy()
-
-    if pair_reviews.empty:
-        return pair_reviews.assign(
-            left_sentiment_pos_share=pd.Series(dtype=float),
-            left_sentiment_neg_share=pd.Series(dtype=float),
-            right_sentiment_pos_share=pd.Series(dtype=float),
-            right_sentiment_neg_share=pd.Series(dtype=float),
-        )
-
-    # посчитаем характер каждой отдельной темы (аспекта)
-    # для этого соберём сводку по sentiment внутри периода
-    aspect_sent = (
-        cur.groupby(["aspect_code", "sentiment", "review_id"])
-           .size()
-           .reset_index()
-           .groupby(["aspect_code", "sentiment"])["review_id"]
-           .nunique()
-           .reset_index(name="mentions_reviews")
-    )
-
-    aspect_pivot = aspect_sent.pivot_table(
-        index="aspect_code",
-        columns="sentiment",
-        values="mentions_reviews",
-        fill_value=0,
-        aggfunc="sum",
-    ).rename(columns={
-        "pos": "mentions_pos",
-        "neg": "mentions_neg",
-        "neu": "mentions_neu"
-    })
-
-    aspect_pivot["total_mentions"] = (
-        aspect_pivot.get("mentions_pos", 0)
-        + aspect_pivot.get("mentions_neg", 0)
-        + aspect_pivot.get("mentions_neu", 0)
-    ).replace(0, 1)
-
-    aspect_pivot["pos_share"] = aspect_pivot["mentions_pos"] / aspect_pivot["total_mentions"]
-    aspect_pivot["neg_share"] = aspect_pivot["mentions_neg"] / aspect_pivot["total_mentions"]
-
-    aspect_pivot = aspect_pivot[["pos_share", "neg_share"]].reset_index()
-
-    # теперь присоединим эту сводку (для left/right отдельно)
-    pair_reviews = pair_reviews.merge(
-        aspect_pivot.add_prefix("left_").rename(columns={"left_aspect_code": "left_aspect", "left_index": "left_aspect"}),
-        on="left_aspect",
-        how="left"
-    )
-    pair_reviews = pair_reviews.merge(
-        aspect_pivot.add_prefix("right_").rename(columns={"right_aspect_code": "right_aspect", "right_index": "right_aspect"}),
-        on="right_aspect",
-        how="left"
-    )
-
-    # переименуем для наглядности
-    pair_reviews = pair_reviews.rename(columns={
-        "left_pos_share": "left_sentiment_pos_share",
-        "left_neg_share": "left_sentiment_neg_share",
-        "right_pos_share": "right_sentiment_pos_share",
-        "right_neg_share": "right_sentiment_neg_share",
-    })
-
-    # отсортируем по значимости (сначала самые частые связки)
-    pair_reviews = pair_reviews.sort_values(
-        by=["pair_reviews", "pair_share"],
-        ascending=[False, False],
-        ignore_index=True
-    )
-
-    return pair_reviews
-
-def classify_pair_tone(row: pd.Series) -> str:
-    """
-    row — строка из результата build_cooccurrence_pairs()
-    Возвращает:
-      "neg_cluster"     — обе стороны в основном негатив,
-      "pos_cluster"     — обе стороны в основном позитив,
-      "mixed_cluster"   — смешано (одна скорее негативная, другая скорее позитивная),
-      "unclear"
-    """
-    left_neg = row["left_sentiment_neg_share"]
-    right_neg = row["right_sentiment_neg_share"]
-    left_pos = row["left_sentiment_pos_share"]
-    right_pos = row["right_sentiment_pos_share"]
-
-    # считаем "негативной" если neg_share >= 0.5
-    left_is_neg = (left_neg >= 0.5)
-    right_is_neg = (right_neg >= 0.5)
-
-    # считаем "позитивной" если pos_share >= 0.5
-    left_is_pos = (left_pos >= 0.5)
-    right_is_pos = (right_pos >= 0.5)
-
-    if left_is_neg and right_is_neg:
-        return "neg_cluster"
-    if left_is_pos and right_is_pos:
-        return "pos_cluster"
-    if (left_is_neg and right_is_pos) or (left_is_pos and right_is_neg):
-        return "mixed_cluster"
-    return "unclear"
-
-
-def describe_top_pairs(
-    pairs_df: pd.DataFrame,
-    aspect_registry: Dict[str, Dict[str, Any]],
-    top_n: int = 5
-) -> Dict[str, List[str]]:
-    """
-    Превращает топ-связки (по важности) в текстовые тезисы для отчёта.
-
-    pairs_df — результат build_cooccurrence_pairs(), отсортированный по значимости.
-    aspect_registry — из build_aspect_registry(TOPIC_SCHEMA).
-    top_n — сколько связок максимум выводить в каждую категорию.
-
-    Возвращает словарь:
-    {
-        "neg_cluster": [
-            "...",
-            "..."
-        ],
-        "mixed_cluster": [
-            "...",
-        ],
-        "pos_cluster": [
-            "...",
-        ]
-    }
-    """
-
-    results = {
-        "neg_cluster": [],
-        "mixed_cluster": [],
-        "pos_cluster": [],
-    }
-
-    if pairs_df.empty:
-        return results
-
-    # Добавим колонку типа связки
-    df = pairs_df.copy()
-    df["cluster_type"] = df.apply(classify_pair_tone, axis=1)
-
-    # пройдёмся по строкам по значимости
-    for _, row in df.iterrows():
-        ctype = row["cluster_type"]
-        if ctype not in results:
-            continue
-
-        left_code = row["left_aspect"]
-        right_code = row["right_aspect"]
-
-        left_label  = aspect_registry.get(left_code,  {}).get("label", left_code)
-        right_label = aspect_registry.get(right_code, {}).get("label", right_code)
-
-        pair_reviews = row["pair_reviews"]
-        pair_share   = row["pair_share"]
-
-        # аккуратная человеческая формулировка
-        if ctype == "neg_cluster":
-            text = (
-                f"Часто одновременно жалуются на «{left_label}» и «{right_label}» — "
-                f"эту связку отметили примерно {pair_reviews} гост(я/ей), "
-                f"что составляет около {pair_share:.0%} всех отзывов за период. "
-                f"Это выглядит как системная зона риска."
-            )
-
-        elif ctype == "pos_cluster":
-            text = (
-                f"Гости часто одновременно хвалят «{left_label}» и «{right_label}». "
-                f"Эта позитивная связка упоминалась примерно в {pair_reviews} отзыв(ах), "
-                f"~{pair_share:.0%} от всех упоминаний недели. "
-                f"Это ядро сильных сторон, влияющее на лояльность."
-            )
-
-        elif ctype == "mixed_cluster":
-            text = (
-                f"Часто встречается контраст: положительно оценивают «{left_label}», "
-                f"но при этом жалуются на «{right_label}». "
-                f"Такой разрыв ожиданий отметили ~{pair_reviews} гост(я/ей), "
-                f"что около {pair_share:.0%} отзывов недели. "
-                f"Это критичная точка восприятия ценности."
-            )
-
-        else:
-            continue
-
-        # не пихаем бесконечно
-        if len(results[ctype]) < top_n:
-            results[ctype].append(text)
-
-    return results
-###############################################################################
-# 16. Формирование текстовых блоков для письма
-###############################################################################
-
-def summarize_overview_for_header(
-    ref_info: Dict[str, Any],
-    this_week: Dict[str, Any],
-    mtd: Dict[str, Any],
-    qtd: Dict[str, Any],
-    ytd: Dict[str, Any],
-    alltime: Dict[str, Any],
-) -> str:
-    """
-    Возвращает текстовый блок (HTML-параграфы) для шапки письма.
-    Он описывает текущую неделю и роль этой недели относительно месяца/квартала/года/итого.
-
+    Локальная тональность по конкретной подтеме.
     Логика:
-    - Число отзывов недели и средняя оценка недели.
-    - Доля позитива/негатива недели.
-    - Какой вклад эта неделя даёт в MTD/QTD/YTD (в процентах отзывов).
-    - Ничего про "/10" в тексте.
+    - Берём окна ±40 символов вокруг совпадений.
+    - В этих окнах применяем тот же приоритет, что и для общего sentiment.
+    Это даёт нам pos/neg/neu для аспекта.
     """
+    l = lang if lang in NEGATIVE_WORDS_STRONG else "en"
 
-    # полезные краткие метрики: средний рейтинг недели, доля позитива и негатива недели
-    def get_basic_week_stats(block: Dict[str, Any]) -> Dict[str, Any]:
-        df_by_cat = block["by_category"]
-        total_reviews = block["total_reviews"]
-
-        # средняя оценка недели в целом:
-        # просто среднее rating10 по всем отзывам периода
-        # (не только темам). Это нужно достать из df_reviews, но у нас
-        # здесь нет df_reviews. Поэтому чуть ниже мы отметим, что
-        # weekly_report_agent при финальной сборке должен передать эти числа явно.
-        #
-        # Для каркаса пока поставим None -> "—".
-        avg_rating_overall = None
-
-        # посчитаем % позитива / негатива по sentiment_overall,
-        # но это тоже требует df_reviews периода. Аналогично — агент может это посчитать
-        # и передать как параметры. Здесь формально оставим "—".
-        pos_pct = None
-        neg_pct = None
-
-        return {
-            "total_reviews": total_reviews,
-            "avg_rating_overall": avg_rating_overall,
-            "pos_pct": pos_pct,
-            "neg_pct": neg_pct,
-        }
-
-    wk_stats = get_basic_week_stats(this_week)
-
-    # вклад недели в larger periods (% отзывов)
-    def share_in(b_small: Dict[str,Any], b_big: Dict[str,Any]) -> Optional[float]:
-        num_small = b_small["total_reviews"]
-        num_big = b_big["total_reviews"]
-        if not num_big:
-            return None
-        return (num_small / num_big) * 100.0
-
-    share_in_mtd = share_in(this_week, mtd)
-    share_in_qtd = share_in(this_week, qtd)
-    share_in_ytd = share_in(this_week, ytd)
-    share_in_all = share_in(this_week, alltime)
-
-    # формируем фразы
-    # Пример тона:
-    # "<b>Текущая неделя:</b> 14 отзывов, средняя оценка 9.1. Позитивные упоминания — 78.6 %, негативные — 7.1 %."
-    # "Эта неделя дала около 62 % всех отзывов за месяц и идёт на уровне общего тона месяца."
-    p_week = (
-        "<p>"
-        f"<b>Текущая неделя:</b> {wk_stats['total_reviews']} отзыв(ов). "
-        f"Средняя оценка — {fmt_score(wk_stats['avg_rating_overall'])}. "
-        f"Позитивные упоминания — {fmt_pct(wk_stats['pos_pct'])}, "
-        f"негативные — {fmt_pct(wk_stats['neg_pct'])}."
-        "</p>"
+    # собрать окна по всем regex этой подтемы
+    windows: List[str] = []
+    pats = (
+        subtopic_patterns.get(lang, []) or
+        subtopic_patterns.get("ru", []) or
+        subtopic_patterns.get("en", []) or
+        []
     )
+    for pat in pats:
+        for m in re.finditer(pat, text_ru, flags=re.IGNORECASE):
+            s, e = m.span()
+            windows.append(text_ru[max(0, s-40): min(len(text_ru), e+40)])
+    if not windows:
+        windows = [text_ru]
 
-    # второе предложение: вклад недели
-    parts_role = []
-    if share_in_mtd is not None:
-        parts_role.append(
-            f"Эта неделя дала примерно {fmt_pct(share_in_mtd)[:-2]} всех отзывов за месяц"
-        )
-    if share_in_qtd is not None:
-        parts_role.append(
-            f"{fmt_pct(share_in_qtd)[:-2]} за квартал"
-        )
-    if share_in_ytd is not None:
-        parts_role.append(
-            f"{fmt_pct(share_in_ytd)[:-2]} за год"
-        )
-    if share_in_all is not None:
-        parts_role.append(
-            f"{fmt_pct(share_in_all)[:-2]} за всю совокупность отзывов"
-        )
+    def any_match(lst: List[str], chunk: str) -> bool:
+        for rgx in lst:
+            if re.search(rgx, chunk, flags=re.IGNORECASE):
+                return True
+        return False
 
-    if parts_role:
-        role_sentence = (
-            "<p><b>Роль недели в общей статистике:</b> "
-            + "; ".join(parts_role)
-            + ".</p>"
-        )
-    else:
-        role_sentence = ""
+    # приоритет в каждом окне
+    for chunk in windows:
+        if any_match(NEGATIVE_WORDS_STRONG.get(l, [])): return "neg"
+        if any_match(POSITIVE_WORDS_STRONG.get(l, [])): return "pos"
+        if any_match(NEGATIVE_WORDS_SOFT.get(l, [])):   return "neg"
+        if any_match(POSITIVE_WORDS_SOFT.get(l, [])):   return "pos"
+        if any_match(NEUTRAL_WORDS.get(l, [])):         return "neu"
 
-    return p_week + role_sentence
+    return "neu"
 
 
-def summarize_trends_block(
-    by_cat_week: pd.DataFrame,
-    picked: Dict[str, Any],
-) -> str:
+# =========================
+# THEMES / ASPECTS
+# =========================
+
+def extract_aspects_and_pairs(text_ru: str, lang: str) -> Tuple[List[str], List[str], List[str], List[Dict[str, str]]]:
     """
-    Формирует текст блока "Динамика и вклад текущей недели":
-    - ниже исторического уровня,
-    - выше исторического уровня,
-    - что особенно волнует гостей,
-    - что сейчас не вызывает жалоб.
-    
-    Формат:
-    <h3>Динамика и вклад текущей недели</h3>
-    <p><b>Существенные отклонения этой недели по темам:</b><br>
-    <span style="color:#c0392b;"><b>Ниже исторического уровня</b></span> — ...<br>
-    <span style="color:#2e8b57;"><b>Выше исторического уровня</b></span> — ...<br>
-    ...
-    </p>
+    Используем TOPIC_SCHEMA:
+    - пробегаемся по категориям -> по подтемам
+    - если подтема упомянута: определяем локальную тональность этой подтемы
+    - аспект = aspects[0] из словаря
+    Возвращаем:
+      topics_all [str],
+      topics_pos [str],
+      topics_neg [str],
+      pair_tags = [{a,b,cat}, ...]  # cat пригодится для B4
     """
+    topics_all: List[str] = []
+    topics_pos: List[str] = []
+    topics_neg: List[str] = []
 
-    weaker_lines = []
-    for w in picked["weaker"]:
-        delta_q = fmt_score(w["delta_quality"])
-        # delta_q уже со знаком (напр. -0.4), fmt_score оставит минус
-        weaker_lines.append(f"«{w['name']}» ({delta_q})")
-
-    stronger_lines = []
-    for s in picked["stronger"]:
-        delta_q = fmt_score(s["delta_quality"])
-        stronger_lines.append(f"«{s['name']}» (+{delta_q.lstrip('-')})")
-
-    hot_lines = []
-    for h in picked["hot_attention"]:
-        di = fmt_score(h["delta_importance_pp"])  # рост важности, в п.п.
-        # fmt_score не добавляет %, добавим позже текстом
-        hot_lines.append(
-            f"«{h['name']}» (+{di.lstrip('-')} п.п. к типичной частоте обсуждения)"
-        )
-
-    calm_lines = []
-    for c in picked["calm_down"]:
-        di = fmt_score(c["delta_importance_pp"])
-        calm_lines.append(
-            f"«{c['name']}» (−{di.lstrip('-')} п.п. к обычной частоте, жалоб практически нет)"
-        )
-
-    # собираем абзац
-    lines = []
-
-    lines.append("<p><b>Существенные отклонения этой недели по темам:</b><br>")
-
-    # Ниже исторического уровня
-    if weaker_lines:
-        lines.append(
-            '<span style="color:#c0392b;"><b>Ниже исторического уровня</b></span> — '
-            + ", ".join(weaker_lines)
-            + ".<br>"
-        )
-
-    # Выше исторического уровня
-    if stronger_lines:
-        lines.append(
-            '<span style="color:#2e8b57;"><b>Выше исторического уровня</b></span> — '
-            + ", ".join(stronger_lines)
-            + ".<br>"
-        )
-
-    # Часто волнует
-    if hot_lines:
-        lines.append(
-            "<b>Особенно часто упоминалось</b> — "
-            + ", ".join(hot_lines)
-            + ".<br>"
-        )
-
-    # Спокойно
-    if calm_lines:
-        lines.append(
-            "Отдельно отметим спокойные зоны — "
-            + ", ".join(calm_lines)
-            + "."
-        )
-
-    lines.append("</p>")
-
-    return "\n".join(lines)
-
-
-def summarize_checkin_line(root_cause_text: Optional[str]) -> str:
-    """
-    Возвращает фразу о причинах заселения, если есть.
-    Если нет причин — возвращает "".
-    """
-    if not root_cause_text:
-        return ""
-    return (
-        "<p><b>Заселение и проживание.</b> "
-        + root_cause_text +
-        "</p>"
-    )
-def parse_date_to_datetime(date_raw: Any) -> datetime:
-    """
-    Унификация даты отзыва из XLS. Принимаем datetime, pandas.Timestamp или строку.
-    Возвращаем datetime без таймзоны.
-    """
-    if isinstance(date_raw, datetime):
-        return date_raw
-    try:
-        return pd.to_datetime(date_raw).to_pydatetime().replace(tzinfo=None)
-    except Exception:
-        # если совсем мусор — ставим сегодняшнюю дату
-        return datetime.utcnow().replace(tzinfo=None)
-
-
-def derive_period_keys(dt: datetime) -> Tuple[str, str, str, str]:
-    """
-    На базе даты делаем ключи периодов:
-    - неделя формата YYYY-W## (ISO неделя)
-    - месяц YYYY-MM
-    - квартал YYYY-Q#
-    - год YYYY
-    """
-    iso_year, iso_week, _ = dt.isocalendar()  # (год ISO, номер недели, день)
-    week_key = f"{iso_year}-W{iso_week:02d}"
-
-    month_key = f"{dt.year}-{dt.month:02d}"
-
-    quarter = (dt.month - 1) // 3 + 1
-    quarter_key = f"{dt.year}-Q{quarter}"
-
-    year_key = f"{dt.year}"
-
-    return week_key, month_key, quarter_key, year_key
-
-
-def build_review_id(dt: datetime, source: str, raw_text: str) -> str:
-    """
-    Делаем стабильный ID отзыва:
-    sha1(<yyyy-mm-dd>|<source>|<первые 200 символов текста>)
-    """
-    base = f"{dt.date().isoformat()}|{source}|{raw_text[:200]}"
-    return hashlib.sha1(base.encode("utf-8")).hexdigest()
-
-
-SENTENCE_SPLIT_RE = re.compile(r"[.!?…]+[\s\n]+")
-
-def extract_clean_quotes(text_clean: str) -> List[str]:
-    """
-    Берём 1-3 характерных предложения из текста отзыва
-    - уже без URL/e-mail/телефонов (normalize_text_basic это сделал)
-    - отбрасываем слишком короткие (<15 симв) и слишком длинные (>300 симв)
-    """
-    if not text_clean:
-        return []
-    # режем по предложениям
-    parts = SENTENCE_SPLIT_RE.split(text_clean)
-    quotes = []
-    for p in parts:
-        p2 = p.strip()
-        if 15 <= len(p2) <= 300:
-            quotes.append(p2)
-        if len(quotes) >= 3:
-            break
-    return quotes
-
-
-def build_semantic_row(review_raw: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Главная функция для backfill/weekly:
-    превращает одну сырую строку отзыва (как в XLS)
-    в нормализованную семантическую запись.
-
-    Ожидается, что review_raw содержит минимум:
-    - 'date'         -> дата отзыва (str/datetime)
-    - 'source'       -> источник (Booking/Google/...)
-    - 'rating_raw'   -> оригинальная оценка (строка/цифра)
-    - 'text'         -> текст отзыва
-    - 'lang_hint'    -> код языка источника (может быть None)
-    """
-
-    raw_text = review_raw.get("text", "") or ""
-    lang_hint = review_raw.get("lang_hint", "")
-
-    # язык
-    lang_norm = normalize_lang(lang_hint, raw_text)
-
-    # очистили текст
-    text_clean = normalize_text_basic(raw_text, lang_norm)
-
-    # псевдо-перевод в русскую лексику
-    text_ru = translate_to_ru(text_clean, lang_norm)
-
-    # рейтинг в /10
-    rating10 = normalize_rating_to_10(review_raw.get("rating_raw"))
-
-    # общая тональность
-    sentiment_overall = detect_sentiment_label(
-        text_clean,
-        lang_norm,
-        rating10
-    )
-
-    # извлечение аспектов
-    topics_pos: set[str] = set()
-    topics_neg: set[str] = set()
-    topics_all: set[str] = set()
-
-    # вспомогательное: храним инфо для последующей классификации пар
-    # (aspect_key, is_pos, is_neg)
-    aspect_sentiment_flags: List[Tuple[str, bool, bool]] = []
-
-    for topic_name, topic_def in TOPIC_SCHEMA.items():
-        for subtopic_name, sub_def in topic_def["subtopics"].items():
-            patterns_lang = sub_def.get("patterns", {})
-            # выбираем паттерны для текущего языка, либо fallback 'en'
-            pats = patterns_lang.get(lang_norm) or patterns_lang.get("en") or []
-            if not pats:
-                continue
-
-            # проверяем, встречается ли подтема
+    for topic_key, topic_def in TOPIC_SCHEMA.items():
+        subtopics = topic_def.get("subtopics", {})
+        for sub_key, sub_def in subtopics.items():
+            patterns = sub_def.get("patterns", {})
+            # найдена ли подтема?
+            pats = (
+                patterns.get(lang, []) or
+                patterns.get("ru", []) or
+                patterns.get("en", []) or
+                []
+            )
             matched = False
             for pat in pats:
-                if re.search(pat, text_clean, flags=re.IGNORECASE):
+                if re.search(pat, text_ru, flags=re.IGNORECASE):
                     matched = True
                     break
             if not matched:
                 continue
 
-            # локальная тональность по подтеме
-            sent_local = detect_subtopic_sentiment(
-                text_clean,
-                lang_norm,
-                subtopic_patterns=pats
-            )
+            # локальная тональность по этой подтеме
+            sent_local = detect_subtopic_sentiment(text_ru, lang, patterns)
 
-            # нормализованный аспект
-            aspects_list = sub_def.get("aspects", [])
-            if aspects_list:
-                aspect_key = aspects_list[0]
-            else:
-                aspect_key = f"{topic_name}.{subtopic_name}"
+            # аспект
+            aspects = sub_def.get("aspects", []) or [f"{topic_key}.{sub_key}"]
+            aspect_key = aspects[0]
 
-            topics_all.add(aspect_key)
-
+            topics_all.append(aspect_key)
             if sent_local == "pos":
-                topics_pos.add(aspect_key)
-                aspect_sentiment_flags.append((aspect_key, True, False))
+                topics_pos.append(aspect_key)
             elif sent_local == "neg":
-                topics_neg.add(aspect_key)
-                aspect_sentiment_flags.append((aspect_key, False, True))
-            else:
-                aspect_sentiment_flags.append((aspect_key, False, False))
+                topics_neg.append(aspect_key)
 
-    # построение связок аспектов (co-occurrence)
+    # уникализируем
+    topics_all = sorted(list(set(topics_all)))
+    topics_pos = sorted(list(set(topics_pos)))
+    topics_neg = sorted(list(set(topics_neg)))
+
+    # ко-упоминания (все пары из topics_all)
     pair_tags: List[Dict[str, str]] = []
-    seen_pairs: set[Tuple[str, str]] = set()
-    aspects_list_all = list(topics_all)
-
-    for i in range(len(aspects_list_all)):
-        for j in range(i + 1, len(aspects_list_all)):
-            a = aspects_list_all[i]
-            b = aspects_list_all[j]
-            pair_sorted = tuple(sorted([a, b]))
-            if pair_sorted in seen_pairs:
-                continue
-            seen_pairs.add(pair_sorted)
-
-            # определяем категорию пары:
-            a_pos = any(x[0] == a and x[1] for x in aspect_sentiment_flags)
-            a_neg = any(x[0] == a and x[2] for x in aspect_sentiment_flags)
-            b_pos = any(x[0] == b and x[1] for x in aspect_sentiment_flags)
-            b_neg = any(x[0] == b and x[2] for x in aspect_sentiment_flags)
+    for i in range(len(topics_all)):
+        for j in range(i+1, len(topics_all)):
+            a = topics_all[i]
+            b = topics_all[j]
+            # классификация пары
+            a_pos = a in topics_pos
+            a_neg = a in topics_neg
+            b_pos = b in topics_pos
+            b_neg = b in topics_neg
 
             if a_neg and b_neg:
-                cat = "systemic_risk"
+                cat = "systemic_risk"  # системная жалоба
             elif (a_pos and b_neg) or (b_pos and a_neg):
-                cat = "expectations_conflict"
+                cat = "expectations_conflict"  # конфликт ожиданий "цена vs качество"
             elif a_pos and b_pos:
-                cat = "loyalty_driver"
+                cat = "loyalty_driver"  # драйвер лояльности
             else:
-                # пара не несёт смысла для отчёта — пропускаем
                 continue
 
-            pair_tags.append({
-                "a": a,
-                "b": b,
-                "cat": cat,
-            })
+            pair_tags.append({"a": a, "b": b, "cat": cat})
 
-    # цитаты-кандидаты
-    quote_candidates = extract_clean_quotes(text_clean)
+    return topics_all, topics_pos, topics_neg, pair_tags
 
-    # периоды
-    dt = parse_date_to_datetime(review_raw.get("date"))
-    week_key, month_key, quarter_key, year_key = derive_period_keys(dt)
 
-    # стабильный id
-    review_id = build_review_id(dt, review_raw.get("source", ""), raw_text)
+def build_quotes(text_ru: str, max_quotes: int = 3) -> List[str]:
+    """
+    Выдёргиваем 1-3 характерные цитаты для блока B5.
+    Требования:
+    - длина 15..300 символов
+    - режем по . ! ? … + переносы
+    """
+    out: List[str] = []
+    for part in re.split(r"[.!?…]+[\s\n]+", text_ru):
+        p = part.strip()
+        if 15 <= len(p) <= 300:
+            out.append(p)
+        if len(out) >= max_quotes:
+            break
+    return out
+
+
+# =========================
+# PUBLIC API: одна строка семантики
+# =========================
+
+def make_review_id(dt: datetime, source: str, raw_text: str) -> str:
+    base = f"{dt.date().isoformat()}|{source}|{(raw_text or '')[:200]}"
+    return hashlib.sha1(base.encode("utf-8")).hexdigest()
+
+
+def build_semantic_row(review_input: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Главная фабрика: "1 отзыв -> 1 нормализованная строка".
+    На входе словарь:
+        {
+            "date": <raw date or excel serial>,
+            "source": "Booking" / "Google" / ...,
+            "rating_raw": 9.2 / 4.5 / ...,
+            "text": "строка отзыва",
+            "lang_hint": "ru" / "en" / ...
+        }
+
+    На выходе словарь (готовая строка для листа reviews_semantic_raw):
+        {
+            review_id,
+            date,
+            week_key, month_key, quarter_key, year_key,
+            source,
+            rating10,
+            sentiment_overall,
+            topics_pos, topics_neg, topics_all,
+            pair_tags,
+            quote_candidates
+        }
+    """
+    # 1. распаковываем
+    raw_text = (review_input.get("text") or "").strip()
+    lang_hint = (review_input.get("lang_hint") or "").strip().lower()
+    source    = (review_input.get("source") or "").strip()
+
+    # 2. нормализация
+    text_norm = clean_text(raw_text)
+    lang      = normalize_lang(lang_hint, text_norm)
+    text_ru   = translate_to_ru(text_norm, lang)  # сейчас identity-стаб, не API
+
+    dt        = parse_date_any(review_input.get("date"))
+    periods   = derive_period_keys(dt)
+    rating10  = normalize_rating_to_10(review_input.get("rating_raw"))
+    sentiment = detect_sentiment_label(text_ru, lang)
+
+    topics_all, topics_pos, topics_neg, pair_tags = extract_aspects_and_pairs(text_ru, lang)
+    quotes = build_quotes(text_ru)
+
+    rid = make_review_id(dt, source, raw_text)
 
     return {
-        "review_id": review_id,
+        "review_id": rid,
         "date": dt.date().isoformat(),
-        "week_key": week_key,
-        "month_key": month_key,
-        "quarter_key": quarter_key,
-        "year_key": year_key,
-        "source": review_raw.get("source", ""),
+        "week_key": periods["week_key"],
+        "month_key": periods["month_key"],
+        "quarter_key": periods["quarter_key"],
+        "year_key": periods["year_key"],
+        "source": source,
         "rating10": rating10,
-        "sentiment_overall": sentiment_overall,
-        "topics_pos": json.dumps(sorted(list(topics_pos)), ensure_ascii=False),
-        "topics_neg": json.dumps(sorted(list(topics_neg)), ensure_ascii=False),
-        "topics_all": json.dumps(sorted(list(topics_all)), ensure_ascii=False),
+        "sentiment_overall": sentiment,
+        "topics_pos": json.dumps(topics_pos, ensure_ascii=False),
+        "topics_neg": json.dumps(topics_neg, ensure_ascii=False),
+        "topics_all": json.dumps(topics_all, ensure_ascii=False),
         "pair_tags": json.dumps(pair_tags, ensure_ascii=False),
-        "quote_candidates": json.dumps(quote_candidates, ensure_ascii=False),
+        "quote_candidates": json.dumps(quotes, ensure_ascii=False),
     }
