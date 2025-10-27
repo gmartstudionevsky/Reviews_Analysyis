@@ -1,39 +1,62 @@
-# agent/reviews_backfill_agent.py
+# reviews_backfill_agent.py
 #
-# Бэкфилл истории отзывов (2019-2025) в Google Sheets.
+# Полный бэкфилл по отзывам в Google Sheets.
 #
 # Что делает:
 #   1. Берёт файл Reviews_2019-25.xls из папки DRIVE_FOLDER_ID в Google Drive.
 #   2. Читает лист "Отзывы".
-#   3. Прогоняет через build_exploded_reviews_df() из text_analytics_core:
-#        - нормализация языка
-#        - тональность (pos/neg/neu)
-#        - аспекты (темы)
-#        - приведение рейтинга к шкале /5
-#        - week_key, month_key, quarter_key, year_key
-#   4. Дедупит (review_id + aspect_code).
-#   5. Строит агрегаты:
-#        a) period_kpi_history: KPI по периодам (неделя / месяц / квартал / год)
-#        b) period_aspects_history: частота аспектов и их тональность по периодам
-#        c) source_history: репутация по источникам (недельная)
-#   6. Полностью ПЕРЕЗАПИСЫВАЕТ в таблице SHEETS_HISTORY_ID вкладки:
-#        - reviews_semantic_history
-#        - period_kpi_history
-#        - period_aspects_history
-#        - source_history
+#   3. Прогоняет каждый отзыв через text_analytics_core.build_semantic_row():
+#        - нормализация языка / текста
+#        - рейтинг в шкале /10
+#        - общая тональность (pos/neg/neu)
+#        - аспекты (темы/подтемы/аспекты) + знак
+#        - пары аспектов (systemic_risk / expectations_conflict / loyalty_driver)
+#        - цитаты
+#        - ключи периодов (week_key, month_key и т.д.)
+#        - источник
+#   4. На базе этого строит агрегаты:
+#        a) history:
+#            KPI по периодам (week / month / quarter / year)
+#            avg10, pos/neu/neg, количество отзывов
+#        b) semantic_agg_aspects_period:
+#            аспекты × период × source_scope ('all' или конкретный источник)
+#            + pos_weight / neg_weight
+#        c) semantic_agg_pairs_period:
+#            связки аспектов × период × source_scope
+#        d) sources_history:
+#            неделя × источник:
+#            средняя оценка /10, pos/neu/neg
+#   5. Полностью ПЕРЕЗАПИСЫВАЕТ в таблице SHEETS_HISTORY_ID вкладки:
+#        - reviews_semantic_raw
+#        - history
+#        - semantic_agg_aspects_period
+#        - semantic_agg_pairs_period
+#        - sources_history
 #
-# Этот скрипт запускается вручную (через отдельный workflow_dispatch или локально).
-# В еженедельном отчёте мы бэкфилл не дергаем.
+# После этого таблица в Google Sheets становится "истиной", из которой
+# будет собираться недельный отчёт.
+#
+# Важные требования окружения:
+#   - DRIVE_FOLDER_ID          (ID папки в Google Drive с историческими файлами)
+#   - SHEETS_HISTORY_ID        (ID Google Sheets с историей)
+#   - GOOGLE_SERVICE_ACCOUNT_JSON   или GOOGLE_SERVICE_ACCOUNT_JSON_CONTENT
+#
+# Зависит от:
+#   - pandas
+#   - google-api-python-client
+#   - google-auth
+#   - xlrd (чтение .xls)
+#
+# Зависит также от text_analytics_core.build_semantic_row, который ты уже обновил.
+
 
 import os
 import io
-import math
+import json
 from datetime import datetime
 from typing import Any, List, Dict, Tuple
 
 import pandas as pd
-
-import json
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
@@ -42,42 +65,41 @@ from googleapiclient.http import MediaIoBaseDownload
 # =========================
 # Импорт ядра семантики отзывов
 # =========================
-# Нас интересует только build_exploded_reviews_df (и TOPIC_SCHEMA она тянет).
+# Берём фабрику одной строки семантики (1 отзыв -> 1 запись)
 try:
-    from agent.text_analytics_core import (
-        TOPIC_SCHEMA,
-        build_exploded_reviews_df,
-    )
-except ModuleNotFoundError:
-    # fallback если запускаем модуль локально как script без пакета agent
+    from agent.text_analytics_core import build_semantic_row
+except Exception:
     import sys
     sys.path.append(os.path.dirname(__file__))
-    from text_analytics_core import (
-        TOPIC_SCHEMA,
-        build_exploded_reviews_df,
-    )
+    from text_analytics_core import build_semantic_row
 
 
 # =========================
-# Настройки листов и колонок
+# Константы / настройки
 # =========================
 
-SEMANTIC_TAB = "reviews_semantic_history"
-KPI_TAB      = "period_kpi_history"
-ASPECTS_TAB  = "period_aspects_history"
-SOURCES_TAB  = "source_history"
+# Названия вкладок в Google Sheets
+SEMANTIC_TAB = "reviews_semantic_raw"            # 1 строка = 1 отзыв (сырой слой)
+KPI_TAB      = "history"                         # KPI по периодам (/10 + pos/neu/neg)
+ASPECTS_TAB  = "semantic_agg_aspects_period"     # аспекты × период × источник/all (+веса)
+PAIRS_TAB    = "semantic_agg_pairs_period"       # связки факторов × период × источник/all
+SOURCES_TAB  = "sources_history"                 # разбивка по источникам (недели)
 
-PERIOD_LEVELS = [
+# Периодические уровни, которые мы считаем
+# порядок важен и будет использоваться и для сортировки
+PERIOD_LEVELS: List[Tuple[str, str]] = [
     ("week",    "week_key"),
     ("month",   "month_key"),
     ("quarter", "quarter_key"),
     ("year",    "year_key"),
 ]
 
+# Права для сервисного аккаунта
 SCOPES = [
     "https://www.googleapis.com/auth/drive.readonly",
     "https://www.googleapis.com/auth/spreadsheets",
 ]
+
 
 # =========================
 # Авторизация в Google API
@@ -89,7 +111,8 @@ def get_google_clients() -> tuple:
     Поддерживает два варианта:
     1. GOOGLE_SERVICE_ACCOUNT_JSON_CONTENT = '{"type":"service_account",...}'
     2. GOOGLE_SERVICE_ACCOUNT_JSON = путь к sa.json
-    Возвращает (DRIVE, SHEETS).
+
+    Возвращает (drive, sheets).
     """
     sa_path    = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
     sa_content = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON_CONTENT")
@@ -112,10 +135,13 @@ def get_google_clients() -> tuple:
 
 def drive_download_reviews_file(drive, folder_id: str, filename: str) -> pd.DataFrame:
     """
-    Находит в папке folder_id файл с именем filename (точное совпадение),
-    скачивает и читает лист 'Отзывы'.
-    Ожидаемый формат столбцов:
+    Находит в папке folder_id файл с именем filename (строгое совпадение),
+    скачивает его и читает лист 'Отзывы'.
+
+    Ожидаемые столбцы в файле:
       'Дата', 'Рейтинг', 'Источник', 'Автор', 'Код языка', 'Текст отзыва', 'Наличие ответа'
+    Не все важны для нас, но 'Дата', 'Рейтинг', 'Источник', 'Текст отзыва', 'Код языка'
+    должны быть найдены.
     """
     query = (
         f"'{folder_id}' in parents and "
@@ -142,7 +168,7 @@ def drive_download_reviews_file(drive, folder_id: str, filename: str) -> pd.Data
         _, done = dl.next_chunk()
     buf.seek(0)
 
-    # .xls может требовать движок xlrd → убедимся, что xlrd стоит в requirements
+    # читаем .xls
     df = pd.read_excel(buf, sheet_name="Отзывы")
     return df
 
@@ -166,7 +192,6 @@ def ensure_tab_exists(sheets, spreadsheet_id: str, tab_name: str, header: List[s
             body={"requests":[{"addSheet":{"properties":{"title":tab_name}}}]}
         ).execute()
 
-    # теперь пишем шапку
     end_col_letter = chr(ord("A") + len(header) - 1)
     sheets.values().update(
         spreadsheetId=spreadsheet_id,
@@ -189,7 +214,7 @@ def clear_tab_data(sheets, spreadsheet_id: str, tab_name: str, start_cell: str =
 
 def append_df_to_sheet(sheets, spreadsheet_id: str, tab_name: str, df: pd.DataFrame, columns: List[str]):
     """
-    Добавляет df в конец вкладки tab_name,
+    Добавляет df в конец вкладки tab_name (начиная с A2),
     значения колонок идут в указанном порядке.
     Преобразует NaN → "".
     """
@@ -216,90 +241,221 @@ def append_df_to_sheet(sheets, spreadsheet_id: str, tab_name: str, df: pd.DataFr
 
 
 # =========================
-# Агрегация для KPI
+# Вспомогательные утилиты для агрегаций
 # =========================
 
-def build_per_review_df(exploded_df: pd.DataFrame) -> pd.DataFrame:
+def _first_non_empty(row, *names):
+    for n in names:
+        if n in row and pd.notna(row[n]) and str(row[n]).strip():
+            return row[n]
+    return None
+
+
+def _parse_json_list(cell) -> list:
     """
-    Одна строка на отзыв.
-    Возвращает DataFrame с колонками:
-        review_id, date, week_key, month_key, quarter_key, year_key,
-        source, rating_5, sentiment
+    Безопасно превратить ячейку (строку JSON или уже list) в list[str]
     """
-    if exploded_df.empty:
-        return pd.DataFrame(columns=[
-            "review_id","date","week_key","month_key","quarter_key","year_key",
-            "source","rating_5","sentiment"
-        ])
-
-    per_review = (
-        exploded_df.groupby("review_id")
-        .agg({
-            "date": "first",
-            "week_key": "first",
-            "month_key": "first",
-            "quarter_key": "first",
-            "year_key": "first",
-            "source": "first",
-            "rating_5": "mean",
-            "sentiment": "first",
-        })
-        .reset_index()
-    )
-
-    return per_review
+    if isinstance(cell, list):
+        return cell
+    if pd.isna(cell):
+        return []
+    try:
+        return json.loads(cell)
+    except Exception:
+        return []
 
 
-def compute_period_kpi_history(exploded_df: pd.DataFrame) -> pd.DataFrame:
+def _parse_json_pairs(cell) -> list:
     """
-    KPI по каждому периодическому ключу:
-      period_type ('week'/'month'/'quarter'/'year'),
-      period_key  ('2025-W42', '2025-10', ...),
-      reviews_count,
-      avg_rating_5,
-      share_pos,
-      share_neg
+    Безопасно превратить ячейку (строку JSON или уже list[dict]) в list[dict]
     """
-    per_review = build_per_review_df(exploded_df)
+    if isinstance(cell, list):
+        return cell
+    if pd.isna(cell):
+        return []
+    try:
+        return json.loads(cell)
+    except Exception:
+        return []
 
-    rows = []
-    for period_type, col in PERIOD_LEVELS:
-        if col not in per_review.columns:
+
+# =========================
+# 0. Строим reviews_semantic_raw (строка = один отзыв)
+# =========================
+
+def build_reviews_semantic_raw_df(raw_reviews_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Преобразует лист "Отзывы" в DataFrame с 1 строкой на 1 отзыв,
+    используя text_analytics_core.build_semantic_row().
+
+    Ожидаемые названия исходных столбцов (учитываем рус/англ варианты):
+      - 'Дата' / 'Date'
+      - 'Рейтинг' / 'Rating' / 'Оценка'
+      - 'Источник' / 'Source'
+      - 'Код языка' / 'Lang' / 'Language'
+      - 'Текст отзыва' / 'Text' / 'Отзыв'
+    """
+
+    cols_lower = {c.lower(): c for c in raw_reviews_df.columns}
+
+    def pick(*options):
+        for opt in options:
+            if opt in cols_lower:
+                return cols_lower[opt]
+        return None
+
+    col_date   = pick("дата","date")
+    col_rate   = pick("рейтинг","rating","оценка","score")
+    col_source = pick("источник","source","площадка")
+    col_lang   = pick("код языка","lang","язык","language code","language")
+    col_text   = pick("текст отзыва","text","отзыв","review text")
+
+    if not all([col_date, col_rate, col_source, col_text]):
+        raise RuntimeError("Не найдены обязательные столбцы (дата/рейтинг/источник/текст).")
+
+    out_rows = []
+    for _, r in raw_reviews_df.iterrows():
+        review_raw = {
+            "date":       r[col_date],
+            "source":     r[col_source],
+            "rating_raw": r[col_rate],
+            "text":       r[col_text] if pd.notna(r[col_text]) else "",
+            "lang_hint":  r[col_lang] if col_lang else "",
+        }
+        try:
+            row_norm = build_semantic_row(review_raw)
+            out_rows.append(row_norm)
+        except Exception as e:
+            # Не роняем весь бэкфилл из-за одной битой строки
+            print(f"[WARN] Ошибка обработки отзыва: {e}")
             continue
 
-        tmp = per_review.dropna(subset=[col]).copy()
+    if not out_rows:
+        return pd.DataFrame(columns=[
+            "review_id","date","week_key","month_key","quarter_key","year_key",
+            "source","rating10","sentiment_overall",
+            "topics_pos","topics_neg","topics_all","pair_tags","quote_candidates"
+        ])
+
+    df = pd.DataFrame(out_rows)
+
+    # сортируем для удобства анализа "сырых" данных:
+    # сначала по дате, потом по источнику, потом по review_id
+    # (date у нас уже строка ISO через build_semantic_row → YYYY-MM-DD, т.е. сортируем как строку)
+    df = df.sort_values(
+        by=["date","source","review_id"],
+        ascending=[True, True, True],
+        ignore_index=True,
+    )
+
+    return df
+
+
+# =========================
+# 1. KPI history (period_type / period_key)
+# =========================
+
+def compute_history_from_raw(df_raw: pd.DataFrame) -> pd.DataFrame:
+    """
+    KPI по периодам для history:
+      period_type ('week'/'month'/'quarter'/'year')
+      period_key
+      reviews
+      avg10
+      pos / neu / neg (кол-во отзывов)
+    """
+    rows = []
+
+    for period_type, col in PERIOD_LEVELS:
+        if col not in df_raw.columns:
+            continue
+
+        tmp = df_raw.dropna(subset=[col]).copy()
         if tmp.empty:
             continue
 
-        g = tmp.groupby(col)
-        for period_key, gdf in g:
-            reviews_count = len(gdf)
-            avg_rating_5 = gdf["rating_5"].dropna().mean()
-
-            pos_cnt = (gdf["sentiment"] == "pos").sum()
-            neg_cnt = (gdf["sentiment"] == "neg").sum()
-
-            share_pos = (pos_cnt / reviews_count) if reviews_count else 0.0
-            share_neg = (neg_cnt / reviews_count) if reviews_count else 0.0
+        for period_key, gdf in tmp.groupby(col, dropna=True):
+            reviews = int(gdf["review_id"].nunique())
+            avg10   = float(gdf["rating10"].dropna().mean()) if reviews else None
+            pos_cnt = int((gdf["sentiment_overall"] == "pos").sum())
+            neu_cnt = int((gdf["sentiment_overall"] == "neu").sum())
+            neg_cnt = int((gdf["sentiment_overall"] == "neg").sum())
 
             rows.append({
                 "period_type": period_type,
-                "period_key": period_key,
-                "reviews_count": reviews_count,
-                "avg_rating_5": round(avg_rating_5, 4) if avg_rating_5 == avg_rating_5 else "",
-                "share_pos": share_pos,
-                "share_neg": share_neg,
+                "period_key":  period_key,
+                "reviews":     reviews,
+                "avg10":       round(avg10, 2) if avg10 == avg10 else "",
+                "pos":         pos_cnt,
+                "neu":         neu_cnt,
+                "neg":         neg_cnt,
             })
 
-    out_df = pd.DataFrame(rows, columns=[
-        "period_type",
-        "period_key",
-        "reviews_count",
-        "avg_rating_5",
-        "share_pos",
-        "share_neg",
-    ]).sort_values(
-        by=["period_type","period_key"],
+    if not rows:
+        return pd.DataFrame(columns=[
+            "period_type","period_key","reviews","avg10","pos","neu","neg"
+        ])
+
+    # "умная" сортировка:
+    # - сначала 'week', потом 'month', потом 'quarter', потом 'year'
+    # - внутри каждого типа период_key по возрастанию
+    period_order = {p_type: idx for idx, (p_type, _) in enumerate(PERIOD_LEVELS)}
+    out_df = pd.DataFrame(rows)
+    out_df["__ptype_rank"] = out_df["period_type"].map(period_order).fillna(999)
+
+    out_df = out_df.sort_values(
+        by=["__ptype_rank","period_key"],
+        ascending=[True, True],
+        ignore_index=True,
+    ).drop(columns=["__ptype_rank"])
+
+    return out_df
+
+
+# =========================
+# 2. Источники по неделям (sources_history)
+# =========================
+
+def compute_sources_history_weekly_from_raw(df_raw: pd.DataFrame) -> pd.DataFrame:
+    """
+    История по источникам (недельно):
+      week_key
+      source
+      reviews
+      avg10
+      pos / neu / neg
+    """
+    tmp = df_raw.dropna(subset=["week_key","source"]).copy()
+    if tmp.empty:
+        return pd.DataFrame(columns=[
+            "week_key","source","reviews","avg10","pos","neu","neg"
+        ])
+
+    rows = []
+    for (wk, src), gdf in tmp.groupby(["week_key","source"], dropna=True):
+        reviews = int(gdf["review_id"].nunique())
+        avg10   = float(gdf["rating10"].dropna().mean()) if reviews else None
+        pos_cnt = int((gdf["sentiment_overall"] == "pos").sum())
+        neu_cnt = int((gdf["sentiment_overall"] == "neu").sum())
+        neg_cnt = int((gdf["sentiment_overall"] == "neg").sum())
+
+        rows.append({
+            "week_key": wk,
+            "source":   src,
+            "reviews":  reviews,
+            "avg10":    round(avg10, 2) if avg10 == avg10 else "",
+            "pos":      pos_cnt,
+            "neu":      neu_cnt,
+            "neg":      neg_cnt,
+        })
+
+    out_df = pd.DataFrame(rows)
+
+    # "умная" сортировка:
+    # - сначала по week_key (возрастание, то есть хронология)
+    # - внутри одной недели по source (алфавит)
+    out_df = out_df.sort_values(
+        by=["week_key","source"],
         ascending=[True, True],
         ignore_index=True,
     )
@@ -307,135 +463,232 @@ def compute_period_kpi_history(exploded_df: pd.DataFrame) -> pd.DataFrame:
     return out_df
 
 
-def compute_period_aspects_history(exploded_df: pd.DataFrame) -> pd.DataFrame:
+# =========================
+# 3. Агрегат по аспектам (semantic_agg_aspects_period)
+# =========================
+
+def compute_semantic_agg_aspects_period_from_raw(df_raw: pd.DataFrame) -> pd.DataFrame:
     """
-    По каждому периоду и аспекту считаем:
-        mentions_reviews  — сколько уникальных отзывов упомянули аспект
-        pos_share / neg_share — доля позитивных / негативных упоминаний
-    Возвращает столбцы:
-        period_type, period_key,
-        aspect_code,
-        mentions_reviews,
-        pos_share,
-        neg_share
+    Для каждой комбинации:
+      (period_type, period_key, source_scope ∈ {'all' | конкретный source}, aspect_key)
+    считаем:
+      - mentions_total  (сколько отзывов вообще упомянули аспект)
+      - pos_mentions / neg_mentions / neu_mentions
+      - pos_share / neg_share
+      - pos_weight / neg_weight
+
+    pos_weight = доля позитивных отзывов периода, где аспект упомянут позитивно
+    neg_weight = доля негативных отзывов периода, где аспект упомянут негативно
     """
     rows = []
 
+    # список источников, пригодится для source_scope
+    sources = sorted([s for s in df_raw["source"].dropna().unique().tolist() if s])
+
     for period_type, col in PERIOD_LEVELS:
-        if col not in exploded_df.columns:
+        if col not in df_raw.columns:
             continue
 
-        tmp = exploded_df.dropna(subset=[col]).copy()
-        if tmp.empty:
+        df_p = df_raw.dropna(subset=[col]).copy()
+        if df_p.empty:
             continue
 
-        # (period_key, aspect_code, sentiment, review_id)
-        grp = (
-            tmp.groupby([col, "aspect_code", "sentiment", "review_id"])
-               .size()
-               .reset_index(name="cnt")
-        )
+        scopes = ["all"] + sources
+        for scope in scopes:
+            df_s = df_p if scope == "all" else df_p[df_p["source"] == scope]
+            if df_s.empty:
+                continue
 
-        # агрегируем по (period_key, aspect_code, sentiment)
-        agg_mentions = (
-            grp.groupby([col, "aspect_code", "sentiment"])["review_id"]
-               .nunique()
-               .reset_index(name="review_mentions")
-        )
+            for period_key, gdf in df_s.groupby(col, dropna=True):
+                # деноминаторы для весов
+                pos_reviews = set(gdf.loc[gdf["sentiment_overall"] == "pos","review_id"])
+                neg_reviews = set(gdf.loc[gdf["sentiment_overall"] == "neg","review_id"])
+                pos_total = len(pos_reviews)
+                neg_total = len(neg_reviews)
 
-        # сводная по sentiment
-        pivot = agg_mentions.pivot_table(
-            index=[col, "aspect_code"],
-            columns="sentiment",
-            values="review_mentions",
-            fill_value=0,
-            aggfunc="sum",
-        )
+                stats: Dict[str, Dict[str, set]] = {}
+                # stats[aspect] = {
+                #   "mentions": set([...]),
+                #   "pos": set([...]),
+                #   "neg": set([...]),
+                #   "neu": set([...])
+                # }
 
-        for need in ["pos","neg","neu"]:
-            if need not in pivot.columns:
-                pivot[need] = 0
+                for _, r in gdf.iterrows():
+                    rid = r["review_id"]
 
-        pivot["mentions_total"] = (
-            pivot["pos"] + pivot["neg"] + pivot["neu"]
-        ).astype(float)
+                    a_all = set(_parse_json_list(r.get("topics_all")))
+                    a_pos = set(_parse_json_list(r.get("topics_pos")))
+                    a_neg = set(_parse_json_list(r.get("topics_neg")))
+                    a_neu = a_all - a_pos - a_neg
 
-        pivot["pos_share"] = pivot["pos"] / pivot["mentions_total"].replace(0, 1)
-        pivot["neg_share"] = pivot["neg"] / pivot["mentions_total"].replace(0, 1)
+                    for a in a_all:
+                        stats.setdefault(a, {"mentions": set(), "pos": set(), "neg": set(), "neu": set()})
+                        stats[a]["mentions"].add(rid)
+                    for a in a_pos:
+                        stats.setdefault(a, {"mentions": set(), "pos": set(), "neg": set(), "neu": set()})
+                        stats[a]["pos"].add(rid)
+                    for a in a_neg:
+                        stats.setdefault(a, {"mentions": set(), "pos": set(), "neg": set(), "neu": set()})
+                        stats[a]["neg"].add(rid)
+                    for a in a_neu:
+                        stats.setdefault(a, {"mentions": set(), "pos": set(), "neg": set(), "neu": set()})
+                        stats[a]["neu"].add(rid)
 
-        pivot = pivot.reset_index()
+                for a_key, d in stats.items():
+                    mentions_total = len(d["mentions"])
+                    pos_mentions   = len(d["pos"])
+                    neg_mentions   = len(d["neg"])
+                    neu_mentions   = len(d["neu"])
 
-        for _, r in pivot.iterrows():
-            period_key = r[col]
-            rows.append({
-                "period_type": period_type,
-                "period_key": period_key,
-                "aspect_code": r["aspect_code"],
-                "mentions_reviews": int(r["mentions_total"]),
-                "pos_share": r["pos_share"],
-                "neg_share": r["neg_share"],
-            })
+                    if mentions_total == 0:
+                        pos_share = 0.0
+                        neg_share = 0.0
+                    else:
+                        pos_share = round(pos_mentions / mentions_total, 4)
+                        neg_share = round(neg_mentions / mentions_total, 4)
 
-    out_df = pd.DataFrame(rows, columns=[
-        "period_type",
-        "period_key",
-        "aspect_code",
-        "mentions_reviews",
-        "pos_share",
-        "neg_share",
-    ]).sort_values(
-        by=["period_type","period_key","mentions_reviews"],
-        ascending=[True, True, False],
+                    # веса (вклад аспекта в позитив/негатив периода)
+                    if pos_total:
+                        pos_weight = round(len(d["pos"].intersection(pos_reviews)) / pos_total, 4)
+                    else:
+                        pos_weight = 0.0
+                    if neg_total:
+                        neg_weight = round(len(d["neg"].intersection(neg_reviews)) / neg_total, 4)
+                    else:
+                        neg_weight = 0.0
+
+                    rows.append({
+                        "period_type":    period_type,
+                        "period_key":     period_key,
+                        "source_scope":   scope,
+                        "aspect_key":     a_key,
+                        "mentions_total": mentions_total,
+                        "pos_mentions":   pos_mentions,
+                        "neg_mentions":   neg_mentions,
+                        "neu_mentions":   neu_mentions,
+                        "pos_share":      pos_share,
+                        "neg_share":      neg_share,
+                        "pos_weight":     pos_weight,
+                        "neg_weight":     neg_weight,
+                    })
+
+    if not rows:
+        return pd.DataFrame(columns=[
+            "period_type","period_key","source_scope","aspect_key",
+            "mentions_total","pos_mentions","neg_mentions","neu_mentions",
+            "pos_share","neg_share","pos_weight","neg_weight",
+        ])
+
+    out_df = pd.DataFrame(rows)
+
+    # "умная" сортировка:
+    #   - по period_type в порядке week -> month -> quarter -> year
+    #   - по period_key возрастание
+    #   - по source_scope ('all' идёт первой)
+    #   - внутри — по убыванию mentions_total (чтобы крупные темы были сверху)
+    period_order = {p_type: idx for idx, (p_type, _) in enumerate(PERIOD_LEVELS)}
+    out_df["__ptype_rank"] = out_df["period_type"].map(period_order).fillna(999)
+    out_df["__scope_rank"] = out_df["source_scope"].apply(lambda s: 0 if s == "all" else 1)
+
+    out_df = out_df.sort_values(
+        by=["__ptype_rank","period_key","__scope_rank","mentions_total"],
+        ascending=[True, True, True, False],
         ignore_index=True,
-    )
+    ).drop(columns=["__ptype_rank","__scope_rank"])
 
     return out_df
 
 
-def compute_source_history_weekly(exploded_df: pd.DataFrame) -> pd.DataFrame:
+# =========================
+# 4. Агрегат по связкам факторов (semantic_agg_pairs_period)
+# =========================
+
+def compute_semantic_agg_pairs_period_from_raw(df_raw: pd.DataFrame) -> pd.DataFrame:
     """
-    История по источникам (недели):
-        week_key,
-        source,
-        reviews_count,
-        avg_rating_5,
-        share_pos,
-        share_neg
+    Для каждой комбинации:
+      (period_type, period_key, source_scope ∈ {'all' | конкретный source},
+       pair_key, category)
+    считаем:
+      - distinct_reviews (сколько отзывов содержат эту связку)
+      - example_quote (характерная цитата)
     """
-    per_review = build_per_review_df(exploded_df)
-    tmp = per_review.dropna(subset=["week_key"]).copy()
-    if tmp.empty:
-        return pd.DataFrame(columns=[
-            "week_key","source","reviews_count","avg_rating_5","share_pos","share_neg"
-        ])
 
     rows = []
-    for (week_key, source), gdf in tmp.groupby(["week_key","source"]):
-        cnt = len(gdf)
-        avg_rating_5 = gdf["rating_5"].dropna().mean()
 
-        pos_cnt = (gdf["sentiment"] == "pos").sum()
-        neg_cnt = (gdf["sentiment"] == "neg").sum()
+    sources = sorted([s for s in df_raw["source"].dropna().unique().tolist() if s])
 
-        share_pos = (pos_cnt / cnt) if cnt else 0.0
-        share_neg = (neg_cnt / cnt) if cnt else 0.0
+    for period_type, col in PERIOD_LEVELS:
+        if col not in df_raw.columns:
+            continue
 
-        rows.append({
-            "week_key": week_key,
-            "source": source,
-            "reviews_count": cnt,
-            "avg_rating_5": round(avg_rating_5,4) if avg_rating_5 == avg_rating_5 else "",
-            "share_pos": share_pos,
-            "share_neg": share_neg,
-        })
+        df_p = df_raw.dropna(subset=[col]).copy()
+        if df_p.empty:
+            continue
 
-    out_df = pd.DataFrame(rows, columns=[
-        "week_key","source","reviews_count","avg_rating_5","share_pos","share_neg"
-    ]).sort_values(
-        by=["week_key","reviews_count"],
-        ascending=[True, False],
+        scopes = ["all"] + sources
+        for scope in scopes:
+            df_s = df_p if scope == "all" else df_p[df_p["source"] == scope]
+            if df_s.empty:
+                continue
+
+            for period_key, gdf in df_s.groupby(col, dropna=True):
+
+                pair_to_reviews: Dict[Tuple[str,str], set] = {}
+                pair_to_quote:   Dict[Tuple[str,str], str] = {}
+
+                for _, r in gdf.iterrows():
+                    rid    = r["review_id"]
+                    pairs  = _parse_json_pairs(r.get("pair_tags"))
+                    quotes = _parse_json_list(r.get("quote_candidates"))
+                    quote0 = quotes[0] if quotes else ""
+
+                    for p in pairs:
+                        a   = (p.get("a") or "").strip()
+                        b   = (p.get("b") or "").strip()
+                        cat = (p.get("cat") or "").strip()
+                        if not a or not b or not cat:
+                            continue
+                        pair_key = "|".join(sorted([a, b]))
+                        key      = (pair_key, cat)
+                        pair_to_reviews.setdefault(key, set()).add(rid)
+                        # сохраняем первую подходящую цитату как example_quote
+                        if key not in pair_to_quote and quote0:
+                            pair_to_quote[key] = quote0
+
+                for (pair_key, cat), rset in pair_to_reviews.items():
+                    rows.append({
+                        "period_type":      period_type,
+                        "period_key":       period_key,
+                        "source_scope":     scope,
+                        "pair_key":         pair_key,
+                        "category":         cat,
+                        "distinct_reviews": len(rset),
+                        "example_quote":    pair_to_quote.get((pair_key, cat), ""),
+                    })
+
+    if not rows:
+        return pd.DataFrame(columns=[
+            "period_type","period_key","source_scope",
+            "pair_key","category","distinct_reviews","example_quote",
+        ])
+
+    out_df = pd.DataFrame(rows)
+
+    # сортировка:
+    #   - period_type в фиксированном порядке
+    #   - period_key по возрастанию
+    #   - source_scope ('all' первой)
+    #   - distinct_reviews по убыванию (топовые связки - наверх)
+    period_order = {p_type: idx for idx, (p_type, _) in enumerate(PERIOD_LEVELS)}
+    out_df["__ptype_rank"] = out_df["period_type"].map(period_order).fillna(999)
+    out_df["__scope_rank"] = out_df["source_scope"].apply(lambda s: 0 if s == "all" else 1)
+
+    out_df = out_df.sort_values(
+        by=["__ptype_rank","period_key","__scope_rank","distinct_reviews"],
+        ascending=[True, True, True, False],
         ignore_index=True,
-    )
+    ).drop(columns=["__ptype_rank","__scope_rank"])
 
     return out_df
 
@@ -446,139 +699,86 @@ def compute_source_history_weekly(exploded_df: pd.DataFrame) -> pd.DataFrame:
 
 def run_backfill():
     """
-    1. Скачиваем Reviews_2019-25.xls.
-    2. Читаем лист "Отзывы".
-    3. Парсим в exploded_df (отзыв × аспект).
-    4. Дедупим.
-    5. Считаем агрегаты.
-    6. Полностью перезаписываем 4 вкладки в SHEETS_HISTORY_ID.
+    Полный бэкфилл истории отзывов в Google Sheets.
+
+    Шаги:
+      1. Скачиваем Reviews_2019-25.xls
+      2. Читаем лист "Отзывы"
+      3. Готовим reviews_semantic_raw (1 отзыв = 1 строка)
+      4. Считаем агрегаты:
+         - history
+         - semantic_agg_aspects_period
+         - semantic_agg_pairs_period
+         - sources_history
+      5. Полностью перезаписываем соответствующие вкладки
+         в SHEETS_HISTORY_ID.
     """
     DRIVE_FOLDER_ID   = os.environ["DRIVE_FOLDER_ID"]
     SHEETS_HISTORY_ID = os.environ["SHEETS_HISTORY_ID"]
 
     drive, sheets = get_google_clients()
 
-    # 1. выкачиваем xls из Google Drive
+    # 1. Вытягиваем исторический XLS из Google Drive
     raw_reviews_df = drive_download_reviews_file(
         drive=drive,
         folder_id=DRIVE_FOLDER_ID,
         filename="Reviews_2019-25.xls",
     )
 
-    # 2. семантический разбор
-    exploded_df = build_exploded_reviews_df(
-        raw_reviews_df=raw_reviews_df,
-        topic_schema=TOPIC_SCHEMA,
-        add_rating_5scale=True,
-    )
+    # 2. Готовим "сырые" семантические строки
+    df_raw = build_reviews_semantic_raw_df(raw_reviews_df)
 
-    # Если пусто - тоже должны залить пустые вкладки с шапками
-    if exploded_df.empty:
-        print("[WARN] exploded_df пустой, но всё равно создаём вкладки с пустыми данными.")
-        semantic_out = pd.DataFrame(columns=[
-            "review_id","date","week_key","month_key","quarter_key","year_key",
-            "source","rating_5","sentiment","aspect_code","text",
-        ])
-        kpi_df = pd.DataFrame(columns=[
-            "period_type","period_key","reviews_count","avg_rating_5","share_pos","share_neg",
-        ])
-        aspects_df = pd.DataFrame(columns=[
-            "period_type","period_key","aspect_code","mentions_reviews","pos_share","neg_share",
-        ])
-        sources_df = pd.DataFrame(columns=[
-            "week_key","source","reviews_count","avg_rating_5","share_pos","share_neg",
-        ])
-    else:
-        # 3. дедуп: один отзыв × аспект только один раз
-        exploded_df = exploded_df.drop_duplicates(
-            subset=["review_id","aspect_code"]
-        ).reset_index(drop=True)
+    # 3. Считаем агрегаты
+    kpi_df     = compute_history_from_raw(df_raw)
+    aspects_df = compute_semantic_agg_aspects_period_from_raw(df_raw)
+    pairs_df   = compute_semantic_agg_pairs_period_from_raw(df_raw)
+    src_df     = compute_sources_history_weekly_from_raw(df_raw)
 
-        exploded_df = exploded_df.sort_values(
-            by=["date","review_id","aspect_code"],
-            ascending=[True,True,True],
-        ).reset_index(drop=True)
-
-        # 4. данные для SEMANTIC_TAB
-        semantic_out = exploded_df[[
-            "review_id",
-            "date",
-            "week_key",
-            "month_key",
-            "quarter_key",
-            "year_key",
-            "source",
-            "rating_5",
-            "sentiment",
-            "aspect_code",
-            "text",
-        ]].copy()
-
-        # дату приводим к строке, чтобы гугл не наигрался с таймзонами
-        semantic_out["date"] = semantic_out["date"].dt.strftime("%Y-%m-%d %H:%M:%S")
-
-        # 5. агрегаты
-        kpi_df     = compute_period_kpi_history(exploded_df)
-        aspects_df = compute_period_aspects_history(exploded_df)
-        sources_df = compute_source_history_weekly(exploded_df)
-
-    # 6. запись во вкладки гугл-таблицы
-    # 6.1 SEMANTIC_TAB
+    # 4. Запись во вкладки Google Sheets
+    # 4.1 reviews_semantic_raw
     semantic_header = [
-        "review_id",
-        "date",
-        "week_key",
-        "month_key",
-        "quarter_key",
-        "year_key",
-        "source",
-        "rating_5",
-        "sentiment",
-        "aspect_code",
-        "text",
+        "review_id","date","week_key","month_key","quarter_key","year_key",
+        "source","rating10","sentiment_overall",
+        "topics_pos","topics_neg","topics_all","pair_tags","quote_candidates",
     ]
     ensure_tab_exists(sheets, SHEETS_HISTORY_ID, SEMANTIC_TAB, semantic_header)
     clear_tab_data(sheets, SHEETS_HISTORY_ID, SEMANTIC_TAB, start_cell="A2")
-    append_df_to_sheet(sheets, SHEETS_HISTORY_ID, SEMANTIC_TAB, semantic_out, semantic_header)
+    append_df_to_sheet(sheets, SHEETS_HISTORY_ID, SEMANTIC_TAB, df_raw, semantic_header)
 
-    # 6.2 KPI_TAB
+    # 4.2 history
     kpi_header = [
-        "period_type",
-        "period_key",
-        "reviews_count",
-        "avg_rating_5",
-        "share_pos",
-        "share_neg",
+        "period_type","period_key","reviews","avg10","pos","neu","neg",
     ]
     ensure_tab_exists(sheets, SHEETS_HISTORY_ID, KPI_TAB, kpi_header)
     clear_tab_data(sheets, SHEETS_HISTORY_ID, KPI_TAB, start_cell="A2")
     append_df_to_sheet(sheets, SHEETS_HISTORY_ID, KPI_TAB, kpi_df, kpi_header)
 
-    # 6.3 ASPECTS_TAB
+    # 4.3 semantic_agg_aspects_period
     aspects_header = [
-        "period_type",
-        "period_key",
-        "aspect_code",
-        "mentions_reviews",
-        "pos_share",
-        "neg_share",
+        "period_type","period_key","source_scope","aspect_key",
+        "mentions_total","pos_mentions","neg_mentions","neu_mentions",
+        "pos_share","neg_share","pos_weight","neg_weight",
     ]
     ensure_tab_exists(sheets, SHEETS_HISTORY_ID, ASPECTS_TAB, aspects_header)
     clear_tab_data(sheets, SHEETS_HISTORY_ID, ASPECTS_TAB, start_cell="A2")
     append_df_to_sheet(sheets, SHEETS_HISTORY_ID, ASPECTS_TAB, aspects_df, aspects_header)
 
-    # 6.4 SOURCES_TAB
+    # 4.4 semantic_agg_pairs_period
+    pairs_header = [
+        "period_type","period_key","source_scope",
+        "pair_key","category","distinct_reviews","example_quote",
+    ]
+    ensure_tab_exists(sheets, SHEETS_HISTORY_ID, PAIRS_TAB, pairs_header)
+    clear_tab_data(sheets, SHEETS_HISTORY_ID, PAIRS_TAB, start_cell="A2")
+    append_df_to_sheet(sheets, SHEETS_HISTORY_ID, PAIRS_TAB, pairs_df, pairs_header)
+
+    # 4.5 sources_history
     sources_header = [
-        "week_key",
-        "source",
-        "reviews_count",
-        "avg_rating_5",
-        "share_pos",
-        "share_neg",
+        "week_key","source","reviews","avg10","pos","neu","neg",
     ]
     ensure_tab_exists(sheets, SHEETS_HISTORY_ID, SOURCES_TAB, sources_header)
     clear_tab_data(sheets, SHEETS_HISTORY_ID, SOURCES_TAB, start_cell="A2")
-    append_df_to_sheet(sheets, SHEETS_HISTORY_ID, SOURCES_TAB, sources_df, sources_header)
+    append_df_to_sheet(sheets, SHEETS_HISTORY_ID, SOURCES_TAB, src_df, sources_header)
 
     print("[INFO] Backfill по отзывам завершён успешно.")
 
