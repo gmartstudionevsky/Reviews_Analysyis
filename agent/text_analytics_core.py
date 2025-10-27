@@ -2962,6 +2962,189 @@ TOPIC_SCHEMA: Dict[str, Dict[str, Any]] = {
     }
 }
 
+# ========= [EXPORT] semantic row factory (вставить НИЖЕ словаря тем) =================
+import json, re, hashlib, unicodedata
+from datetime import datetime
+import pandas as pd
+from typing import Any, Dict, List
+
+# --- Базовая очистка текста (без изменения твоих словарей)
+_MULTI_WS  = re.compile(r"\s+")
+_URL       = re.compile(r"https?://\S+|www\.\S+")
+_EMAIL_RE  = re.compile(r"\b[\w.\-+%]+@[\w.\-]+\.[A-Za-z]{2,}\b")
+_PHONE_RE  = re.compile(r"\+?\d[\d\-\s()]{6,}\d")
+_HTML_RE   = re.compile(r"<[^>]+>")
+_WIFI_UNI  = re.compile(r"\b(wi[\s\-]?fi|вай[\s\-]?[фа]й)\b", re.IGNORECASE)
+
+def _clean_text(x: str) -> str:
+    if not x:
+        return ""
+    t = unicodedata.normalize("NFKC", str(x))
+    t = _HTML_RE.sub(" ", t)
+    t = _URL.sub(" ", t)
+    t = _EMAIL_RE.sub(" ", t)
+    t = _PHONE_RE.sub(" ", t)
+    t = t.lower()
+    t = _WIFI_UNI.sub("wi-fi", t)
+    t = _MULTI_WS.sub(" ", t).strip()
+    return t
+
+# --- Дата: поддержка dd.mm.yyyy, yyyy-mm-dd, datetime и Excel-serial
+def _parse_date_any(x: Any) -> datetime:
+    if isinstance(x, datetime):
+        return x.replace(tzinfo=None)
+    # Excel serial?
+    if isinstance(x, (int, float)) and not pd.isna(x):
+        try:
+            # Excel day 0 = 1899-12-30 (правильный origin для pandas)
+            ts = pd.Timestamp("1899-12-30") + pd.to_timedelta(float(x), unit="D")
+            return ts.to_pydatetime().replace(tzinfo=None)
+        except Exception:
+            pass
+    # Общий путь
+    try:
+        return pd.to_datetime(x, errors="raise", dayfirst=True).to_pydatetime().replace(tzinfo=None)
+    except Exception:
+        # в крайнем случае — сегодня (но лучше логировать в агенте)
+        return datetime.utcnow().replace(tzinfo=None)
+
+def _derive_period_keys(dt: datetime) -> Dict[str, str]:
+    iso_y, iso_w, _ = dt.isocalendar()
+    q = (dt.month - 1)//3 + 1
+    return {
+        "week_key":    f"{iso_y:04d}-W{iso_w:02d}",
+        "month_key":   f"{dt.year:04d}-{dt.month:02d}",
+        "quarter_key": f"{dt.year:04d}-Q{q}",
+        "year_key":    f"{dt.year:04d}",
+    }
+
+def _review_id(dt: datetime, source: str, raw_text: str) -> str:
+    base = f"{dt.date().isoformat()}|{source}|{(raw_text or '')[:200]}"
+    return hashlib.sha1(base.encode("utf-8")).hexdigest()
+
+# --- Локальная тональность по подтеме (приоритет: neg strong -> neg soft -> pos strong -> pos soft -> neu)
+def _subtopic_sentiment(text: str, lang: str, sub_patterns: Dict[str, List[str]]) -> str:
+    lang_key = lang if lang in NEGATIVE_WORDS_STRONG else "en"
+
+    def _has_any(rgx_list, s: str) -> bool:
+        for rgx in rgx_list:
+            if re.search(rgx, s, flags=re.IGNORECASE):
+                return True
+        return False
+
+    # окно ±40 символов вокруг совпадений подтемы
+    windows: List[str] = []
+    pats = sub_patterns.get(lang, []) or sub_patterns.get("ru", []) or sub_patterns.get("en", [])
+    for p in pats:
+        for m in re.finditer(p, text, flags=re.IGNORECASE):
+            s, e = m.span()
+            windows.append(text[max(0, s-40): min(len(text), e+40)])
+    if not windows:
+        windows = [text]
+
+    for chunk in windows:
+        if _has_any(NEGATIVE_WORDS_STRONG.get(lang_key, []), chunk): return "neg"
+        if _has_any(NEGATIVE_WORDS_SOFT.get(lang_key, []),   chunk): return "neg"
+        if _has_any(POSITIVE_WORDS_STRONG.get(lang_key, []), chunk): return "pos"
+        if _has_any(POSITIVE_WORDS_SOFT.get(lang_key, []),   chunk): return "pos"
+    return "neu"
+
+# --- Главная функция экспорта одной строки семантики
+def build_semantic_row(review_raw: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    На входе: {'date','source','rating_raw','text','lang_hint'}
+    На выходе: одна строка для reviews_semantic_raw.
+    """
+    raw_text = (review_raw.get("text") or "").strip()
+    lang_hint = (review_raw.get("lang_hint") or "").strip()
+    source    = (review_raw.get("source") or "").strip()
+
+    # язык -> легкая русификация
+    lang = normalize_lang(lang_hint, raw_text)
+    text_basic = _clean_text(raw_text)
+    text_ru = translate_to_ru(text_basic, lang)  # не меняет кириллицу
+
+    rating10 = normalize_rating_to_10(review_raw.get("rating_raw"))
+    try:
+        overall = detect_sentiment_label(text_ru, lang)  # твоя функция из словарей
+    except Exception:
+        overall = "neu"
+
+    # темы/аспекты
+    topics_all, topics_pos, topics_neg = set(), set(), set()
+    # защитимся, если TOPIC_SCHEMA не импортирован
+    schema = globals().get("TOPIC_SCHEMA", {}) or {}
+    for t_key, t_def in schema.items():
+        subs = (t_def or {}).get("subtopics", {}) or {}
+        for s_key, s_def in subs.items():
+            pats = (s_def or {}).get("patterns", {}) or {}
+            # есть совпадение?
+            lang_pats = pats.get(lang) or pats.get("ru") or pats.get("en") or []
+            if not lang_pats:
+                continue
+            matched = any(re.search(p, text_ru, flags=re.IGNORECASE) for p in lang_pats)
+            if not matched:
+                continue
+            # локальная тональность подтемы
+            sent_local = _subtopic_sentiment(text_ru, lang, pats)
+            aspects = (s_def or {}).get("aspects") or [f"{t_key}.{s_key}"]
+            aspect = aspects[0]
+            topics_all.add(aspect)
+            if sent_local == "pos":
+                topics_pos.add(aspect)
+            elif sent_local == "neg":
+                topics_neg.add(aspect)
+
+    # сопряжённые пары (ко-упоминания)
+    pair_tags: List[Dict[str, str]] = []
+    if topics_all:
+        pairs = build_cooccurrence_pairs(sorted(list(topics_all)))
+        for a, b in pairs:
+            a_pos, a_neg = (a in topics_pos), (a in topics_neg)
+            b_pos, b_neg = (b in topics_pos), (b in topics_neg)
+            if a_neg and b_neg:
+                cat = "systemic_risk"
+            elif (a_pos and b_neg) or (b_pos and a_neg):
+                cat = "expectations_conflict"
+            elif a_pos and b_pos:
+                cat = "loyalty_driver"
+            else:
+                continue
+            pair_tags.append({"a": a, "b": b, "cat": cat})
+
+    # цитаты (1–3 предложения)
+    quotes = []
+    for part in re.split(r"[.!?…]+[\s\n]+", text_ru):
+        p = part.strip()
+        if 15 <= len(p) <= 300:
+            quotes.append(p)
+        if len(quotes) >= 3:
+            break
+
+    dt = _parse_date_any(review_raw.get("date"))
+    per = _derive_period_keys(dt)
+    rid = _review_id(dt, source, raw_text)
+
+    return {
+        "review_id": rid,
+        "date": dt.date().isoformat(),
+        "week_key": per["week_key"],
+        "month_key": per["month_key"],
+        "quarter_key": per["quarter_key"],
+        "year_key": per["year_key"],
+        "source": source,
+        "rating10": rating10,
+        "sentiment_overall": overall,
+        "topics_pos": json.dumps(sorted(list(topics_pos)), ensure_ascii=False),
+        "topics_neg": json.dumps(sorted(list(topics_neg)), ensure_ascii=False),
+        "topics_all": json.dumps(sorted(list(topics_all)), ensure_ascii=False),
+        "pair_tags": json.dumps(pair_tags, ensure_ascii=False),
+        "quote_candidates": json.dumps(quotes, ensure_ascii=False),
+    }
+# ========= [/EXPORT] =================================================================
+
+
+
 import re
 from typing import Dict, Any, List
 
