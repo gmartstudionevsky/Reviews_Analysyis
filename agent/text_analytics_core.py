@@ -3252,6 +3252,213 @@ def group_aspects_by_topic(registry: Dict[str, Dict[str, Any]]) -> Dict[str, Dic
 #    - чтобы потом ранжировать и говорить
 #      «Топ факторов негатива недели» и «Ключевые плюсы недели».
 #
+
+# ====== [ADD BELOW TOPIC_SCHEMA] ==================================================
+# Лёгкая нормализация текста и ID/даты + фабрика строки семантики
+
+import json, hashlib, unicodedata
+from datetime import datetime
+
+WI_FI_UNIFY = re.compile(r"\b(wi[\s\-]?fi|вай[\s\-]?фай)\b", re.IGNORECASE)
+MULTISPACE = re.compile(r"\s+")
+URL = re.compile(r"https?://\S+|www\.\S+")
+EMAIL = re.compile(r"\b[\w.\-+%]+@[\w.\-]+\.[A-Za-z]{2,}\b")
+PHONE = re.compile(r"\+?\d[\d\-\s()]{6,}\d")
+HTML = re.compile(r"<[^>]+>")
+
+def _normalize_text_basic_v2(text: str) -> str:
+    if not text:
+        return ""
+    t = unicodedata.normalize("NFKC", str(text))
+    t = HTML.sub(" ", t)
+    t = URL.sub(" ", t)
+    t = EMAIL.sub(" ", t)
+    t = PHONE.sub(" ", t)
+    t = t.lower()
+    t = WI_FI_UNIFY.sub("wi-fi", t)
+    t = MULTISPACE.sub(" ", t).strip()
+    return t
+
+def _parse_date_to_datetime_v2(date_raw: Any) -> datetime:
+    """
+    Парсим dd.mm.yyyy / yyyy-mm-dd / dd/mm/yyyy и Excel-serial (float/int).
+    Всегда dayfirst=True.
+    """
+    if isinstance(date_raw, datetime):
+        return date_raw.replace(tzinfo=None)
+    # Excel serial number?
+    if isinstance(date_raw, (int, float)) and not pd.isna(date_raw):
+        try:
+            # Excel считает от 1899-12-30
+            return (pd.Timestamp("1899-12-30") + pd.to_timedelta(float(date_raw), unit="D")).to_pydatetime()
+        except Exception:
+            pass
+    try:
+        return pd.to_datetime(date_raw, dayfirst=True, errors="raise").to_pydatetime().replace(tzinfo=None)
+    except Exception:
+        return datetime.utcnow().replace(tzinfo=None)
+
+def _derive_period_keys_v2(dt: datetime) -> Dict[str, str]:
+    iso_year, iso_week, _ = dt.isocalendar()
+    q = (dt.month - 1) // 3 + 1
+    return {
+        "week_key": f"{iso_year:04d}-W{iso_week:02d}",
+        "month_key": f"{dt.year:04d}-{dt.month:02d}",
+        "quarter_key": f"{dt.year:04d}-Q{q}",
+        "year_key": f"{dt.year:04d}",
+    }
+
+def _build_review_id_v2(dt: datetime, source: str, raw_text: str) -> str:
+    base = f"{dt.date().isoformat()}|{source}|{(raw_text or '')[:200]}"
+    return hashlib.sha1(base.encode("utf-8")).hexdigest()
+
+# Негаторы для локальной оценки подтем
+_RU_NEG = r"(не|без)\s+"
+_EN_NEG = r"(not|no|without|never)\s+"
+_TR_NEG = r"(değil|yok|olm[aeı]yor)\s+"
+
+def _negated_v2(text: str, lang: str, term_regex: str) -> bool:
+    if lang == "ru":
+        return re.search(rf"{_RU_NEG}\w{{0,3}}(?:{term_regex})", text, flags=re.IGNORECASE) is not None
+    if lang == "tr":
+        return re.search(rf"{_TR_NEG}\w{{0,3}}(?:{term_regex})", text, flags=re.IGNORECASE) is not None
+    return re.search(rf"{_EN_NEG}\w{{0,3}}(?:{term_regex})", text, flags=re.IGNORECASE) is not None
+
+def _detect_subtopic_sentiment_v2(text: str, lang: str, patterns: Dict[str, List[str]]) -> str:
+    """
+    Смотрим окно ±40 символов вокруг совпадений подтемы и применяем приоритет:
+    strong-neg -> soft-neg -> strong-pos -> soft-pos -> neu (с учётом negation).
+    Используем уже имеющиеся лексиконы из файла (POSITIVE_WORDS_*, NEGATIVE_WORDS_*).
+    """
+    lang_key = lang if lang in NEGATIVE_WORDS_STRONG else "en"
+    spans: List[str] = []
+    pats = patterns.get(lang, []) or patterns.get("en", [])
+    for pat in pats:
+        for m in re.finditer(pat, text, flags=re.IGNORECASE):
+            s, e = m.span()
+            spans.append(text[max(0, s-40): min(len(text), e+40)])
+    if not spans:
+        spans = [text]
+
+    def has(rgx_list, chunk) -> bool:
+        for rgx in rgx_list:
+            if re.search(rgx, chunk, flags=re.IGNORECASE):
+                if _negated_v2(chunk, lang, rgx):
+                    # «не хорошо» трактуем как негатив
+                    return False
+                return True
+        return False
+
+    for ch in spans:
+        if has(NEGATIVE_WORDS_STRONG.get(lang_key, []), ch): return "neg"
+        if has(NEGATIVE_WORDS_SOFT.get(lang_key, []), ch):   return "neg"
+        if has(POSITIVE_WORDS_STRONG.get(lang_key, []), ch): return "pos"
+        if has(POSITIVE_WORDS_SOFT.get(lang_key, []), ch):   return "pos"
+        for rgx in NEUTRAL_WORDS.get(lang_key, []):
+            if re.search(rgx, ch, flags=re.IGNORECASE): return "neu"
+    return "neu"
+
+def build_semantic_row(review_raw: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    1 отзыв -> 1 нормализованная строка для reviews_semantic_raw:
+    { review_id, date, week_key, month_key, quarter_key, year_key,
+      source, rating10, sentiment_overall,
+      topics_pos, topics_neg, topics_all, pair_tags, quote_candidates }
+    """
+    raw_text = (review_raw.get("text") or "").strip()
+    lang_hint = (review_raw.get("lang_hint") or "").strip()
+    source    = (review_raw.get("source") or "").strip()
+
+    lang_norm = normalize_lang(lang_hint, raw_text)
+    text_clean = _normalize_text_basic_v2(raw_text)
+    # псевдо-перевод оставляем как есть (в модуле он безопасный)
+    _ = translate_to_ru(text_clean, lang_norm)
+
+    rating10 = normalize_rating_to_10(review_raw.get("rating_raw"))
+    # общая тональность как была (без падения на None)
+    try:
+        sentiment_overall = detect_sentiment_label(text_clean, lang_norm)
+    except Exception:
+        sentiment_overall = "neu"
+
+    # темы/аспекты
+    topics_all: set[str] = set()
+    topics_pos: set[str] = set()
+    topics_neg: set[str] = set()
+
+    # соберём флаги для каждой подтемы по схеме
+    for topic_key, tdef in TOPIC_SCHEMA.items():
+        for sub_key, sdef in tdef.get("subtopics", {}).items():
+            patterns = sdef.get("patterns", {})
+            pats = patterns.get(lang_norm) or patterns.get("en") or []
+            if not pats:
+                continue
+            # совпадение есть?
+            matched = any(re.search(p, text_clean, flags=re.IGNORECASE) for p in pats)
+            if not matched:
+                continue
+
+            sent_local = _detect_subtopic_sentiment_v2(text_clean, lang_norm, patterns)
+            aspects = sdef.get("aspects") or [f"{topic_key}.{sub_key}"]
+            # нормализуем ключ аспекта
+            aspect = aspects[0]
+            topics_all.add(aspect)
+            if sent_local == "pos":
+                topics_pos.add(aspect)
+            elif sent_local == "neg":
+                topics_neg.add(aspect)
+
+    # пары (ко-упоминания) на основе уже имеющейся функции
+    pair_tags: List[Dict[str, str]] = []
+    if topics_all:
+        pairs = build_cooccurrence_pairs(sorted(list(topics_all)))
+        for a, b in pairs:
+            # классификация связок
+            a_pos, a_neg = (a in topics_pos), (a in topics_neg)
+            b_pos, b_neg = (b in topics_pos), (b in topics_neg)
+            if a_neg and b_neg:
+                cat = "systemic_risk"
+            elif (a_pos and b_neg) or (b_pos and a_neg):
+                cat = "expectations_conflict"
+            elif a_pos and b_pos:
+                cat = "loyalty_driver"
+            else:
+                continue
+            pair_tags.append({"a": a, "b": b, "cat": cat})
+
+    # цитаты — 1–3 предложения из очищенного текста
+    quotes = []
+    for part in re.split(r"[.!?…]+[\s\n]+", text_clean):
+        p = part.strip()
+        if 15 <= len(p) <= 300:
+            quotes.append(p)
+        if len(quotes) >= 3:
+            break
+
+    # дата/периоды/id
+    dt = _parse_date_to_datetime_v2(review_raw.get("date"))
+    per = _derive_period_keys_v2(dt)
+    review_id = _build_review_id_v2(dt, source, raw_text)
+
+    return {
+        "review_id": review_id,
+        "date": dt.date().isoformat(),
+        "week_key": per["week_key"],
+        "month_key": per["month_key"],
+        "quarter_key": per["quarter_key"],
+        "year_key": per["year_key"],
+        "source": source,
+        "rating10": rating10,
+        "sentiment_overall": sentiment_overall,
+        "topics_pos": json.dumps(sorted(list(topics_pos)), ensure_ascii=False),
+        "topics_neg": json.dumps(sorted(list(topics_neg)), ensure_ascii=False),
+        "topics_all": json.dumps(sorted(list(topics_all)), ensure_ascii=False),
+        "pair_tags": json.dumps(pair_tags, ensure_ascii=False),
+        "quote_candidates": json.dumps(quotes, ensure_ascii=False),
+    }
+# ====== [/ADD] ====================================================================
+
+
 def aggregate_aspects_for_period(df_exploded,
                                  period_key_col: str,
                                  current_period_key: str,
