@@ -1,6 +1,16 @@
 # agent/text_analytics_core.py
 # =============================================================================
 
+from __future__ import annotations
+
+from typing import Any, Dict, List, Tuple
+from datetime import datetime
+import pandas as pd
+import re
+import unicodedata
+import hashlib
+import json
+
 ###############################################################################
 # Тональность: расширенные словари
 ###############################################################################
@@ -2615,17 +2625,6 @@ TOPIC_SCHEMA: Dict[str, Dict[str, Any]] = {
 #
 # 2. Всё остальное в этом файле — ядро логики. Его не меняем.
 # =============================================================================
-
-from __future__ import annotations
-
-from typing import Any, Dict, List, Tuple
-from datetime import datetime
-import pandas as pd
-import re
-import unicodedata
-import hashlib
-import json
-
 
 # =============================================================================
 # ТЕКСТОВЫЕ ХЕЛПЕРЫ / НОРМАЛИЗАЦИЯ
