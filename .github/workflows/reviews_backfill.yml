@@ -35,4 +35,4 @@ jobs:
 
       - name: Run reviews backfill agent
         run: |
-          python reviews_backfill_agent.py
+          python agent.reviews_backfill_agent.py
