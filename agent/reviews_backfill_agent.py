@@ -57,11 +57,8 @@ def _download_drive_file(drive, file_id: str) -> bytes:
         _, done = downloader.next_chunk()
     return buf.getvalue()
 
+# === A) IO: чтение Excel из Google Drive (лист 'Отзывы') ===
 def drive_download_reviews_file(drive, folder_id: str, filename_base: str) -> pd.DataFrame:
-    """
-    Ищем сначала .xls, если нет — .xlsx. Берём лист 'Отзывы',
-    если нет такого — первый лист.
-    """
     for ext in (".xls", ".xlsx"):
         q = (
             f"'{folder_id}' in parents and "
@@ -76,15 +73,19 @@ def drive_download_reviews_file(drive, folder_id: str, filename_base: str) -> pd
             continue
         file_id = items[0]["id"]
         content = _download_drive_file(drive, file_id)
-        # читаем Excel
         bio = io.BytesIO(content)
         try:
             xls = pd.ExcelFile(bio)
         except Exception:
-            # .xls может требовать xlrd: попробуем engine
-            xls = pd.ExcelFile(bio, engine="xlrd")
+            xls = pd.ExcelFile(bio, engine="xlrd")  # .xls
         sheet = "Отзывы" if "Отзывы" in xls.sheet_names else xls.sheet_names[0]
-        return pd.read_excel(bio, sheet_name=sheet)
+        df = pd.read_excel(io.BytesIO(content), sheet_name=sheet)
+        # строгая проверка колонок
+        need = {"Дата","Рейтинг","Источник","Текст отзыва"}
+        miss = [c for c in need if c not in set(df.columns)]
+        if miss:
+            raise RuntimeError(f"Нет колонок {miss} на листе '{sheet}'")
+        return df
     raise RuntimeError(f"Файл {filename_base}.xls(x) не найден в папке {folder_id}")
 
 def ensure_tab_exists(sheets, spreadsheet_id: str, tab_name: str, header: List[str]):
@@ -123,6 +124,7 @@ def append_df_to_sheet(sheets, spreadsheet_id: str, tab_name: str, df: pd.DataFr
 
 # ---------- RAW (1 строка = 1 отзыв)
 
+# === B) RAW: одна строка = один отзыв ===
 def build_reviews_semantic_raw_df(raw_df: pd.DataFrame) -> pd.DataFrame:
     cols = {c.lower().strip(): c for c in raw_df.columns}
     def pick(*names):
@@ -138,8 +140,10 @@ def build_reviews_semantic_raw_df(raw_df: pd.DataFrame) -> pd.DataFrame:
     if not all([col_date, col_rate, col_source, col_text]):
         raise RuntimeError("Нет обязательных столбцов: дата/рейтинг/источник/текст")
 
-    rows = []
-    for _, rr in raw_df.iterrows():
+    today = pd.Timestamp.utcnow().normalize()
+    rows, skipped = [], 0
+
+    for idx, rr in raw_df.iterrows():
         payload = {
             "date": rr[col_date],
             "source": rr[col_source],
@@ -148,10 +152,18 @@ def build_reviews_semantic_raw_df(raw_df: pd.DataFrame) -> pd.DataFrame:
             "lang_hint": (rr[col_lang] if col_lang else ""),
         }
         try:
-            rows.append(build_semantic_row(payload))
+            row = build_semantic_row(payload)
+            # фильтр «странных» будущих дат: > сегодня + 7 дней => скип
+            dt = pd.to_datetime(row["date"], errors="coerce")
+            if pd.isna(dt) or dt > (today + pd.Timedelta(days=7)):
+                skipped += 1
+                continue
+            rows.append(row)
         except Exception as e:
-            print(f"[WARN] skip row: {e}")
+            skipped += 1
+            print(f"[WARN] skip row #{idx}: {e}")
 
+    print(f"[INFO] built {len(rows)} rows; skipped={skipped}")
     df = pd.DataFrame(rows)
     if df.empty:
         return pd.DataFrame(columns=[
@@ -159,10 +171,8 @@ def build_reviews_semantic_raw_df(raw_df: pd.DataFrame) -> pd.DataFrame:
             "source","rating10","sentiment_overall",
             "topics_pos","topics_neg","topics_all","pair_tags","quote_candidates"
         ])
+    return df.sort_values(by=["date","source","review_id"], ignore_index=True)
 
-    # читаемость «сырых»: по дате/источнику/id
-    df = df.sort_values(by=["date","source","review_id"], ascending=[True,True,True], ignore_index=True)
-    return df
 
 # ---------- Aggregations
 
