@@ -11,19 +11,20 @@
 # - Причины проблем с заселением
 # - Цитаты гостей
 #
-# ВАЖНО:
-# - Здесь нет форматирования HTML. Это чистая аналитика.
-# - Здесь нет отправки писем.
-#
 # Совместимо с Python 3.11
 
 from __future__ import annotations
 from typing import List, Dict, Any, Optional, Tuple
 import re
 import math
+import json
+import hashlib
+import unicodedata
+from datetime import datetime
 import pandas as pd
 import numpy as np
 from dataclasses import dataclass
+
 
 ###############################################################################
 # 0. Нормализация языка и текста
@@ -84,25 +85,69 @@ def normalize_lang(raw_lang: Optional[str], text: str) -> str:
 
 def translate_to_ru(text: str, lang: str) -> str:
     """
-    Заглушка. В перспективе:
-    - сюда можно встроить реальный переводчик (вызов API или локальная модель)
-    - для арабского, турецкого, китайского, английского.
+    Псевдо-перевод частых сервисных слов в «условно русский словарь».
+    Это НЕ машинный перевод и он специально очень узкий.
 
-    Сейчас:
-    - Если это русский (или кириллица), возвращаем как есть
-    - Иначе возвращаем оригинал без перевода (чтобы пайплайн не ломался)
+    Логика:
+    - Если в тексте уже есть кириллица — возвращаем как есть.
+    - Если язык не ru — делаем лексическую подмену типичных отельных слов
+      (wifi → вайфай, breakfast → завтрак, noisy → шумно и т.д.).
+    Это повышает шанс, что русские паттерны сработают одинаково для
+    англ/тур/прочих отзывов.
     """
-    if lang == "ru":
-        return text
-    if CYRILLIC_RE.search(text):
-        return text
-    # TODO: сюда потом вставим фактический перевод
-    return text
+    if not text:
+        return ""
 
-# --- add below translate_to_ru ---
-import re, unicodedata
+    # если кириллица уже есть — просто вернуть
+    if lang == "ru" or CYRILLIC_RE.search(text):
+        return text
 
-WI_FI_UNIFY = re.compile(r"\b(wi[\s\-]?[fi]|вай[\s\-]?[фа]й)\b", re.I)
+    # словарь частых соответствий
+    lex_map = {
+        # английский
+        r"\bwifi\b": "вайфай",
+        r"\bwi[- ]?fi\b": "вайфай",
+        r"\binternet\b": "интернет",
+        r"\bbreakfast\b": "завтрак",
+        r"\bstaff\b": "персонал",
+        r"\breception\b": "ресепшен",
+        r"\bcheck[- ]?in\b": "заселение",
+        r"\bcheckin\b": "заселение",
+        r"\bcheck[- ]?out\b": "выезд",
+        r"\broom\b": "номер",
+        r"\bclean\b": "чисто",
+        r"\bdirty\b": "грязно",
+        r"\bnoise[y]?\b": "шумно",
+        r"\bnoisy\b": "шумно",
+        r"\blocation\b": "расположение",
+        r"\bexpensive\b": "дорого",
+        r"\bprice\b": "цена",
+        r"\bvalue for money\b": "соотношение цена качество",
+        r"\bbad value\b": "не соответствует цене",
+        r"\bair ?conditioning\b": "кондиционер",
+        r"\bheating\b": "отопление",
+
+        # турецкий
+        r"\bwifi\b": "вайфай",
+        r"\binternet\b": "интернет",
+        r"\bkahvalt[ıi]\b": "завтрак",
+        r"\bpersonel\b": "персонал",
+        r"\btemiz\b": "чисто",
+        r"\bkirli\b": "грязно",
+        r"\bgürült[üu]\b": "шумно",
+        r"\bkonum\b": "расположение",
+        r"\bpahalı\b": "дорого",
+    }
+
+    out = text
+    for pat, repl in lex_map.items():
+        out = re.sub(pat, repl, out, flags=re.IGNORECASE)
+
+    return out
+
+# Нормализация текста
+
+WI_FI_UNIFY = re.compile(r"\b(wi[\s\-]?[fi]|вай[\s\-]?[фа]й)\b", re.IGNORECASE)
 MULTISPACE = re.compile(r"\s+")
 URL = re.compile(r"https?://\S+|www\.\S+")
 EMAIL = re.compile(r"\b[\w.\-+%]+@[\w.\-]+\.[A-Za-z]{2,}\b")
@@ -111,11 +156,13 @@ HTML = re.compile(r"<[^>]+>")
 
 def normalize_text_basic(text: str, lang: str) -> str:
     """
-    Очистка и унификация текста перед лингвистикой.
-    - убираем URL/почты/телефоны/HTML;
-    - нормализуем юникод (NFKC), приводим к lower;
-    - унифицируем варианты 'wi-fi'/'wifi'/'вай фай';
-    - схлопываем пробелы.
+    ОЧИСТКА:
+    - убираем html-теги, url, e-mail, телефоны;
+    - нормализуем юникод (NFKC);
+    - приводим к lower;
+    - унифицируем написание 'wi-fi'/'wifi'/'вай фай' -> 'wi-fi';
+    - схлопываем лишние пробелы.
+    Это делается ДО анализа тональности и тем.
     """
     if not text:
         return ""
@@ -129,6 +176,7 @@ def normalize_text_basic(text: str, lang: str) -> str:
     t = WI_FI_UNIFY.sub("wi-fi", t)
     t = MULTISPACE.sub(" ", t).strip()
     return t
+
 
 ###############################################################################
 # 1. Нормализация рейтинга и базовая тональность
@@ -340,6 +388,39 @@ NEUTRAL_WORDS = {
     ],
 }
 
+def _get_lexicons_for_lang(lang: str) -> Tuple[List[str], List[str], List[str], List[str], List[str]]:
+    """
+    Возвращает кортеж списков regex:
+    (strong_neg, soft_neg, strong_pos, soft_pos, neutrals)
+    с fallback на английский, если языка нет явно.
+    """
+    key = lang if lang in NEGATIVE_WORDS_STRONG else "en"
+
+    strong_neg = NEGATIVE_WORDS_STRONG.get(key, [])
+    soft_neg   = NEGATIVE_WORDS_SOFT.get(key, [])
+    strong_pos = POSITIVE_WORDS_STRONG.get(key, [])
+    soft_pos   = POSITIVE_WORDS_SOFT.get(key, [])
+    neutrals   = NEUTRAL_WORDS.get(key, [])
+
+    return (strong_neg, soft_neg, strong_pos, soft_pos, neutrals)
+
+
+# Негаторы (языковые частицы отрицания)
+RU_NEG = r"(не|без)\s+"
+EN_NEG = r"(not|no|without|never)\s+"
+TR_NEG = r"(değil|yok|olm[aı]yor)\s+"
+
+def _negated(text: str, lang: str, term_regex: str) -> bool:
+    """
+    True, если перед term_regex стоит отрицание.
+    Т.е. 'не грязно' не считаем грязью, 'not dirty' не считаем грязью.
+    """
+    if lang == "ru":
+        return re.search(rf"{RU_NEG}\w{{0,3}}(?:{term_regex})", text, flags=re.IGNORECASE) is not None
+    if lang == "tr":
+        return re.search(rf"{TR_NEG}\w{{0,3}}(?:{term_regex})", text, flags=re.IGNORECASE) is not None
+    # fallback → английский
+    return re.search(rf"{EN_NEG}\w{{0,3}}(?:{term_regex})", text, flags=re.IGNORECASE) is not None
 
 
 def _match_any(patterns: List[str], text: str) -> bool:
@@ -351,117 +432,106 @@ def _match_any(patterns: List[str], text: str) -> bool:
 
 def detect_sentiment_label(text: str, lang: str, fallback_rating10: Optional[float]) -> str:
     """
-    Классифицирует отзыв целиком: 'pos' / 'neg' / 'neu'.
-
+    Общая тональность отзыва.
     Приоритет:
-    1. сильный негатив
+    1. сильный негатив (учитывая negation — 'не грязно' не считается)
     2. мягкий негатив
-    3. сильный позитив
+    3. сильный позитив (если 'не хорошо' → трактуем как мягкий негатив)
     4. мягкий позитив
-    5. явные нейтральные конструкции
-    6. fallback по оценке
+    5. нейтральные маркеры
+    6. fallback по рейтингу /10
     """
-
-    lang_key = lang if lang in NEGATIVE_WORDS_STRONG else "en"
+    (strong_neg, soft_neg, strong_pos, soft_pos, neutrals) = _get_lexicons_for_lang(lang)
 
     # 1. сильный негатив
-    if _match_any(NEGATIVE_WORDS_STRONG.get(lang_key, []), text):
-        return "neg"
+    for rgx in strong_neg:
+        if re.search(rgx, text, flags=re.IGNORECASE) and not _negated(text, lang, rgx):
+            return "neg"
 
     # 2. мягкий негатив
-    if _match_any(NEGATIVE_WORDS_SOFT.get(lang_key, []), text):
-        return "neg"
+    for rgx in soft_neg:
+        if re.search(rgx, text, flags=re.IGNORECASE) and not _negated(text, lang, rgx):
+            return "neg"
 
     # 3. сильный позитив
-    if _match_any(POSITIVE_WORDS_STRONG.get(lang_key, []), text):
-        return "pos"
+    for rgx in strong_pos:
+        if re.search(rgx, text, flags=re.IGNORECASE):
+            # если "не отлично" -> это жалоба
+            if _negated(text, lang, rgx):
+                return "neg"
+            return "pos"
 
     # 4. мягкий позитив
-    if _match_any(POSITIVE_WORDS_SOFT.get(lang_key, []), text):
-        return "pos"
+    for rgx in soft_pos:
+        if re.search(rgx, text, flags=re.IGNORECASE):
+            if _negated(text, lang, rgx):
+                return "neg"
+            return "pos"
 
-    # 5. нейтральная лексика
-    if _match_any(NEUTRAL_WORDS.get(lang_key, []), text):
-        return "neu"
+    # 5. явная нейтральная лексика
+    for rgx in neutrals:
+        if re.search(rgx, text, flags=re.IGNORECASE):
+            return "neu"
 
-    # 6. fallback по оценке
+    # 6. fallback по рейтингу
     if fallback_rating10 is not None:
         if fallback_rating10 >= 9.0:
             return "pos"
         if fallback_rating10 <= 6.0:
             return "neg"
 
-    # если средняя зона (7-8/10) или вообще нет оценки — считаем нейтрально
     return "neu"
 
 
-def detect_subtopic_sentiment(text: str, lang: str, subtopic_patterns: list[str] | None = None) -> str:
+def detect_subtopic_sentiment(text: str, lang: str, subtopic_patterns: Optional[List[str]] = None) -> str:
     """
-    Оценивает тональность фрагмента по подтеме.
-    Если переданы subtopic_patterns (regex), анализируем окна ±40 символов вокруг совпадений;
-    иначе — по всему тексту.
-    Негаторы учитываются: "не грязно" → не считаем негативом; "не хорошо" → слабый негатив.
+    Тональность по конкретной подтеме.
+    Если subtopic_patterns даны, смотрим окно ±40 символов вокруг каждого совпадения,
+    иначе смотрим весь текст.
     """
     if not text:
         return "neu"
 
-    candidates = [text]
+    # соберём кандидаты-фрагменты
+    candidates: List[str] = [text]
     if subtopic_patterns:
-        spans = []
+        spans: List[str] = []
         for pat in subtopic_patterns:
-            for m in re.finditer(pat, text, flags=re.I):
+            for m in re.finditer(pat, text, flags=re.IGNORECASE):
                 s, e = m.span()
-                spans.append(text[max(0, s-40): min(len(text), e+40)])
+                spans.append(text[max(0, s - 40): min(len(text), e + 40)])
         if spans:
             candidates = spans
 
-    # приоритет: strong neg > soft neg > strong pos > soft pos > neutral
-    strong_neg, soft_neg, strong_pos, soft_pos, neutrals = _get_lexicons_for_lang(lang)
+    (strong_neg, soft_neg, strong_pos, soft_pos, neutrals) = _get_lexicons_for_lang(lang)
 
     for chunk in candidates:
-        # strong neg (с проверкой негаторов)
+        # сильный негатив
         for rgx in strong_neg:
-            if re.search(rgx, chunk, re.I) and not _negated(chunk, lang, rgx):
+            if re.search(rgx, chunk, flags=re.IGNORECASE) and not _negated(chunk, lang, rgx):
                 return "neg"
-        # soft neg
+        # мягкий негатив
         for rgx in soft_neg:
-            if re.search(rgx, chunk, re.I) and not _negated(chunk, lang, rgx):
+            if re.search(rgx, chunk, flags=re.IGNORECASE) and not _negated(chunk, lang, rgx):
                 return "neg"
-        # strong pos (отрицание → считаем мягким негативом)
+        # сильный позитив
         for rgx in strong_pos:
-            if re.search(rgx, chunk, re.I):
+            if re.search(rgx, chunk, flags=re.IGNORECASE):
                 if _negated(chunk, lang, rgx):
                     return "neg"
                 return "pos"
-        # soft pos
+        # мягкий позитив
         for rgx in soft_pos:
-            if re.search(rgx, chunk, re.I):
+            if re.search(rgx, chunk, flags=re.IGNORECASE):
                 if _negated(chunk, lang, rgx):
                     return "neg"
                 return "pos"
-        # нейтрали
+        # нейтрально
         for rgx in neutrals:
-            if re.search(rgx, chunk, re.I):
+            if re.search(rgx, chunk, flags=re.IGNORECASE):
                 return "neu"
 
     return "neu"
-
-# --- add negation helpers ---
-RU_NEG = r"(не|без)\s+"
-EN_NEG = r"(not|no|without|never)\s+"
-TR_NEG = r"(değil|yok|olm[aı]yor)\s+"
-
-def _negated(text: str, lang: str, term_regex: str) -> bool:
-    """
-    True, если перед term_regex стоит языковой негатор (в пределах 2-3 символов).
-    """
-    if lang == "ru":
-        return re.search(rf"{RU_NEG}\w{{0,3}}(?:{term_regex})", text, re.I) is not None
-    if lang == "tr":
-        return re.search(rf"{TR_NEG}\w{{0,3}}(?:{term_regex})", text, re.I) is not None
-    # default → en
-    return re.search(rf"{EN_NEG}\w{{0,3}}(?:{term_regex})", text, re.I) is not None
-
 
 ###############################################################################
 # 2. Схема тем (Категория -> Подтемы -> Аспекты)
@@ -5540,3 +5610,218 @@ def summarize_checkin_line(root_cause_text: Optional[str]) -> str:
         + root_cause_text +
         "</p>"
     )
+def parse_date_to_datetime(date_raw: Any) -> datetime:
+    """
+    Унификация даты отзыва из XLS. Принимаем datetime, pandas.Timestamp или строку.
+    Возвращаем datetime без таймзоны.
+    """
+    if isinstance(date_raw, datetime):
+        return date_raw
+    try:
+        return pd.to_datetime(date_raw).to_pydatetime().replace(tzinfo=None)
+    except Exception:
+        # если совсем мусор — ставим сегодняшнюю дату
+        return datetime.utcnow().replace(tzinfo=None)
+
+
+def derive_period_keys(dt: datetime) -> Tuple[str, str, str, str]:
+    """
+    На базе даты делаем ключи периодов:
+    - неделя формата YYYY-W## (ISO неделя)
+    - месяц YYYY-MM
+    - квартал YYYY-Q#
+    - год YYYY
+    """
+    iso_year, iso_week, _ = dt.isocalendar()  # (год ISO, номер недели, день)
+    week_key = f"{iso_year}-W{iso_week:02d}"
+
+    month_key = f"{dt.year}-{dt.month:02d}"
+
+    quarter = (dt.month - 1) // 3 + 1
+    quarter_key = f"{dt.year}-Q{quarter}"
+
+    year_key = f"{dt.year}"
+
+    return week_key, month_key, quarter_key, year_key
+
+
+def build_review_id(dt: datetime, source: str, raw_text: str) -> str:
+    """
+    Делаем стабильный ID отзыва:
+    sha1(<yyyy-mm-dd>|<source>|<первые 200 символов текста>)
+    """
+    base = f"{dt.date().isoformat()}|{source}|{raw_text[:200]}"
+    return hashlib.sha1(base.encode("utf-8")).hexdigest()
+
+
+SENTENCE_SPLIT_RE = re.compile(r"[.!?…]+[\s\n]+")
+
+def extract_clean_quotes(text_clean: str) -> List[str]:
+    """
+    Берём 1-3 характерных предложения из текста отзыва
+    - уже без URL/e-mail/телефонов (normalize_text_basic это сделал)
+    - отбрасываем слишком короткие (<15 симв) и слишком длинные (>300 симв)
+    """
+    if not text_clean:
+        return []
+    # режем по предложениям
+    parts = SENTENCE_SPLIT_RE.split(text_clean)
+    quotes = []
+    for p in parts:
+        p2 = p.strip()
+        if 15 <= len(p2) <= 300:
+            quotes.append(p2)
+        if len(quotes) >= 3:
+            break
+    return quotes
+
+
+def build_semantic_row(review_raw: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Главная функция для backfill/weekly:
+    превращает одну сырую строку отзыва (как в XLS)
+    в нормализованную семантическую запись.
+
+    Ожидается, что review_raw содержит минимум:
+    - 'date'         -> дата отзыва (str/datetime)
+    - 'source'       -> источник (Booking/Google/...)
+    - 'rating_raw'   -> оригинальная оценка (строка/цифра)
+    - 'text'         -> текст отзыва
+    - 'lang_hint'    -> код языка источника (может быть None)
+    """
+
+    raw_text = review_raw.get("text", "") or ""
+    lang_hint = review_raw.get("lang_hint", "")
+
+    # язык
+    lang_norm = normalize_lang(lang_hint, raw_text)
+
+    # очистили текст
+    text_clean = normalize_text_basic(raw_text, lang_norm)
+
+    # псевдо-перевод в русскую лексику
+    text_ru = translate_to_ru(text_clean, lang_norm)
+
+    # рейтинг в /10
+    rating10 = normalize_rating_to_10(review_raw.get("rating_raw"))
+
+    # общая тональность
+    sentiment_overall = detect_sentiment_label(
+        text_clean,
+        lang_norm,
+        rating10
+    )
+
+    # извлечение аспектов
+    topics_pos: set[str] = set()
+    topics_neg: set[str] = set()
+    topics_all: set[str] = set()
+
+    # вспомогательное: храним инфо для последующей классификации пар
+    # (aspect_key, is_pos, is_neg)
+    aspect_sentiment_flags: List[Tuple[str, bool, bool]] = []
+
+    for topic_name, topic_def in TOPIC_SCHEMA.items():
+        for subtopic_name, sub_def in topic_def["subtopics"].items():
+            patterns_lang = sub_def.get("patterns", {})
+            # выбираем паттерны для текущего языка, либо fallback 'en'
+            pats = patterns_lang.get(lang_norm) or patterns_lang.get("en") or []
+            if not pats:
+                continue
+
+            # проверяем, встречается ли подтема
+            matched = False
+            for pat in pats:
+                if re.search(pat, text_clean, flags=re.IGNORECASE):
+                    matched = True
+                    break
+            if not matched:
+                continue
+
+            # локальная тональность по подтеме
+            sent_local = detect_subtopic_sentiment(
+                text_clean,
+                lang_norm,
+                subtopic_patterns=pats
+            )
+
+            # нормализованный аспект
+            aspects_list = sub_def.get("aspects", [])
+            if aspects_list:
+                aspect_key = aspects_list[0]
+            else:
+                aspect_key = f"{topic_name}.{subtopic_name}"
+
+            topics_all.add(aspect_key)
+
+            if sent_local == "pos":
+                topics_pos.add(aspect_key)
+                aspect_sentiment_flags.append((aspect_key, True, False))
+            elif sent_local == "neg":
+                topics_neg.add(aspect_key)
+                aspect_sentiment_flags.append((aspect_key, False, True))
+            else:
+                aspect_sentiment_flags.append((aspect_key, False, False))
+
+    # построение связок аспектов (co-occurrence)
+    pair_tags: List[Dict[str, str]] = []
+    seen_pairs: set[Tuple[str, str]] = set()
+    aspects_list_all = list(topics_all)
+
+    for i in range(len(aspects_list_all)):
+        for j in range(i + 1, len(aspects_list_all)):
+            a = aspects_list_all[i]
+            b = aspects_list_all[j]
+            pair_sorted = tuple(sorted([a, b]))
+            if pair_sorted in seen_pairs:
+                continue
+            seen_pairs.add(pair_sorted)
+
+            # определяем категорию пары:
+            a_pos = any(x[0] == a and x[1] for x in aspect_sentiment_flags)
+            a_neg = any(x[0] == a and x[2] for x in aspect_sentiment_flags)
+            b_pos = any(x[0] == b and x[1] for x in aspect_sentiment_flags)
+            b_neg = any(x[0] == b and x[2] for x in aspect_sentiment_flags)
+
+            if a_neg and b_neg:
+                cat = "systemic_risk"
+            elif (a_pos and b_neg) or (b_pos and a_neg):
+                cat = "expectations_conflict"
+            elif a_pos and b_pos:
+                cat = "loyalty_driver"
+            else:
+                # пара не несёт смысла для отчёта — пропускаем
+                continue
+
+            pair_tags.append({
+                "a": a,
+                "b": b,
+                "cat": cat,
+            })
+
+    # цитаты-кандидаты
+    quote_candidates = extract_clean_quotes(text_clean)
+
+    # периоды
+    dt = parse_date_to_datetime(review_raw.get("date"))
+    week_key, month_key, quarter_key, year_key = derive_period_keys(dt)
+
+    # стабильный id
+    review_id = build_review_id(dt, review_raw.get("source", ""), raw_text)
+
+    return {
+        "review_id": review_id,
+        "date": dt.date().isoformat(),
+        "week_key": week_key,
+        "month_key": month_key,
+        "quarter_key": quarter_key,
+        "year_key": year_key,
+        "source": review_raw.get("source", ""),
+        "rating10": rating10,
+        "sentiment_overall": sentiment_overall,
+        "topics_pos": json.dumps(sorted(list(topics_pos)), ensure_ascii=False),
+        "topics_neg": json.dumps(sorted(list(topics_neg)), ensure_ascii=False),
+        "topics_all": json.dumps(sorted(list(topics_all)), ensure_ascii=False),
+        "pair_tags": json.dumps(pair_tags, ensure_ascii=False),
+        "quote_candidates": json.dumps(quote_candidates, ensure_ascii=False),
+    }
