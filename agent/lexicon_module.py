@@ -15370,10 +15370,420 @@ class Lexicon:
                     ],
                 },
             ),
+        }
+
+            # обратный индекс: куда относить найденный аспект в отчёте 
+            # ключ = aspect_code (тот же самый ключ, что в aspects_meta / aspect_rules) 
+            # значение = список (topic_code, subtopic_code)
+
+            self.aspect_to_subtopics: Dict[str, List[Tuple[str, str]]] = {
+            # --- staff_spir / отношение и работа персонала ---
+
+            # тон / настроение / вежливость
+            "spir_friendly": [("staff_spir", "staff_attitude")],
+            "spir_welcoming": [("staff_spir", "staff_attitude")],
+            "spir_helpful": [("staff_spir", "staff_attitude")],
+            "spir_unfriendly": [("staff_spir", "staff_attitude")],
+            "spir_rude": [("staff_spir", "staff_attitude")],
+            "spir_unprofessional": [("staff_spir", "staff_attitude")],
+            "spir_professional": [("staff_spir", "staff_attitude")],
+
+            # скорость и реакция
+            "spir_quick_response": [("staff_spir", "staff_responsiveness")],
+            "spir_slow_response": [("staff_spir", "staff_responsiveness")],
+            "spir_unresponsive": [("staff_spir", "staff_responsiveness")],
+            "spir_ignored_requests": [("staff_spir", "staff_responsiveness")],
+
+            # контактность / доступность
+            "spir_easy_contact": [("staff_spir", "staff_availability")],
+            "spir_hard_to_contact": [("staff_spir", "staff_availability")],
+            "spir_available": [("staff_spir", "staff_availability")],
+            "spir_not_available": [("staff_spir", "staff_availability")],
+
+            # решение проблем
+            "spir_problem_fixed_fast": [("staff_spir", "issue_resolution")],
+            "spir_problem_not_fixed": [("staff_spir", "issue_resolution")],
+
+            # язык общения
+            "spir_language_support_good": [("staff_spir", "language_support")],
+            "spir_language_support_bad": [("staff_spir", "language_support")],
+
+            # примеры из заготовки
+            "bed_uncomfortable": [("comfort", "sleep_quality")],
+            "spir_rude": [("staff_spir", "staff_attitude")],
+
+            # --- checkin_stay / Заселение и проживание ---
+
+            # checkin_speed
+            "checkin_fast": [("checkin_stay", "checkin_speed")],
+            "no_wait_checkin": [("checkin_stay", "checkin_speed")],
+            "checkin_wait_long": [("checkin_stay", "checkin_speed")],
+            "room_not_ready_delay": [("checkin_stay", "checkin_speed")],
+
+            # room_ready
+            "room_ready_on_arrival": [("checkin_stay", "room_ready")],
+            "clean_on_arrival": [("checkin_stay", "room_ready")],
+            "room_not_ready": [("checkin_stay", "room_ready")],
+            "dirty_on_arrival": [("checkin_stay", "room_ready")],
+            "leftover_trash_previous_guest": [("checkin_stay", "room_ready")],
+
+            # access
+            "access_smooth": [("checkin_stay", "access")],
+            "door_code_worked": [("checkin_stay", "access")],
+            "tech_access_issue": [("checkin_stay", "access")],
+            "entrance_hard_to_find": [("checkin_stay", "access")],
+            "no_elevator_baggage_issue": [("checkin_stay", "access")],
+
+            # docs_payment
+            "payment_clear": [("checkin_stay", "docs_payment")],
+            "deposit_clear": [("checkin_stay", "docs_payment")],
+            "docs_provided": [("checkin_stay", "docs_payment")],
+            "no_hidden_fees": [("checkin_stay", "docs_payment")],
+            "payment_confusing": [("checkin_stay", "docs_payment")],
+            "unexpected_charge": [("checkin_stay", "docs_payment")],
+            "hidden_fees": [("checkin_stay", "docs_payment")],
+            "deposit_problematic": [("checkin_stay", "docs_payment")],
+            "billing_mistake": [("checkin_stay", "docs_payment")],
+            "overcharge": [("checkin_stay", "docs_payment")],
+
+            # instructions
+            "instructions_clear": [("checkin_stay", "instructions")],
+            "self_checkin_easy": [("checkin_stay", "instructions")],
+            "wifi_info_given": [("checkin_stay", "instructions")],
+            "instructions_confusing": [("checkin_stay", "instructions")],
+            "late_access_code": [("checkin_stay", "instructions")],
+            "wifi_info_missing": [("checkin_stay", "instructions")],
+            "had_to_figure_out": [("checkin_stay", "instructions")],
+
+            # stay_support
+            "support_during_stay_good": [("checkin_stay", "stay_support")],
+            "issue_fixed_immediately": [("checkin_stay", "stay_support")],
+            "support_during_stay_slow": [("checkin_stay", "stay_support")],
+            "support_ignored": [("checkin_stay", "stay_support")],
+            "promised_not_done": [("checkin_stay", "stay_support")],
+
+            # checkout
+            "checkout_easy": [("checkin_stay", "checkout")],
+            "checkout_fast": [("checkin_stay", "checkout")],
+            "checkout_slow": [("checkin_stay", "checkout")],
+            "deposit_return_issue": [("checkin_stay", "checkout")],
+            "checkout_no_staff": [("checkin_stay", "checkout")],
+
+            # --- cleanliness / Чистота ---
+
+            # arrival_clean
+            "clean_on_arrival": [("cleanliness", "arrival_clean")],
+            "fresh_bedding": [("cleanliness", "arrival_clean")],
+            "no_dust_surfaces": [("cleanliness", "arrival_clean")],
+            "floor_clean": [("cleanliness", "arrival_clean")],
+            "dirty_on_arrival": [("cleanliness", "arrival_clean")],
+            "dusty_surfaces": [("cleanliness", "arrival_clean")],
+            "sticky_surfaces": [("cleanliness", "arrival_clean")],
+            "stained_bedding": [("cleanliness", "arrival_clean")],
+            "hair_on_bed": [("cleanliness", "arrival_clean")],
+            "leftover_trash_previous_guest": [("cleanliness", "arrival_clean")],
+            "used_towels_left": [("cleanliness", "arrival_clean")],
+            "crumbs_left": [("cleanliness", "arrival_clean")],
+
+            # bathroom_state
+            "bathroom_clean_on_arrival": [("cleanliness", "bathroom_state")],
+            "no_mold_visible": [("cleanliness", "bathroom_state")],
+            "sink_clean": [("cleanliness", "bathroom_state")],
+            "shower_clean": [("cleanliness", "bathroom_state")],
+            "bathroom_dirty_on_arrival": [("cleanliness", "bathroom_state")],
+            "hair_in_shower": [("cleanliness", "bathroom_state")],
+            "hair_in_sink": [("cleanliness", "bathroom_state")],
+            "mold_in_shower": [("cleanliness", "bathroom_state")],
+            "limescale_stains": [("cleanliness", "bathroom_state")],
+            "sewage_smell_bathroom": [("cleanliness", "bathroom_state")],
+
+            # stay_cleaning
+            "housekeeping_regular": [("cleanliness", "stay_cleaning")],
+            "trash_taken_out": [("cleanliness", "stay_cleaning")],
+            "bed_made": [("cleanliness", "stay_cleaning")],
+            "housekeeping_missed": [("cleanliness", "stay_cleaning")],
+            "trash_not_taken": [("cleanliness", "stay_cleaning")],
+            "bed_not_made": [("cleanliness", "stay_cleaning")],
+            "had_to_request_cleaning": [("cleanliness", "stay_cleaning")],
+            "dirt_accumulated": [("cleanliness", "stay_cleaning")],
+
+            # linen_towels
+            "towels_changed": [("cleanliness", "linen_towels")],
+            "fresh_towels_fast": [("cleanliness", "linen_towels")],
+            "linen_changed": [("cleanliness", "linen_towels")],
+            "amenities_restocked": [("cleanliness", "linen_towels")],
+            "towels_dirty": [("cleanliness", "linen_towels")],
+            "towels_stained": [("cleanliness", "linen_towels")],
+            "towels_smell": [("cleanliness", "linen_towels")],
+            "towels_not_changed": [("cleanliness", "linen_towels")],
+            "linen_not_changed": [("cleanliness", "linen_towels")],
+            "no_restock": [("cleanliness", "linen_towels")],
+
+            # smell
+            "smell_of_smoke": [("cleanliness", "smell")],
+            "chemical_smell_strong": [("cleanliness", "smell")],
+            "fresh_smell": [("cleanliness", "smell")],
+
+            # public_areas
+            "hallway_clean": [("cleanliness", "public_areas")],
+            "common_areas_clean": [("cleanliness", "public_areas")],
+            "hallway_dirty": [("cleanliness", "public_areas")],
+            "elevator_dirty": [("cleanliness", "public_areas")],
+            "hallway_bad_smell": [("cleanliness", "public_areas")],
+            "entrance_feels_unsafe": [("cleanliness", "public_areas")],
+
+            # --- comfort / Комфорт проживания ---
+
+            # room_equipment
+            "room_well_equipped": [("comfort", "room_equipment")],
+            "kettle_available": [("comfort", "room_equipment")],
+            "fridge_available": [("comfort", "room_equipment")],
+            "hairdryer_available": [("comfort", "room_equipment")],
+            "sockets_enough": [("comfort", "room_equipment")],
+            "workspace_available": [("comfort", "room_equipment")],
+            "luggage_space_ok": [("comfort", "room_equipment")],
+            "kettle_missing": [("comfort", "room_equipment")],
+            "fridge_missing": [("comfort", "room_equipment")],
+            "hairdryer_missing": [("comfort", "room_equipment")],
+            "sockets_not_enough": [("comfort", "room_equipment")],
+            "no_workspace": [("comfort", "room_equipment")],
+            "no_luggage_space": [("comfort", "room_equipment")],
+
+            # sleep_quality
+            "bed_comfy": [("comfort", "sleep_quality")],
+            "mattress_comfy": [("comfort", "sleep_quality")],
+            "pillow_comfy": [("comfort", "sleep_quality")],
+            "slept_well": [("comfort", "sleep_quality")],
+            "bed_uncomfortable": [("comfort", "sleep_quality")],
+            "mattress_too_soft": [("comfort", "sleep_quality")],
+            "mattress_too_hard": [("comfort", "sleep_quality")],
+            "mattress_sagging": [("comfort", "sleep_quality")],
+            "bed_creaks": [("comfort", "sleep_quality")],
+            "pillow_uncomfortable": [("comfort", "sleep_quality")],
+            "pillow_too_hard": [("comfort", "sleep_quality")],
+            "pillow_too_high": [("comfort", "sleep_quality")],
+
+            # noise
+            "quiet_room": [("comfort", "noise")],
+            "good_soundproofing": [("comfort", "noise")],
+            "no_street_noise": [("comfort", "noise")],
+            "noisy_room": [("comfort", "noise")],
+            "street_noise": [("comfort", "noise")],
+            "thin_walls": [("comfort", "noise")],
+            "hallway_noise": [("comfort", "noise")],
+            "night_noise_trouble_sleep": [("comfort", "noise")],
+
+            # climate
+            "temp_comfortable": [("comfort", "climate")],
+            "ventilation_ok": [("comfort", "climate")],
+            "ac_working": [("comfort", "climate")],
+            "heating_working": [("comfort", "climate")],
+            "too_hot_sleep_issue": [("comfort", "climate")],
+            "too_cold": [("comfort", "climate")],
+            "stuffy_no_air": [("comfort", "climate")],
+            "no_ventilation": [("comfort", "climate")],
+            "ac_not_working": [("comfort", "climate")],
+            "no_ac": [("comfort", "climate")],
+            "heating_not_working": [("comfort", "climate")],
+            "draft_window": [("comfort", "climate")],
+
+            # space_light
+            "room_spacious": [("comfort", "space_light")],
+            "good_layout": [("comfort", "space_light")],
+            "cozy_feel": [("comfort", "space_light")],
+            "bright_room": [("comfort", "space_light")],
+            "big_windows": [("comfort", "space_light")],
+            "room_small": [("comfort", "space_light")],
+            "no_space_for_luggage": [("comfort", "space_light")],
+            "dark_room": [("comfort", "space_light")],
+            "no_natural_light": [("comfort", "space_light")],
+
+            # --- tech_state / Техническое состояние и инфраструктура ---
+
+            # plumbing_water
+            "hot_water_ok": [("tech_state", "plumbing_water")],
+            "water_pressure_ok": [("tech_state", "plumbing_water")],
+            "shower_ok": [("tech_state", "plumbing_water")],
+            "no_leak": [("tech_state", "plumbing_water")],
+            "no_hot_water": [("tech_state", "plumbing_water")],
+            "weak_pressure": [("tech_state", "plumbing_water")],
+            "shower_broken": [("tech_state", "plumbing_water")],
+            "leak_water": [("tech_state", "plumbing_water")],
+            "bathroom_flooding": [("tech_state", "plumbing_water")],
+            "drain_clogged": [("tech_state", "plumbing_water")],
+            "drain_smell": [("tech_state", "plumbing_water")],
+
+            # appliances_equipment
+            "ac_working_device": [("tech_state", "appliances_equipment")],
+            "heating_working_device": [("tech_state", "appliances_equipment")],
+            "appliances_ok": [("tech_state", "appliances_equipment")],
+            "tv_working": [("tech_state", "appliances_equipment")],
+            "fridge_working": [("tech_state", "appliances_equipment")],
+            "kettle_working": [("tech_state", "appliances_equipment")],
+            "door_secure": [("tech_state", "appliances_equipment")],
+            "ac_broken": [("tech_state", "appliances_equipment")],
+            "heating_broken": [("tech_state", "appliances_equipment")],
+            "tv_broken": [("tech_state", "appliances_equipment")],
+            "fridge_broken": [("tech_state", "appliances_equipment")],
+            "kettle_broken": [("tech_state", "appliances_equipment")],
+            "socket_danger": [("tech_state", "appliances_equipment")],
+            "door_not_closing": [("tech_state", "appliances_equipment")],
+            "lock_broken": [("tech_state", "appliances_equipment")],
+            "furniture_broken": [("tech_state", "appliances_equipment")],
+            "room_worn_out": [("tech_state", "appliances_equipment")],
+
+            # wifi_internet
+            "wifi_fast": [("tech_state", "wifi_internet")],
+            "internet_stable": [("tech_state", "wifi_internet")],
+            "good_for_work": [("tech_state", "wifi_internet")],
+            "wifi_down": [("tech_state", "wifi_internet")],
+            "wifi_slow": [("tech_state", "wifi_internet")],
+            "wifi_unstable": [("tech_state", "wifi_internet")],
+            "wifi_hard_to_connect": [("tech_state", "wifi_internet")],
+            "internet_not_suitable_for_work": [("tech_state", "wifi_internet")],
+
+            # tech_noise
+            "ac_noisy": [("tech_state", "tech_noise")],
+            "fridge_noisy": [("tech_state", "tech_noise")],
+            "pipes_noise": [("tech_state", "tech_noise")],
+            "ventilation_noisy": [("tech_state", "tech_noise")],
+            "night_mechanical_hum": [("tech_state", "tech_noise")],
+            "tech_noise_sleep_issue": [("tech_state", "tech_noise")],
+            "ac_quiet": [("tech_state", "tech_noise")],
+            "fridge_quiet": [("tech_state", "tech_noise")],
+            "no_tech_noise_night": [("tech_state", "tech_noise")],
+
+            # elevator_infrastructure
+            "elevator_working": [("tech_state", "elevator_infrastructure")],
+            "luggage_easy": [("tech_state", "elevator_infrastructure")],
+            "elevator_broken": [("tech_state", "elevator_infrastructure")],
+            "elevator_stuck": [("tech_state", "elevator_infrastructure")],
+            "no_elevator_heavy_bags": [("tech_state", "elevator_infrastructure")],
+
+            # lock_security
+            "door_secure": [("tech_state", "lock_security")],
+            "felt_safe": [("tech_state", "lock_security")],
+            "door_not_closing": [("tech_state", "lock_security")],
+            "lock_broken": [("tech_state", "lock_security")],
+            "felt_unsafe": [("tech_state", "lock_security")],
+
+            # --- breakfast / Завтрак и питание ---
+
+            # food_quality
+            "breakfast_tasty": [("breakfast", "food_quality")],
+            "food_fresh": [("breakfast", "food_quality")],
+            "food_hot_served_hot": [("breakfast", "food_quality")],
+            "coffee_good": [("breakfast", "food_quality")],
+            "breakfast_bad_taste": [("breakfast", "food_quality")],
+            "food_not_fresh": [("breakfast", "food_quality")],
+            "food_cold": [("breakfast", "food_quality")],
+            "coffee_bad": [("breakfast", "food_quality")],
+
+            # variety_offering
+            "breakfast_variety_good": [("breakfast", "variety_offering")],
+            "buffet_rich": [("breakfast", "variety_offering")],
+            "fresh_fruit_available": [("breakfast", "variety_offering")],
+            "pastries_available": [("breakfast", "variety_offering")],
+            "breakfast_variety_poor": [("breakfast", "variety_offering")],
+            "breakfast_repetitive": [("breakfast", "variety_offering")],
+            "hard_to_find_food": [("breakfast", "variety_offering")],
+
+            # service_dining_staff
+            "breakfast_staff_friendly": [("breakfast", "service_dining_staff")],
+            "breakfast_staff_attentive": [("breakfast", "service_dining_staff")],
+            "buffet_refilled_quickly": [("breakfast", "service_dining_staff")],
+            "tables_cleared_fast": [("breakfast", "service_dining_staff")],
+            "breakfast_staff_rude": [("breakfast", "service_dining_staff")],
+            "no_refill_food": [("breakfast", "service_dining_staff")],
+            "tables_left_dirty": [("breakfast", "service_dining_staff")],
+            "ignored_requests": [("breakfast", "service_dining_staff")],
+
+            # availability_flow
+            "food_enough_for_all": [("breakfast", "availability_flow")],
+            "kept_restocking": [("breakfast", "availability_flow")],
+            "tables_available": [("breakfast", "availability_flow")],
+            "no_queue": [("breakfast", "availability_flow")],
+            "breakfast_flow_ok": [("breakfast", "availability_flow")],
+            "food_ran_out": [("breakfast", "availability_flow")],
+            "not_restocked": [("breakfast", "availability_flow")],
+            "had_to_wait_food": [("breakfast", "availability_flow")],
+            "no_tables_available": [("breakfast", "availability_flow")],
+            "long_queue": [("breakfast", "availability_flow")],
+
+            # cleanliness_breakfast
+            "breakfast_area_clean": [("breakfast", "cleanliness_breakfast")],
+            "tables_cleaned_quickly": [("breakfast", "cleanliness_breakfast")],
+            "dirty_tables": [("breakfast", "cleanliness_breakfast")],
+            "dirty_dishes_left": [("breakfast", "cleanliness_breakfast")],
+            "buffet_area_messy": [("breakfast", "cleanliness_breakfast")],
+
+
+            # --- value / Цена и ценность ---
+
+            # value_for_money
+            "good_value": [("value", "value_for_money")],
+            "worth_the_price": [("value", "value_for_money")],
+            "affordable_for_level": [("value", "value_for_money")],
+            "overpriced": [("value", "value_for_money")],
+            "not_worth_price": [("value", "value_for_money")],
+            "expected_better_for_price": [("value", "value_for_money")],
+
+            # expectations_vs_price
+            "photos_misleading": [("value", "expectations_vs_price")],
+            "quality_below_expectation": [("value", "expectations_vs_price")],
+
+
+            # --- location / Локация и окружение ---
+
+            # proximity_area
+            "great_location": [("location", "proximity_area")],
+            "central_convenient": [("location", "proximity_area")],
+            "near_transport": [("location", "proximity_area")],
+            "area_has_food_shops": [("location", "proximity_area")],
+            "location_inconvenient": [("location", "proximity_area")],
+            "far_from_center": [("location", "proximity_area")],
+            "nothing_around": [("location", "proximity_area")],
+
+            # safety_environment
+            "area_safe": [("location", "safety_environment")],
+            "area_quiet_at_night": [("location", "safety_environment")],
+            "entrance_clean": [("cleanliness", "public_areas"), ("location", "safety_environment")],
+            "area_unsafe": [("location", "safety_environment")],
+            "uncomfortable_at_night": [("location", "safety_environment")],
+            "entrance_dirty": [("cleanliness", "public_areas"), ("location", "safety_environment")],
+            "people_loitering": [("location", "safety_environment")],
+
+            # access_navigation
+            "easy_to_find": [("location", "access_navigation")],
+            "clear_instructions": [("location", "access_navigation")],
+            "luggage_access_ok": [("location", "access_navigation")],
+            "hard_to_find_entrance": [("location", "access_navigation")],
+            "confusing_access": [("location", "access_navigation")],
+            "no_signage": [("location", "access_navigation")],
+            "luggage_access_hard": [("location", "access_navigation")],
+
+
+            # --- atmosphere / Атмосфера и общее впечатление ---
+
+            # style_feel
+            "cozy_atmosphere": [("atmosphere", "style_feel")],
+            "nice_design": [("atmosphere", "style_feel")],
+            "good_vibe": [("atmosphere", "style_feel")],
+            "not_cozy": [("atmosphere", "style_feel")],
+            "gloomy_feel": [("comfort", "space_light"), ("atmosphere", "style_feel")],
+            "dated_look": [("atmosphere", "style_feel")],
+            "soulless_feel": [("atmosphere", "style_feel")],
+
+            # smell_common_areas
+            "fresh_smell_common": [("atmosphere", "smell_common_areas")],
+            "no_bad_smell": [("cleanliness", "smell"), ("atmosphere", "smell_common_areas")],
+            "bad_smell_common": [("atmosphere", "smell_common_areas")],
+            "cigarette_smell": [("atmosphere", "smell_common_areas")],
+            "sewage_smell": [("cleanliness", "smell"), ("atmosphere", "smell_common_areas")],
+            "musty_smell": [("cleanliness", "smell"), ("atmosphere", "smell_common_areas")],
 
         }
 
-    
     ###########################################################################
     # 3. Публичные методы доступа
     ###########################################################################
