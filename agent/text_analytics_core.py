@@ -99,6 +99,36 @@ def translate_to_ru(text: str, lang: str) -> str:
     # TODO: сюда потом вставим фактический перевод
     return text
 
+# --- add below translate_to_ru ---
+import re, unicodedata
+
+WI_FI_UNIFY = re.compile(r"\b(wi[\s\-]?[fi]|вай[\s\-]?[фа]й)\b", re.I)
+MULTISPACE = re.compile(r"\s+")
+URL = re.compile(r"https?://\S+|www\.\S+")
+EMAIL = re.compile(r"\b[\w.\-+%]+@[\w.\-]+\.[A-Za-z]{2,}\b")
+PHONE = re.compile(r"\+?\d[\d\-\s()]{6,}\d")
+HTML = re.compile(r"<[^>]+>")
+
+def normalize_text_basic(text: str, lang: str) -> str:
+    """
+    Очистка и унификация текста перед лингвистикой.
+    - убираем URL/почты/телефоны/HTML;
+    - нормализуем юникод (NFKC), приводим к lower;
+    - унифицируем варианты 'wi-fi'/'wifi'/'вай фай';
+    - схлопываем пробелы.
+    """
+    if not text:
+        return ""
+    t = str(text)
+    t = unicodedata.normalize("NFKC", t)
+    t = HTML.sub(" ", t)
+    t = URL.sub(" ", t)
+    t = EMAIL.sub(" ", t)
+    t = PHONE.sub(" ", t)
+    t = t.lower()
+    t = WI_FI_UNIFY.sub("wi-fi", t)
+    t = MULTISPACE.sub(" ", t).strip()
+    return t
 
 ###############################################################################
 # 1. Нормализация рейтинга и базовая тональность
@@ -365,42 +395,72 @@ def detect_sentiment_label(text: str, lang: str, fallback_rating10: Optional[flo
     return "neu"
 
 
-def detect_subtopic_sentiment(text: str, lang: str, subtopic_patterns: Dict[str, List[str]]) -> str:
+def detect_subtopic_sentiment(text: str, lang: str, subtopic_patterns: list[str] | None = None) -> str:
     """
-    Классифицирует тональность для КОНКРЕТНОЙ подтемы отзыва.
-    Та же логика приоритетов, что и выше.
-    fallback по оценке мы тут не используем жёстко, потому что
-    оценка гостя общая, а подтема может быть частично негативна
-    ("всё супер, но wi-fi просто мёртвый").
-
-    Поэтому:
-    - если нашли явный негатив в тексте → 'neg'
-    - иначе если нашли явный позитив → 'pos'
-    - иначе если нашли нейтральные конструкции → 'neu'
-    - иначе 'neu'.
+    Оценивает тональность фрагмента по подтеме.
+    Если переданы subtopic_patterns (regex), анализируем окна ±40 символов вокруг совпадений;
+    иначе — по всему тексту.
+    Негаторы учитываются: "не грязно" → не считаем негативом; "не хорошо" → слабый негатив.
     """
-
-    lang_key = lang if lang in NEGATIVE_WORDS_STRONG else "en"
-
-    # негатив (сильный, затем мягкий)
-    if _match_any(NEGATIVE_WORDS_STRONG.get(lang_key, []), text):
-        return "neg"
-    if _match_any(NEGATIVE_WORDS_SOFT.get(lang_key, []), text):
-        return "neg"
-
-    # позитив (сильный, затем мягкий)
-    if _match_any(POSITIVE_WORDS_STRONG.get(lang_key, []), text):
-        return "pos"
-    if _match_any(POSITIVE_WORDS_SOFT.get(lang_key, []), text):
-        return "pos"
-
-    # нейтральные выражения
-    if _match_any(NEUTRAL_WORDS.get(lang_key, []), text):
+    if not text:
         return "neu"
 
-    # по умолчанию нейтрально, если нет прямой эмоциональной лексики
+    candidates = [text]
+    if subtopic_patterns:
+        spans = []
+        for pat in subtopic_patterns:
+            for m in re.finditer(pat, text, flags=re.I):
+                s, e = m.span()
+                spans.append(text[max(0, s-40): min(len(text), e+40)])
+        if spans:
+            candidates = spans
+
+    # приоритет: strong neg > soft neg > strong pos > soft pos > neutral
+    strong_neg, soft_neg, strong_pos, soft_pos, neutrals = _get_lexicons_for_lang(lang)
+
+    for chunk in candidates:
+        # strong neg (с проверкой негаторов)
+        for rgx in strong_neg:
+            if re.search(rgx, chunk, re.I) and not _negated(chunk, lang, rgx):
+                return "neg"
+        # soft neg
+        for rgx in soft_neg:
+            if re.search(rgx, chunk, re.I) and not _negated(chunk, lang, rgx):
+                return "neg"
+        # strong pos (отрицание → считаем мягким негативом)
+        for rgx in strong_pos:
+            if re.search(rgx, chunk, re.I):
+                if _negated(chunk, lang, rgx):
+                    return "neg"
+                return "pos"
+        # soft pos
+        for rgx in soft_pos:
+            if re.search(rgx, chunk, re.I):
+                if _negated(chunk, lang, rgx):
+                    return "neg"
+                return "pos"
+        # нейтрали
+        for rgx in neutrals:
+            if re.search(rgx, chunk, re.I):
+                return "neu"
+
     return "neu"
 
+# --- add negation helpers ---
+RU_NEG = r"(не|без)\s+"
+EN_NEG = r"(not|no|without|never)\s+"
+TR_NEG = r"(değil|yok|olm[aı]yor)\s+"
+
+def _negated(text: str, lang: str, term_regex: str) -> bool:
+    """
+    True, если перед term_regex стоит языковой негатор (в пределах 2-3 символов).
+    """
+    if lang == "ru":
+        return re.search(rf"{RU_NEG}\w{{0,3}}(?:{term_regex})", text, re.I) is not None
+    if lang == "tr":
+        return re.search(rf"{TR_NEG}\w{{0,3}}(?:{term_regex})", text, re.I) is not None
+    # default → en
+    return re.search(rf"{EN_NEG}\w{{0,3}}(?:{term_regex})", text, re.I) is not None
 
 
 ###############################################################################
@@ -3453,25 +3513,55 @@ SENTIMENT_LEXICON: Dict[str, Dict[str, List[re.Pattern]]] = {
 }
 
 
-def detect_sentiment_label(text: str, lang: str) -> str:
+def detect_sentiment_label(text: str, lang: str, rating10: float | None = None) -> str:
     """
-    Возвращает 'pos', 'neg' или 'neu' для всего отзыва.
-    Простой подсчёт вхождений лексем.
+    Общая тональность отзыва.
+    Негаторы гасят "ложные" срабатывания (не грязно → не негатив),
+    а "не хорошо" интерпретируется как мягкий негатив.
     """
-    lang_key = lang if lang in SENTIMENT_LEXICON else "other"
-    rules = SENTIMENT_LEXICON[lang_key]
+    if not text:
+        return "neu"
 
-    t = text.lower() if text else ""
+    strong_neg, soft_neg, strong_pos, soft_pos, neutrals = _get_lexicons_for_lang(lang)
 
-    pos_hits = sum(bool(p.search(t)) for p in rules["pos"])
-    neg_hits = sum(bool(p.search(t)) for p in rules["neg"])
+    # strong neg
+    for rgx in strong_neg:
+        if re.search(rgx, text, re.I) and not _negated(text, lang, rgx):
+            return "neg"
 
-    # жёсткие пороги
-    if neg_hits > pos_hits * 1.2 and neg_hits >= 1:
-        return "neg"
-    if pos_hits > neg_hits * 1.2 and pos_hits >= 1:
-        return "pos"
+    # soft neg
+    for rgx in soft_neg:
+        if re.search(rgx, text, re.I) and not _negated(text, lang, rgx):
+            return "neg"
+
+    # strong pos (с проверкой negation)
+    for rgx in strong_pos:
+        if re.search(rgx, text, re.I):
+            if _negated(text, lang, rgx):
+                return "neg"
+            return "pos"
+
+    # soft pos
+    for rgx in soft_pos:
+        if re.search(rgx, text, re.I):
+            if _negated(text, lang, rgx):
+                return "neg"
+            return "pos"
+
+    # neutrals
+    for rgx in neutrals:
+        if re.search(rgx, text, re.I):
+            return "neu"
+
+    # fallback по оценке
+    if rating10 is not None:
+        if rating10 >= 9.0:
+            return "pos"
+        if rating10 <= 6.0:
+            return "neg"
+
     return "neu"
+
 
 
 # -------------------------------------------------
@@ -3944,9 +4034,12 @@ def preprocess_reviews_df(df_raw: pd.DataFrame) -> pd.DataFrame:
     # Нормализация рейтинга
     df["rating10"] = df.get("rating_raw", None).apply(normalize_rating_to_10)
 
+    # Нормализация текста
+    text_clean = normalize_text_basic(text, lang_norm)
+
     # text_ru (потом сюда можно будет подвесить реальный перевод)
     df["text_ru"] = [
-        translate_to_ru(txt, lg) for txt, lg in zip(df["text_orig"], df["lang_norm"])
+        translate_to_ru(txt, lg) for txt, lg in zip(df["text_clean"], df["lang_norm"])
     ]
 
     # sentiment_overall
