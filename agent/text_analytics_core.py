@@ -2832,6 +2832,944 @@ TOPIC_SCHEMA: Dict[str, Dict[str, Any]] = {
     }
 }
 
+import re
+from typing import Dict, Any, List
+
+# 1. Человекочитаемые подписи для аспектов.
+#    Всё, что мы точно хотим красиво выводить в отчёте.
+#    Если какого-то аспекта здесь нет, мы сгенерируем fallback из subtopic_display.
+ASPECT_LABEL_OVERRIDES: Dict[str, str] = {
+    # Техническое состояние / вода
+    "hot_water_ok": "Стабильная горячая вода",
+    "no_hot_water": "Не было горячей воды / перебои с горячей водой",
+    "water_pressure_ok": "Хорошее давление воды",
+    "weak_pressure": "Слабый напор воды",
+    "shower_ok": "Душ исправен",
+    "shower_broken": "Проблемы с душем",
+    "leak_water": "Течи воды / подтекает",
+    "bathroom_flooding": "Вода на полу после душа",
+    "drain_clogged": "Плохой слив / засор",
+    "drain_smell": "Неприятный запах из слива/канализации",
+
+    # Оборудование номера
+    "ac_working_device": "Кондиционер работает",
+    "ac_broken": "Кондиционер не работает / сломан",
+    "heating_working_device": "Отопление работает",
+    "heating_broken": "Нет отопления / не работает обогрев",
+    "tv_working": "Телевизор исправен",
+    "tv_broken": "Телевизор не работает",
+    "fridge_working": "Холодильник работает",
+    "fridge_broken": "Холодильник не работает / не холодит",
+    "kettle_working": "Чайник исправен",
+    "kettle_broken": "Чайник не работает",
+    "appliances_ok": "Техника и оснащение исправны",
+    "socket_danger": "Опасные розетки (люфт, искрит)",
+    "door_secure": "Дверь закрывается надёжно",
+    "door_not_closing": "Дверь плохо закрывается / не фиксируется",
+    "lock_broken": "Проблемы с замком / не закрывается",
+    "felt_safe": "Гости чувствуют себя в безопасности",
+    "felt_unsafe": "Гости не чувствуют себя в безопасности",
+    "furniture_broken": "Сломанная мебель / износ",
+    "room_worn_out": "Номер визуально уставший / требует ремонта",
+
+    # Wi-Fi
+    "wifi_fast": "Быстрый Wi-Fi",
+    "internet_stable": "Стабильный интернет",
+    "good_for_work": "Интернет подходит для удалённой работы",
+    "wifi_down": "Wi-Fi не работал",
+    "wifi_slow": "Медленный Wi-Fi",
+    "wifi_unstable": "Нестабильный Wi-Fi / обрывы",
+    "wifi_hard_to_connect": "Сложно подключиться к Wi-Fi / пароль не работает",
+    "internet_not_suitable_for_work": "Интернет не подходит для удалённой работы",
+
+    # Шум инженерки
+    "ac_quiet": "Кондиционер работает тихо",
+    "ac_noisy": "Шумный кондиционер",
+    "fridge_quiet": "Холодильник не шумит",
+    "fridge_noisy": "Шумный холодильник",
+    "pipes_noise": "Шум в трубах / стояке",
+    "ventilation_noisy": "Шумная вентиляция/вентилятор",
+    "night_mechanical_hum": "Гул оборудования ночью",
+    "tech_noise_sleep_issue": "Шум техники мешал спать",
+    "no_tech_noise_night": "Ночью тихо (нет шума техники)",
+
+    # Лифт
+    "elevator_working": "Лифт работает",
+    "elevator_broken": "Лифт не работает",
+    "elevator_stuck": "Гости застревали в лифте",
+    "luggage_easy": "Удобно с багажом (лифт/доступ)",
+    "no_elevator_heavy_bags": "Тяжело с багажом из-за лифта/лестниц",
+
+    # Завтрак — вкус и качество
+    "breakfast_tasty": "Завтрак вкусный",
+    "breakfast_bad_taste": "Невкусный завтрак / проблемы со вкусом",
+    "food_fresh": "Свежие продукты",
+    "food_not_fresh": "Несвежие продукты / вкус «вчерашний»",
+    "food_hot_served_hot": "Горячее подано горячим",
+    "food_cold": "Горячее подано холодным",
+    "coffee_good": "Кофе нормального качества",
+    "coffee_bad": "Плохой кофе",
+
+    # Завтрак — выбор
+    "breakfast_variety_good": "Хороший выбор на завтраке",
+    "buffet_rich": "Полноценный/богатый шведский стол",
+    "fresh_fruit_available": "Есть свежие фрукты",
+    "pastries_available": "Есть выпечка/сладкое",
+    "breakfast_variety_poor": "Слабый выбор на завтраке",
+    "breakfast_repetitive": "Одно и то же каждый день",
+    "hard_to_find_food": "Сложно найти что поесть",
+
+    # Завтрак — сервис персонала
+    "breakfast_staff_friendly": "Персонал завтрака дружелюбный",
+    "breakfast_staff_attentive": "Персонал завтрака внимательный/заботливый",
+    "buffet_refilled_quickly": "Блюда оперативно пополняют",
+    "tables_cleared_fast": "Столы быстро убирают",
+    "breakfast_staff_rude": "Персонал завтрака неприветливый/грубый",
+    "no_refill_food": "Еду не пополняют, подносы пустые",
+    "tables_left_dirty": "Столы остаются грязными",
+    "ignored_requests": "Просьбы гостей игнорировали",
+
+    # Завтрак — организация потока
+    "food_enough_for_all": "Еды хватает всем",
+    "kept_restocking": "Постоянно пополняют еду",
+    "tables_available": "Есть свободные столы",
+    "no_queue": "Без очередей/толпы",
+    "breakfast_flow_ok": "Завтрак организован удобно",
+    "food_ran_out": "К моменту прихода еды почти не осталось",
+    "not_restocked": "Пустые лотки не пополняли",
+    "had_to_wait_food": "Приходилось ждать, пока вынесут еду",
+    "no_tables_available": "Некуда сесть на завтраке",
+    "long_queue": "Очередь/давка на завтраке",
+
+    # Завтрак — чистота
+    "breakfast_area_clean": "Зона завтрака чистая/аккуратная",
+    "tables_cleaned_quickly": "Столы на завтраке быстро протирают",
+    "dirty_tables": "Грязные/липкие столы",
+    "dirty_dishes_left": "Грязная посуда не убрана",
+    "buffet_area_messy": "Грязно/неаккуратно у раздачи",
+
+    # Цена
+    "good_value": "Хорошее соотношение цена/качество",
+    "worth_the_price": "Стоит своих денег",
+    "affordable_for_level": "Недорого для такого уровня",
+    "overpriced": "Слишком дорого для такого уровня",
+    "not_worth_price": "Не стоит своих денег",
+    "expected_better_for_price": "Ожидали выше уровень за эту цену",
+
+    # Ожидания vs цена
+    "photos_misleading": "Фото/описание обещали больше, чем в реальности",
+    "quality_below_expectation": "Уровень ниже ожидаемого за эти деньги",
+
+    # Локация / окружение
+    "great_location": "Отличное расположение",
+    "central_convenient": "Близко к центру / всё рядом",
+    "near_transport": "Удобно по транспорту (метро/транспорт рядом)",
+    "area_has_food_shops": "Рядом кафе и магазины",
+    "location_inconvenient": "Неудобная локация",
+    "far_from_center": "Далеко от центра/основных точек",
+    "nothing_around": "Вокруг почти ничего нет",
+
+    # Безопасность района / подъезд
+    "area_safe": "В районе безопасно / спокойно",
+    "area_quiet_at_night": "Тихо в районе ночью",
+    "entrance_clean": "Чистый/нормальный вход",
+    "area_unsafe": "Небезопасный район / стрёмно",
+    "uncomfortable_at_night": "Неуютно выходить вечером / страшно ночью",
+    "entrance_dirty": "Грязный/неприятный вход/подъезд",
+    "people_loitering": "Неприятный контингент у входа",
+
+    # Навигация/доступ
+    "easy_to_find": "Легко найти адрес и вход",
+    "clear_instructions": "Понятные инструкции по доступу и заселению",
+    "luggage_access_ok": "Удобно заходить с багажом с улицы",
+    "hard_to_find_entrance": "Сложно найти вход / адрес / подъезд",
+    "confusing_access": "Неочевидно, как попасть внутрь",
+    "no_signage": "Нет нормальной навигации/вывесок",
+    "luggage_access_hard": "Тяжело с багажом с улицы/по лестнице",
+
+    # Атмосфера / вайб
+    "cozy_atmosphere": "Уютно, домашняя атмосфера",
+    "nice_design": "Красивый / стильный интерьер",
+    "good_vibe": "Приятная атмосфера, «хочется остаться»",
+    "not_cozy": "Неуютно / холодная атмосфера",
+    "gloomy_feel": "Мрачно / давит / депрессивно",
+    "dated_look": "Уставший / старый визуально вид",
+    "soulless_feel": "Без души / нет ощущения «добро пожаловать»",
+
+    # Запахи общих зон
+    "fresh_smell_common": "Приятный запах / свежо в коридорах",
+    "no_bad_smell": "Нет неприятного запаха в общих зонах",
+    "bad_smell_common": "Неприятный запах в коридорах",
+    "cigarette_smell": "Запах сигарет в общих зонах",
+    "sewage_smell": "Запах канализации в общих зонах",
+    "musty_smell": "Запах сырости / плесени / затхлости",
+}
+
+
+# 2. Эвристика полярности аспекта.
+#    Возвращает "pos" / "neg" / "neutral".
+def infer_polarity(aspect_code: str) -> str:
+    positive_markers = [
+        "ok", "good", "fast", "friendly", "attentive",
+        "clean", "cleaned", "refilled", "enough", "available",
+        "quiet", "safe", "secure", "working", "tasty",
+        "fresh", "hot_served_hot", "great", "worth", "value",
+        "easy", "cozy", "nice", "flow_ok", "no_queue",
+        "no_bad_smell", "kept_restocking", "tables_available",
+        "luggage_access_ok", "area_safe", "entrance_clean",
+        "central", "near_transport", "good_vibe",
+    ]
+    negative_markers = [
+        "no_",  # e.g. no_hot_water / no_refill_food / no_tables_available
+        "not_", "slow", "dirty", "broken", "unsafe",
+        "hard", "hard_to", "unsafe", "unfriendly", "rude",
+        "smell", "smelly", "bad", "overpriced", "ran_out",
+        "repetitive", "poor", "cold", "leak", "clog",
+        "flood", "noisy", "stuck", "queue", "long_queue",
+        "uncomfortable", "confusing", "gloomy", "dated",
+        "soulless", "people_loitering", "luggage_access_hard",
+        "area_unsafe", "entrance_dirty", "far_from_center",
+        "nothing_around", "not_worth_price", "expected_better",
+    ]
+
+    a = aspect_code.lower()
+
+    # если начинается с no_ или contains obvious negative first -> считаем отрицательно
+    if any(marker in a for marker in negative_markers):
+        return "neg"
+
+    # если содержит позитивные маркеры -> считаем позитивно
+    if any(marker in a for marker in positive_markers):
+        return "pos"
+
+    # по умолчанию
+    return "neutral"
+
+
+# 3. Генерация реестра аспектов на основе TOPIC_SCHEMA и ASPECT_LABEL_OVERRIDES
+def build_aspect_registry(topic_schema: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """
+    Превращает TOPIC_SCHEMA в плоский словарь аспектов.
+    Ключ словаря = код аспекта (например "wifi_unstable").
+    Значение = метаданные: тема, подтема, красивая подпись, полярность.
+    """
+    registry: Dict[str, Dict[str, Any]] = {}
+
+    for topic_key, topic_block in topic_schema.items():
+        topic_display = topic_block.get("display", topic_key)
+
+        subtopics: Dict[str, Any] = topic_block.get("subtopics", {})
+        for sub_key, sub_block in subtopics.items():
+            sub_display = sub_block.get("display", sub_key)
+
+            aspects: List[str] = sub_block.get("aspects", [])
+            for aspect_code in aspects:
+                label = ASPECT_LABEL_OVERRIDES.get(
+                    aspect_code,
+                    f"{sub_display}: {aspect_code}"
+                )
+                registry[aspect_code] = {
+                    "topic_key": topic_key,
+                    "topic_display": topic_display,
+                    "subtopic_key": sub_key,
+                    "subtopic_display": sub_display,
+                    "label": label,
+                    "polarity": infer_polarity(aspect_code),
+                }
+
+    return registry
+
+
+# 4. Вспомогательная функция — сгруппировать аспекты в управленческие группы
+#    Это пригодится, чтобы потом в отчёте выводить не просто список тегов,
+#    а блоками по зонам ответственности (Завтрак, Wi-Fi, Вода, Локация и т.д.).
+def group_aspects_by_topic(registry: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """
+    Возвращает структуру вида:
+    {
+        "breakfast": {
+            "topic_display": "Завтрак и питание",
+            "aspects": ["breakfast_tasty", "food_not_fresh", ...]
+        },
+        "tech_state": {
+            "topic_display": "Техническое состояние и инфраструктура",
+            "aspects": ["wifi_unstable", "no_hot_water", ...]
+        },
+        ...
+    }
+    """
+    grouped: Dict[str, Dict[str, Any]] = {}
+    for aspect_code, meta in registry.items():
+        k = meta["topic_key"]
+        if k not in grouped:
+            grouped[k] = {
+                "topic_display": meta["topic_display"],
+                "aspects": [],
+            }
+        grouped[k]["aspects"].append(aspect_code)
+    return grouped
+
+
+# 5. Агрегация по аспектам для заданного периода.
+#    Предполагаем, что у нас уже есть "взорванный" датафрейм отзывов,
+#    где каждая строка = один (review_id, aspect_code, sentiment_label, period_key).
+#
+#    sentiment_label должен быть 'pos'/'neg'/'neu' после тонального анализа.
+#
+#    Возвращаем сводку:
+#    - сколько упоминаний аспекта,
+#    - доля негатива и позитива,
+#    - чтобы потом ранжировать и говорить
+#      «Топ факторов негатива недели» и «Ключевые плюсы недели».
+#
+def aggregate_aspects_for_period(df_exploded,
+                                 period_key_col: str,
+                                 current_period_key: str,
+                                 registry: Dict[str, Dict[str, Any]]):
+    """
+    df_exploded: DataFrame со столбцами:
+        - aspect_code : str
+        - sentiment   : {'pos','neg','neu'}
+        - {period_key_col} : например 'week_key' / '2025-W42'
+        - review_id   : id отзыва (для подсчёта уникальных отзывов по аспекту)
+
+    period_key_col: имя столбца периода для группировки, например 'week_key'
+    current_period_key: значение периода, например '2025-W42'
+    registry: выход из build_aspect_registry()
+
+    Возвращает DataFrame с колонками:
+        aspect_code
+        mentions_reviews  - уникальных отзывов, где аспект встречался
+        pos_share         - доля позитивных употреблений
+        neg_share         - доля негативных употреблений
+        topic_display
+        subtopic_display
+        label
+        polarity_hint     - polarity из реестра ('pos'/'neg'/'neutral')
+    """
+
+    import pandas as pd
+
+    cur = df_exploded[df_exploded[period_key_col] == current_period_key].copy()
+
+    # считаем по отзывам (уникальным), а не по количеству предложений
+    grp = (
+        cur.groupby(["aspect_code", "sentiment", "review_id"])
+           .size()
+           .reset_index()
+    )
+
+    # теперь считаем, сколько отзывов упомянули аспект хотя бы один раз
+    mentions = (
+        grp.groupby(["aspect_code", "sentiment"])["review_id"]
+           .nunique()
+           .reset_index(name="review_mentions")
+    )
+
+    # сводим в wide: pos / neg / neu отдельно
+    pivot = mentions.pivot_table(
+        index="aspect_code",
+        columns="sentiment",
+        values="review_mentions",
+        fill_value=0,
+        aggfunc="sum",
+    )
+
+    pivot = pivot.rename(columns={
+        "pos": "mentions_pos",
+        "neg": "mentions_neg",
+        "neu": "mentions_neu",
+    })
+
+    pivot["mentions_total"] = (
+        pivot.get("mentions_pos", 0)
+        + pivot.get("mentions_neg", 0)
+        + pivot.get("mentions_neu", 0)
+    )
+
+    # доля позитива / негатива от всех упоминаний аспекта
+    pivot["pos_share"] = pivot["mentions_pos"] / pivot["mentions_total"].replace(0, 1)
+    pivot["neg_share"] = pivot["mentions_neg"] / pivot["mentions_total"].replace(0, 1)
+
+    pivot = pivot.reset_index()
+
+    # присоединяем человекочитаемые подписи и метаданные
+    meta_df = []
+    for aspect_code, meta in registry.items():
+        meta_df.append({
+            "aspect_code": aspect_code,
+            "topic_display": meta["topic_display"],
+            "subtopic_display": meta["subtopic_display"],
+            "label": meta["label"],
+            "polarity_hint": meta["polarity"],
+        })
+    meta_df = pd.DataFrame(meta_df)
+
+    out = pivot.merge(meta_df, on="aspect_code", how="left")
+
+    # сортируем по полной значимости аспекта в этом периоде
+    out = out.sort_values(
+        by=["mentions_total", "mentions_neg", "mentions_pos"],
+        ascending=[False, False, False],
+        ignore_index=True,
+    )
+
+    return out
+
+import re
+import uuid
+import pandas as pd
+from datetime import datetime
+from typing import Dict, Any, List, Tuple
+
+
+# -------------------------------------------------
+# 1. Нормализация языка
+# -------------------------------------------------
+
+LANG_MAP_EXPLICIT = {
+    "ru": "ru", "ru-ru": "ru", "russian": "ru",
+    "ua": "ru", "uk": "ru", "ukrainian": "ru",  # частая путаница кириллицы как "украинский"
+    "en": "en", "en-us": "en", "en-gb": "en", "english": "en",
+    "tr": "tr", "turkish": "tr",
+    "ar": "ar", "arabic": "ar",
+    "zh": "zh", "cn": "zh", "zh-cn": "zh", "chinese": "zh", "zh-hans": "zh",
+    "zh-hant": "zh", "zh-tw": "zh",
+}
+
+CYRILLIC_RE = re.compile(r"[а-яё]", re.IGNORECASE)
+ARABIC_RE = re.compile(r"[\u0600-\u06FF]")
+HANZI_RE = re.compile(r"[\u4e00-\u9fff]")
+TURKISH_HINT_RE = re.compile(r"[çğıöşü]", re.IGNORECASE)
+
+def normalize_lang(raw_code: str, text: str) -> str:
+    """
+    Приводим язык к одному из {ru,en,tr,ar,zh,other}
+    Используем сначала код из источника, потом эвристику по алфавиту.
+    """
+    if raw_code:
+        c = raw_code.strip().lower()
+        if c in LANG_MAP_EXPLICIT:
+            return LANG_MAP_EXPLICIT[c]
+
+    t = text or ""
+    # эвристики
+    if CYRILLIC_RE.search(t):
+        return "ru"
+    if ARABIC_RE.search(t):
+        return "ar"
+    if HANZI_RE.search(t):
+        return "zh"
+    if TURKISH_HINT_RE.search(t):
+        return "tr"
+
+    # если есть явные английские слова типа "the", "and", "was", "great"
+    if re.search(r"\b(the|and|was|were|is|are|very|really|great|good|bad|price)\b", t.lower()):
+        return "en"
+
+    return "other"
+
+
+# -------------------------------------------------
+# 2. Тональность (sentiment)
+# -------------------------------------------------
+
+# Регэкспы для позитивной / негативной окраски.
+# Мы не пытаемся грамматически распарсить фразу,
+# просто считаем "кол-во попаданий сильных позитивных и негативных маркеров".
+SENTIMENT_LEXICON: Dict[str, Dict[str, List[re.Pattern]]] = {
+    "ru": {
+        "pos": [
+            re.compile(r"\bотличн\w+\b", re.I),
+            re.compile(r"\bпрекрасн\w+\b", re.I),
+            re.compile(r"\bсупер\b", re.I),
+            re.compile(r"\bклассн\w+\b", re.I),
+            re.compile(r"\bвеликолепн\w+\b", re.I),
+            re.compile(r"\bпонравил\w+\b", re.I),
+            re.compile(r"\bочень вкусн\w+\b", re.I),
+            re.compile(r"\bочень уютн\w+\b", re.I),
+            re.compile(r"\bдружелюбн\w+\b", re.I),
+            re.compile(r"\bвежлив\w+\b", re.I),
+            re.compile(r"\bчисто\b", re.I),
+            re.compile(r"\bсвежо\b", re.I),
+            re.compile(r"\bуютн\w+\b", re.I),
+            re.compile(r"\bстильн\w+\b", re.I),
+            re.compile(r"\bкрасив\w+\b", re.I),
+            re.compile(r"\bвсё было хорошо\b", re.I),
+            re.compile(r"\bвсё понравил\w+\b", re.I),
+            re.compile(r"\bрекомендую\b", re.I),
+            re.compile(r"\bвернусь\b", re.I),
+        ],
+        "neg": [
+            re.compile(r"\bужасн\w+\b", re.I),
+            re.compile(r"\bотвратительн\w+\b", re.I),
+            re.compile(r"\bстр(е|ё)мн\w+\b", re.I),
+            re.compile(r"\bгрязн\w+\b", re.I),
+            re.compile(r"\bвоняет\b", re.I),
+            re.compile(r"\bвонь\b", re.I),
+            re.compile(r"\bгрязный подъезд\b", re.I),
+            re.compile(r"\bслишком дорог\w+\b", re.I),
+            re.compile(r"\bдорого\b", re.I),
+            re.compile(r"\bне стоит (этих|своих) денег\b", re.I),
+            re.compile(r"\bне оправдывает цен\w+\b", re.I),
+            re.compile(r"\bпроблемы с\b", re.I),
+            re.compile(r"\bне работал\w*\b", re.I),
+            re.compile(r"\bсломан\w+\b", re.I),
+            re.compile(r"\bхолодн(о|ый|ая)\b", re.I),
+            re.compile(r"\bшумн\w+\b", re.I),
+            re.compile(r"\bнеуютн\w+\b", re.I),
+            re.compile(r"\bне понравил\w+\b", re.I),
+            re.compile(r"\bразочарован\w*\b", re.I),
+        ],
+    },
+    "en": {
+        "pos": [
+            re.compile(r"\bgreat\b", re.I),
+            re.compile(r"\bexcellent\b", re.I),
+            re.compile(r"\bwonderful\b", re.I),
+            re.compile(r"\bamazing\b", re.I),
+            re.compile(r"\bdelicious\b", re.I),
+            re.compile(r"\btasty\b", re.I),
+            re.compile(r"\bcozy\b", re.I),
+            re.compile(r"\bclean\b", re.I),
+            re.compile(r"\bfriendly staff\b", re.I),
+            re.compile(r"\bhelpful\b", re.I),
+            re.compile(r"\bworth the price\b", re.I),
+            re.compile(r"\bgood value\b", re.I),
+            re.compile(r"\bperfect location\b", re.I),
+            re.compile(r"\bwould stay again\b", re.I),
+            re.compile(r"\bwe loved\b", re.I),
+        ],
+        "neg": [
+            re.compile(r"\bterrible\b", re.I),
+            re.compile(r"\bawful\b", re.I),
+            re.compile(r"\bhorrible\b", re.I),
+            re.compile(r"\bdisgusting\b", re.I),
+            re.compile(r"\bdirty\b", re.I),
+            re.compile(r"\bsmelled bad\b", re.I),
+            re.compile(r"\bbad smell\b", re.I),
+            re.compile(r"\boverpriced\b", re.I),
+            re.compile(r"\btoo expensive\b", re.I),
+            re.compile(r"\bnot worth\b", re.I),
+            re.compile(r"\bno hot water\b", re.I),
+            re.compile(r"\bnoisy\b", re.I),
+            re.compile(r"\bunsafe\b", re.I),
+            re.compile(r"\bwe will not come back\b", re.I),
+        ],
+    },
+    "tr": {
+        "pos": [
+            re.compile(r"\bharika\b", re.I),
+            re.compile(r"\bçok iyi\b", re.I),
+            re.compile(r"\bmükemmel\b", re.I),
+            re.compile(r"\blezzetli\b", re.I),
+            re.compile(r"\btemizdi\b", re.I),
+            re.compile(r"\btemiz\b", re.I),
+            re.compile(r"\bgüvenliydi\b", re.I),
+            re.compile(r"\bgüzel konum\b", re.I),
+            re.compile(r"\bpersonel çok nazik\b", re.I),
+            re.compile(r"\bparasına değer\b", re.I),
+        ],
+        "neg": [
+            re.compile(r"\bberbat\b", re.I),
+            re.compile(r"\bkorkunç\b", re.I),
+            re.compile(r"\bkirli\b", re.I),
+            re.compile(r"\bpis kokuyordu\b", re.I),
+            re.compile(r"\bpahalı\b", re.I),
+            re.compile(r"\bçok pahalı\b", re.I),
+            re.compile(r"\bdeğmez\b", re.I),
+            re.compile(r"\bgürültülü\b", re.I),
+            re.compile(r"\bgüvensiz\b", re.I),
+            re.compile(r"\byavaş internet\b", re.I),
+        ],
+    },
+    "ar": {
+        "pos": [
+            re.compile(r"كتير حلو", re.I),
+            re.compile(r"كتير نظيف", re.I),
+            re.compile(r"نضيف", re.I),
+            re.compile(r"مرتاح", re.I),
+            re.compile(r"مرتاحين", re.I),
+            re.compile(r"أمان", re.I),
+            re.compile(r"طَيّب", re.I),
+            re.compile(r"زاكي", re.I),
+            re.compile(r"منيح", re.I),
+        ],
+        "neg": [
+            re.compile(r"وسخ", re.I),
+            re.compile(r"ريحة بشعة", re.I),
+            re.compile(r"ريحة مجاري", re.I),
+            re.compile(r"غالي", re.I),
+            re.compile(r"غالي عالفاضي", re.I),
+            re.compile(r"مو آمن", re.I),
+            re.compile(r"مو مريح", re.I),
+            re.compile(r"زحمة", re.I),
+            re.compile(r"كنا مستائين", re.I),
+        ],
+    },
+    "zh": {
+        "pos": [
+            re.compile(r"很好", re.I),
+            re.compile(r"很棒", re.I),
+            re.compile(r"很舒服", re.I),
+            re.compile(r"很干净", re.I),
+            re.compile(r"干净", re.I),
+            re.compile(r"安全", re.I),
+            re.compile(r"方便", re.I),
+            re.compile(r"位置很好", re.I),
+            re.compile(r"很好吃", re.I),
+        ],
+        "neg": [
+            re.compile(r"很脏", re.I),
+            re.compile(r"脏", re.I),
+            re.compile(r"臭", re.I),
+            re.compile(r"味道很差", re.I),
+            re.compile(r"太贵", re.I),
+            re.compile(r"不值", re.I),
+            re.compile(r"吵", re.I),
+            re.compile(r"很吵", re.I),
+            re.compile(r"不安全", re.I),
+        ],
+    },
+    # если язык нераспознан → базовая англо-ориентированная схема
+    "other": {
+        "pos": [
+            re.compile(r"\bgreat\b", re.I),
+            re.compile(r"\bexcellent\b", re.I),
+            re.compile(r"\bgood\b", re.I),
+            re.compile(r"\bclean\b", re.I),
+            re.compile(r"\bcozy\b", re.I),
+            re.compile(r"\bworth\b", re.I),
+        ],
+        "neg": [
+            re.compile(r"\bbad\b", re.I),
+            re.compile(r"\bdirty\b", re.I),
+            re.compile(r"\bsmell\b", re.I),
+            re.compile(r"\bexpensive\b", re.I),
+            re.compile(r"\bnoisy\b", re.I),
+            re.compile(r"\bnot worth\b", re.I),
+        ],
+    },
+}
+
+
+def detect_sentiment_label(text: str, lang: str) -> str:
+    """
+    Возвращает 'pos', 'neg' или 'neu' для всего отзыва.
+    Простой подсчёт вхождений лексем.
+    """
+    lang_key = lang if lang in SENTIMENT_LEXICON else "other"
+    rules = SENTIMENT_LEXICON[lang_key]
+
+    t = text.lower() if text else ""
+
+    pos_hits = sum(bool(p.search(t)) for p in rules["pos"])
+    neg_hits = sum(bool(p.search(t)) for p in rules["neg"])
+
+    # жёсткие пороги
+    if neg_hits > pos_hits * 1.2 and neg_hits >= 1:
+        return "neg"
+    if pos_hits > neg_hits * 1.2 and pos_hits >= 1:
+        return "pos"
+    return "neu"
+
+
+# -------------------------------------------------
+# 3. Вспомогательные функции для периодов
+# -------------------------------------------------
+
+def get_period_keys(dt: datetime) -> Dict[str, str]:
+    """
+    Возвращает словарь с ключами периода для отзыва:
+    - week_key: 'YYYY-Www'
+    - month_key: 'YYYY-MM'
+    - quarter_key: 'YYYY-Qn'
+    - year_key: 'YYYY'
+    """
+    iso_year, iso_week, _ = dt.isocalendar()  # (year, week, weekday)
+    month_key = f"{dt.year:04d}-{dt.month:02d}"
+
+    # квартал по месяцу
+    q = (dt.month - 1) // 3 + 1
+    quarter_key = f"{dt.year:04d}-Q{q}"
+
+    return {
+        "week_key": f"{iso_year:04d}-W{iso_week:02d}",
+        "month_key": month_key,
+        "quarter_key": quarter_key,
+        "year_key": f"{dt.year:04d}",
+    }
+
+
+# -------------------------------------------------
+# 4. Матчинг подтем (subtopics) и маппинг в аспекты
+# -------------------------------------------------
+
+def match_subtopics_for_review(
+    text: str,
+    lang: str,
+    topic_schema: Dict[str, Dict[str, Any]]
+) -> List[Tuple[str, str]]:
+    """
+    Возвращает список (topic_key, subtopic_key) которые сработали в этом отзыве.
+    Если по языку нет паттернов -> не матчим эту подтему.
+    """
+    hits: List[Tuple[str, str]] = []
+    if not text:
+        return hits
+
+    for topic_key, topic_block in topic_schema.items():
+        subtopics = topic_block.get("subtopics", {})
+        for sub_key, sub_block in subtopics.items():
+            patterns = sub_block.get("patterns", {})
+            lang_patterns = patterns.get(lang, [])
+            if not lang_patterns:
+                # если нет паттернов на этом языке - пропускаем
+                continue
+            for pat in lang_patterns:
+                # pat в схеме у нас как raw string/regex source
+                # нужно скомпилить
+                if isinstance(pat, str):
+                    rgx = re.compile(pat, re.IGNORECASE | re.UNICODE | re.MULTILINE)
+                else:
+                    # если вдруг кто-то положит ужеcompiled re.Pattern
+                    rgx = pat
+                if rgx.search(text):
+                    hits.append((topic_key, sub_key))
+                    break  # достаточно одного попадания для данной подтемы
+    return hits
+
+
+def aspects_from_subtopic_by_sentiment(
+    topic_schema: Dict[str, Dict[str, Any]],
+    topic_key: str,
+    subtopic_key: str,
+    sentiment_label: str,
+) -> List[str]:
+    """
+    У подтемы есть список aspects (включающий и позитивные, и негативные формулировки).
+    Мы фильтруем эти аспекты по полярности (infer_polarity) так, чтобы
+    не приписывать позитивный тег при явно негативном отзыве и наоборот.
+    Нейтральные аспекты считаем для всех типов sent (если они вообще появятся).
+    """
+    sub_block = topic_schema[topic_key]["subtopics"][subtopic_key]
+    aspects_all = sub_block.get("aspects", [])
+
+    filtered: List[str] = []
+    for a in aspects_all:
+        pol = infer_polarity(a)  # 'pos' / 'neg' / 'neutral'
+        if pol == "neutral":
+            filtered.append(a)
+        elif pol == sentiment_label:
+            filtered.append(a)
+        # иначе не добавляем
+    return filtered
+
+
+# -------------------------------------------------
+# 5. Основная функция построения exploded-DF
+# -------------------------------------------------
+
+def build_exploded_reviews_df(
+    raw_reviews_df: pd.DataFrame,
+    topic_schema: Dict[str, Dict[str, Any]],
+    add_rating_5scale: bool = True,
+) -> pd.DataFrame:
+    """
+    Превращает сырые отзывы (как в выгрузке Reviews_dd-mm-yyyy.xls)
+    в "взорванный" датафрейм аспектов.
+
+    Ожидаемые столбцы raw_reviews_df:
+        - 'Дата' (или 'date') : строка даты
+        - 'Рейтинг' (или 'rating') : float/int
+        - 'Источник' (или 'source')
+        - 'Автор' (или 'author')
+        - 'Код языка' (или 'lang_code')
+        - 'Текст отзыва' (или 'text')
+        - (опционально) 'Наличие ответа' (ignored here)
+
+    Возвращаем DataFrame со столбцами:
+        review_id          уникальный id отзыва (str)
+        source             площадка
+        date               datetime
+        week_key, month_key, quarter_key, year_key
+        rating_raw         исходная оценка
+        rating_5           оценка приведённая к шкале 1–5 (если add_rating_5scale=True)
+        lang               нормализованный язык ('ru','en','tr','ar','zh','other')
+        aspect_code        код аспекта (wifi_unstable, breakfast_tasty, ...)
+        sentiment          'pos'/'neg'/'neu' (тональность отзыва в целом)
+        text               полный текст отзыва (для референса анализа)
+
+    Важно: одна строка = один (review_id, aspect_code) для данного периода.
+    Если один и тот же аспект ловится много раз в одном отзыве, мы оставляем его один раз.
+    """
+
+    # нормализуем имена столбцов к удобным
+    cols_map = {
+        'Дата': 'date',
+        'Рейтинг': 'rating_raw',
+        'Источник': 'source',
+        'Автор': 'author',
+        'Код языка': 'lang_code',
+        'Текст отзыва': 'text',
+        'Наличие ответа': 'responded',
+        'rating': 'rating_raw',
+        'date': 'date',
+        'source': 'source',
+        'author': 'author',
+        'lang_code': 'lang_code',
+        'text': 'text',
+    }
+    df = raw_reviews_df.rename(columns={c: cols_map.get(c, c) for c in raw_reviews_df.columns})
+
+    # убедимся, что обязательные столбцы есть
+    required_cols = ["date", "rating_raw", "source", "author", "lang_code", "text"]
+    for rc in required_cols:
+        if rc not in df.columns:
+            # если чего-то нет (например lang_code), добавим пустой
+            df[rc] = df.get(rc, "")
+
+    # приводим дату к datetime
+    def parse_date_safe(x):
+        if isinstance(x, datetime):
+            return x
+        if pd.isna(x):
+            return None
+        # пробуем несколько форматов
+        for fmt in ("%d.%m.%Y", "%Y-%m-%d", "%d/%m/%Y", "%d.%m.%y"):
+            try:
+                return datetime.strptime(str(x), fmt)
+            except ValueError:
+                continue
+        # last resort: let pandas try
+        try:
+            return pd.to_datetime(x)
+        except Exception:
+            return None
+
+    df["date"] = df["date"].apply(parse_date_safe)
+
+    # фильтруем пустые тексты
+    df = df[~(df["text"].isna() | (df["text"].astype(str).str.strip() == ""))].copy()
+
+    # создаём review_id, если в исходниках его нет
+    # (делаем детерминированно через hash конкатенации текста+даты+автора+source)
+    if "review_id" not in df.columns:
+        def make_id(row):
+            base = f"{row.get('source','')}|{row.get('author','')}|{row.get('date','')}|{row.get('text','')}"
+            # короткий uuid5-like (без crypto)
+            return str(uuid.uuid5(uuid.NAMESPACE_URL, base))
+        df["review_id"] = df.apply(make_id, axis=1)
+
+    # нормализуем язык
+    df["lang"] = df.apply(
+        lambda r: normalize_lang(str(r.get("lang_code", "")), str(r.get("text", ""))),
+        axis=1
+    )
+
+    # определяем тональность ВСЕГО отзыва
+    df["sentiment"] = df.apply(
+        lambda r: detect_sentiment_label(str(r.get("text", "")), r.get("lang", "other")),
+        axis=1
+    )
+
+    # периодические ключи
+    period_keys = df["date"].apply(lambda d: get_period_keys(d) if pd.notna(d) else {
+        "week_key": None,
+        "month_key": None,
+        "quarter_key": None,
+        "year_key": None,
+    })
+    df = pd.concat([df, period_keys.apply(pd.Series)], axis=1)
+
+    # опционально нормализуем рейтинг в 5-балльную шкалу
+    # Логика:
+    # - если rating_raw <=5 → считаем, что это уже 5-балльная
+    # - если rating_raw <=10 → делим на 2
+    def to_5scale(x):
+        try:
+            val = float(x)
+        except Exception:
+            return None
+        if val <= 5:
+            return val
+        if val <= 10:
+            return val / 2.0
+        # если внезапно другая шкала — приводить не будем
+        return None
+
+    if add_rating_5scale:
+        df["rating_5"] = df["rating_raw"].apply(to_5scale)
+    else:
+        df["rating_5"] = None
+
+    # теперь извлекаем подтемы → аспекты
+    exploded_rows: List[Dict[str, Any]] = []
+
+    for _, row in df.iterrows():
+        rid = row["review_id"]
+        txt = str(row["text"])
+        lang = row["lang"]
+        sent_label = row["sentiment"]
+
+        wk = row["week_key"]
+        mk = row["month_key"]
+        qk = row["quarter_key"]
+        yk = row["year_key"]
+
+        src = row["source"]
+        dt  = row["date"]
+        rating_raw = row["rating_raw"]
+        rating_5 = row["rating_5"]
+
+        # какие подтемы сработали
+        subtopic_hits = match_subtopics_for_review(
+            text=txt,
+            lang=lang,
+            topic_schema=topic_schema
+        )
+
+        # для каждой подтемы — берём аспекты соответствующей полярности
+        aspects_all: List[str] = []
+        for (topic_key, sub_key) in subtopic_hits:
+            a_list = aspects_from_subtopic_by_sentiment(
+                topic_schema=topic_schema,
+                topic_key=topic_key,
+                subtopic_key=sub_key,
+                sentiment_label=sent_label,
+            )
+            aspects_all.extend(a_list)
+
+        # дедуп по аспектам
+        aspects_all = sorted(set(aspects_all))
+
+        # теперь формируем финальные строки
+        for aspect_code in aspects_all:
+            exploded_rows.append({
+                "review_id": rid,
+                "source": src,
+                "date": dt,
+                "week_key": wk,
+                "month_key": mk,
+                "quarter_key": qk,
+                "year_key": yk,
+                "rating_raw": rating_raw,
+                "rating_5": rating_5,
+                "lang": lang,
+                "aspect_code": aspect_code,
+                "sentiment": sent_label,
+                "text": txt,
+            })
+
+    exploded_df = pd.DataFrame(exploded_rows)
+
+    # если не нашли ни одной темы в отзыве, он не попадает в exploded_df.
+    # это норм, но для прозрачности можно (по желанию) включить "generic" аспект
+    # вроде "unclassified_positive"/"unclassified_negative", если нужно покрыть всё 100%.
+    # Пока не добавляем.
+
+    return exploded_df
+
 
 ###############################################################################
 # 3. Классификация тем для одного отзыва
@@ -3996,79 +4934,310 @@ def pick_key_topics_for_week(
         "calm_down": calm_down,
     }
 ###############################################################################
-# 15. Анализ причин проблем с заселением (category="checkin_stay")
+# 15. Анализ причинно-следственных связей
 ###############################################################################
 
-def analyze_checkin_root_causes(
-    by_sub_week: pd.DataFrame,
-    category_key: str = "checkin_stay",
-    aspect_labels: Dict[str, str] = None,
-) -> Optional[str]:
+import itertools
+import math
+import pandas as pd
+from typing import Dict, Any, List, Tuple
+
+
+def build_cooccurrence_pairs(
+    df_exploded: pd.DataFrame,
+    period_key_col: str,
+    current_period_key: str,
+    min_pair_reviews: int = 2,
+    min_pair_share: float = 0.05,
+) -> pd.DataFrame:
     """
-    Строит краткий текст о том, что было причиной проблем с заселением/проживанием.
+    Строит ко-упоминания аспектов (пары аспектов, которые часто встречаются вместе в одном отзыве)
+    за конкретный период.
 
-    Ищем подтемы внутри категории checkin_stay (заселение и проживание),
-    суммируем aspects_counter по ним, считаем, что доминирует.
+    df_exploded: DataFrame со столбцами:
+        - review_id: str / int
+        - aspect_code: str
+        - sentiment: {'pos','neg','neu'}
+        - {period_key_col}: например 'week_key', 'month_key', ...
 
-    aspect_labels: словарь для человекочитаемых формулировок аспектов:
-        {
-          "staff_slow": "нехватка оперативности персонала",
-          "room_not_ready": "номер не был готов вовремя (уборка / подготовка)",
-          "tech_access_issue": "технические сложности с доступом (коды, ключи, замки)"
-        }
+    period_key_col: имя столбца с ключом периода ('week_key' и т.д.)
+    current_period_key: значение периода (например '2025-W42' или '2025-10')
+    min_pair_reviews: минимальное число уникальных отзывов,
+                      в которых пара встретилась, чтобы считать её значимой
+    min_pair_share: минимальная доля от общего числа отзывов периода,
+                    в которых эта пара встретилась (например, 0.05 = 5%)
 
-    Возвращает строку (русский текст) или None, если ничего нет.
+    Возвращает DataFrame с колонками:
+        left_aspect
+        right_aspect
+        pair_reviews         — в скольких отзывах встречалась такая пара
+        pair_share           — доля отзывов периода, где пара упомянута
+        left_sentiment_neg_share / _pos_share — характер левой темы
+        right_sentiment_neg_share / _pos_share — характер правой темы
     """
-    if aspect_labels is None:
-        aspect_labels = {
-            "staff_slow": "оперативности сотрудников СПиР",
-            "room_not_ready": "готовности номера к заселению (уборка / подготовка)",
-            "tech_access_issue": "технического доступа (коды, карты, замки, лифт)",
-        }
 
-    # отфильтруем строки по категории
-    df_checkin = by_sub_week[by_sub_week["category"] == category_key].copy()
-    if df_checkin.empty:
-        return None
+    # ограничиваемся текущим периодом
+    cur = df_exploded[df_exploded[period_key_col] == current_period_key].copy()
 
-    # собираем все aspects_counter
-    total_counter = {}
-    for _, row in df_checkin.iterrows():
-        ac = row.get("aspects_counter", {})
-        if not isinstance(ac, dict):
+    # собираем для каждого review_id список аспектов, уникальных внутри этого отзыва
+    review_aspects = (
+        cur.groupby("review_id")["aspect_code"]
+           .apply(lambda s: sorted(set(s)))
+           .reset_index()
+    )
+
+    # считаем общее число отзывов в периоде
+    total_reviews_period = review_aspects["review_id"].nunique()
+    if total_reviews_period == 0:
+        return pd.DataFrame(columns=[
+            "left_aspect", "right_aspect",
+            "pair_reviews", "pair_share",
+            "left_sentiment_pos_share", "left_sentiment_neg_share",
+            "right_sentiment_pos_share", "right_sentiment_neg_share",
+        ])
+
+    # генерим пары аспектов внутри каждого отзыва
+    # пример: ['no_hot_water','overpriced','hard_to_find_entrance']
+    #   -> ('no_hot_water','overpriced'), ('no_hot_water','hard_to_find_entrance'), ...
+    pairs_list: List[Tuple[str, str]] = []
+    for _, row in review_aspects.iterrows():
+        aspects_for_review = row["aspect_code"]
+        if len(aspects_for_review) < 2:
             continue
-        for k, v in ac.items():
-            total_counter[k] = total_counter.get(k, 0) + v
+        for a, b in itertools.combinations(aspects_for_review, 2):
+            left, right = sorted((a, b))
+            pairs_list.append((left, right))
 
-    if not total_counter:
-        return None
+    if not pairs_list:
+        return pd.DataFrame(columns=[
+            "left_aspect", "right_aspect",
+            "pair_reviews", "pair_share",
+            "left_sentiment_pos_share", "left_sentiment_neg_share",
+            "right_sentiment_pos_share", "right_sentiment_neg_share",
+        ])
 
-    # сортируем по значимости
-    sorted_aspects = sorted(total_counter.items(), key=lambda x: x[1], reverse=True)
+    pairs_df = pd.DataFrame(pairs_list, columns=["left_aspect", "right_aspect"])
 
-    # Возьмём топ-2 причин и построим человекочитаемую фразу.
-    parts = []
-    for i, (asp_key, count) in enumerate(sorted_aspects[:2]):
-        human = aspect_labels.get(asp_key, asp_key)
-        parts.append(human)
+    # сколько уникальных отзывов упоминали ту или иную пару
+    # нам нужно посчитать не количество строк в pairs_list,
+    # а количество review_id, где пара встречалась хотя бы раз.
+    # Для этого сначала построим mapping от review_id к сету пар:
+    review_pairs = []
+    for _, row in review_aspects.iterrows():
+        aspects_for_review = row["aspect_code"]
+        rid = row["review_id"]
+        for a, b in itertools.combinations(aspects_for_review, 2):
+            left, right = sorted((a, b))
+            review_pairs.append((rid, left, right))
+    review_pairs_df = pd.DataFrame(review_pairs, columns=["review_id", "left_aspect", "right_aspect"])
 
-    if not parts:
-        return None
+    pair_reviews = (
+        review_pairs_df
+        .groupby(["left_aspect", "right_aspect"])["review_id"]
+        .nunique()
+        .reset_index(name="pair_reviews")
+    )
 
-    if len(parts) == 1:
-        return (
-            "Отмечаем, что замечания по заселению в основном связаны с "
-            + parts[0]
-            + "."
+    # добавляем долю отзывов
+    pair_reviews["pair_share"] = pair_reviews["pair_reviews"] / float(total_reviews_period)
+
+    # фильтруем только значимые по частоте связи
+    pair_reviews = pair_reviews[
+        (pair_reviews["pair_reviews"] >= min_pair_reviews) &
+        (pair_reviews["pair_share"]  >= min_pair_share)
+    ].copy()
+
+    if pair_reviews.empty:
+        return pair_reviews.assign(
+            left_sentiment_pos_share=pd.Series(dtype=float),
+            left_sentiment_neg_share=pd.Series(dtype=float),
+            right_sentiment_pos_share=pd.Series(dtype=float),
+            right_sentiment_neg_share=pd.Series(dtype=float),
         )
-    else:
-        return (
-            "Отмечаем, что замечания по заселению в основном связаны с "
-            + parts[0]
-            + ", а также с "
-            + parts[1]
-            + "."
-        )
+
+    # посчитаем характер каждой отдельной темы (аспекта)
+    # для этого соберём сводку по sentiment внутри периода
+    aspect_sent = (
+        cur.groupby(["aspect_code", "sentiment", "review_id"])
+           .size()
+           .reset_index()
+           .groupby(["aspect_code", "sentiment"])["review_id"]
+           .nunique()
+           .reset_index(name="mentions_reviews")
+    )
+
+    aspect_pivot = aspect_sent.pivot_table(
+        index="aspect_code",
+        columns="sentiment",
+        values="mentions_reviews",
+        fill_value=0,
+        aggfunc="sum",
+    ).rename(columns={
+        "pos": "mentions_pos",
+        "neg": "mentions_neg",
+        "neu": "mentions_neu"
+    })
+
+    aspect_pivot["total_mentions"] = (
+        aspect_pivot.get("mentions_pos", 0)
+        + aspect_pivot.get("mentions_neg", 0)
+        + aspect_pivot.get("mentions_neu", 0)
+    ).replace(0, 1)
+
+    aspect_pivot["pos_share"] = aspect_pivot["mentions_pos"] / aspect_pivot["total_mentions"]
+    aspect_pivot["neg_share"] = aspect_pivot["mentions_neg"] / aspect_pivot["total_mentions"]
+
+    aspect_pivot = aspect_pivot[["pos_share", "neg_share"]].reset_index()
+
+    # теперь присоединим эту сводку (для left/right отдельно)
+    pair_reviews = pair_reviews.merge(
+        aspect_pivot.add_prefix("left_").rename(columns={"left_aspect_code": "left_aspect", "left_index": "left_aspect"}),
+        on="left_aspect",
+        how="left"
+    )
+    pair_reviews = pair_reviews.merge(
+        aspect_pivot.add_prefix("right_").rename(columns={"right_aspect_code": "right_aspect", "right_index": "right_aspect"}),
+        on="right_aspect",
+        how="left"
+    )
+
+    # переименуем для наглядности
+    pair_reviews = pair_reviews.rename(columns={
+        "left_pos_share": "left_sentiment_pos_share",
+        "left_neg_share": "left_sentiment_neg_share",
+        "right_pos_share": "right_sentiment_pos_share",
+        "right_neg_share": "right_sentiment_neg_share",
+    })
+
+    # отсортируем по значимости (сначала самые частые связки)
+    pair_reviews = pair_reviews.sort_values(
+        by=["pair_reviews", "pair_share"],
+        ascending=[False, False],
+        ignore_index=True
+    )
+
+    return pair_reviews
+
+def classify_pair_tone(row: pd.Series) -> str:
+    """
+    row — строка из результата build_cooccurrence_pairs()
+    Возвращает:
+      "neg_cluster"     — обе стороны в основном негатив,
+      "pos_cluster"     — обе стороны в основном позитив,
+      "mixed_cluster"   — смешано (одна скорее негативная, другая скорее позитивная),
+      "unclear"
+    """
+    left_neg = row["left_sentiment_neg_share"]
+    right_neg = row["right_sentiment_neg_share"]
+    left_pos = row["left_sentiment_pos_share"]
+    right_pos = row["right_sentiment_pos_share"]
+
+    # считаем "негативной" если neg_share >= 0.5
+    left_is_neg = (left_neg >= 0.5)
+    right_is_neg = (right_neg >= 0.5)
+
+    # считаем "позитивной" если pos_share >= 0.5
+    left_is_pos = (left_pos >= 0.5)
+    right_is_pos = (right_pos >= 0.5)
+
+    if left_is_neg and right_is_neg:
+        return "neg_cluster"
+    if left_is_pos and right_is_pos:
+        return "pos_cluster"
+    if (left_is_neg and right_is_pos) or (left_is_pos and right_is_neg):
+        return "mixed_cluster"
+    return "unclear"
+
+
+def describe_top_pairs(
+    pairs_df: pd.DataFrame,
+    aspect_registry: Dict[str, Dict[str, Any]],
+    top_n: int = 5
+) -> Dict[str, List[str]]:
+    """
+    Превращает топ-связки (по важности) в текстовые тезисы для отчёта.
+
+    pairs_df — результат build_cooccurrence_pairs(), отсортированный по значимости.
+    aspect_registry — из build_aspect_registry(TOPIC_SCHEMA).
+    top_n — сколько связок максимум выводить в каждую категорию.
+
+    Возвращает словарь:
+    {
+        "neg_cluster": [
+            "...",
+            "..."
+        ],
+        "mixed_cluster": [
+            "...",
+        ],
+        "pos_cluster": [
+            "...",
+        ]
+    }
+    """
+
+    results = {
+        "neg_cluster": [],
+        "mixed_cluster": [],
+        "pos_cluster": [],
+    }
+
+    if pairs_df.empty:
+        return results
+
+    # Добавим колонку типа связки
+    df = pairs_df.copy()
+    df["cluster_type"] = df.apply(classify_pair_tone, axis=1)
+
+    # пройдёмся по строкам по значимости
+    for _, row in df.iterrows():
+        ctype = row["cluster_type"]
+        if ctype not in results:
+            continue
+
+        left_code = row["left_aspect"]
+        right_code = row["right_aspect"]
+
+        left_label  = aspect_registry.get(left_code,  {}).get("label", left_code)
+        right_label = aspect_registry.get(right_code, {}).get("label", right_code)
+
+        pair_reviews = row["pair_reviews"]
+        pair_share   = row["pair_share"]
+
+        # аккуратная человеческая формулировка
+        if ctype == "neg_cluster":
+            text = (
+                f"Часто одновременно жалуются на «{left_label}» и «{right_label}» — "
+                f"эту связку отметили примерно {pair_reviews} гост(я/ей), "
+                f"что составляет около {pair_share:.0%} всех отзывов за период. "
+                f"Это выглядит как системная зона риска."
+            )
+
+        elif ctype == "pos_cluster":
+            text = (
+                f"Гости часто одновременно хвалят «{left_label}» и «{right_label}». "
+                f"Эта позитивная связка упоминалась примерно в {pair_reviews} отзыв(ах), "
+                f"~{pair_share:.0%} от всех упоминаний недели. "
+                f"Это ядро сильных сторон, влияющее на лояльность."
+            )
+
+        elif ctype == "mixed_cluster":
+            text = (
+                f"Часто встречается контраст: положительно оценивают «{left_label}», "
+                f"но при этом жалуются на «{right_label}». "
+                f"Такой разрыв ожиданий отметили ~{pair_reviews} гост(я/ей), "
+                f"что около {pair_share:.0%} отзывов недели. "
+                f"Это критичная точка восприятия ценности."
+            )
+
+        else:
+            continue
+
+        # не пихаем бесконечно
+        if len(results[ctype]) < top_n:
+            results[ctype].append(text)
+
+    return results
 ###############################################################################
 # 16. Формирование текстовых блоков для письма
 ###############################################################################
