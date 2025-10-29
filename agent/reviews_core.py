@@ -15,11 +15,6 @@ reviews_core.py
 - AspectMention: одно конкретное "гость пожаловался на шум кондиционера"
 - ParsedReviewResult: всё вместе, уже готовое к агрегации
 
-Важный момент:
-Мы здесь НЕ делаем агрегацию по неделям, не строим метрики, не рисуем отчёты.
-Это будет в metrics_core и reviews_weekly_report_agent.
-
-Только парсинг одного отзыва.
 """
 
 from __future__ import annotations
