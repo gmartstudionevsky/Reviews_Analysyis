@@ -1,309 +1,296 @@
-# agent/metrics_core.py
 from __future__ import annotations
-from typing import Any, Dict, List, Tuple
+
+"""
+metrics_core.py
+
+Общие утилиты для расчёта периодов и метрик, используемые как модулем
+анкет (surveys_*), так и будущими отчётами по отзывам (reviews_*).
+
+⚠️ Важно: этот модуль спроектирован БЕЗ изменения действующего API,
+от которого уже зависят surveys_* файлы. Все новые возможности
+добавлены аддитивно.
+"""
+
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta
+from typing import Dict, Tuple, Optional, Iterable, Any
+
 import pandas as pd
-import json
+import numpy as np
 
-# периоды, которые мы агрегируем
-PERIOD_LEVELS: List[Tuple[str, str]] = [
-    ("week",    "week_key"),
-    ("month",   "month_key"),
-    ("quarter", "quarter_key"),
-    ("year",    "year_key"),
-]
+# -----------------------------
+# Русские подписи для месяцев
+# -----------------------------
+RU_MONTH_SHORT = {
+    1: "янв",
+    2: "фев",
+    3: "мар",
+    4: "апр",
+    5: "май",
+    6: "июн",
+    7: "июл",
+    8: "авг",
+    9: "сен",
+    10: "окт",
+    11: "ноя",
+    12: "дек",
+}
+RU_MONTH_FULL = {
+    1: "январь",
+    2: "февраль",
+    3: "март",
+    4: "апрель",
+    5: "май",
+    6: "июнь",
+    7: "июль",
+    8: "август",
+    9: "сентябрь",
+    10: "октябрь",
+    11: "ноябрь",
+    12: "декабрь",
+}
 
-def _json_list(cell: Any) -> List[Any]:
-    """Чтение JSON-строки в python-list безопасно."""
-    if isinstance(cell, list):
-        return cell
-    if cell is None or (isinstance(cell, float) and pd.isna(cell)):
-        return []
+_ROMAN = {1: "I", 2: "II", 3: "III", 4: "IV"}
+
+
+# -----------------------------
+# Вспомогательные функции дат
+# -----------------------------
+def _last_day_of_month(d: date) -> date:
+    nm = d.month + 1
+    ny = d.year + (1 if nm == 13 else 0)
+    nm = 1 if nm == 13 else nm
+    first_next = date(ny, nm, 1)
+    return first_next - timedelta(days=1)
+
+
+def _quarter_start(d: date) -> date:
+    q = (d.month - 1) // 3 + 1
+    start_month = 3 * (q - 1) + 1
+    return date(d.year, start_month, 1)
+
+
+def _quarter_end(d: date) -> date:
+    qs = _quarter_start(d)
+    # конец квартала = 3 месяца от начала минус 1 день
+    nm = qs.month + 3
+    ny = qs.year + (1 if nm > 12 else 0)
+    nm = nm - 12 if nm > 12 else nm
+    first_after = date(ny, nm, 1)
+    return first_after - timedelta(days=1)
+
+
+def iso_week_monday(week_key: str) -> date:
+    """
+    Преобразует строку ISO недели вида 'YYYY-W##' в дату понедельника.
+    Примеры допустимых форматов: '2025-W1', '2025-W01', '2025-W52'.
+
+    :param week_key: ISO-неделя как строка.
+    :return: дата (понедельник) начала недели.
+    """
+    week_key = week_key.strip()
+    # Ожидаем 'YYYY-W##'
     try:
-        return json.loads(cell)
-    except Exception:
-        return []
+        yr_part, w_part = week_key.split("-W")
+        y = int(yr_part)
+        w = int(w_part)
+        return date.fromisocalendar(y, w, 1)  # Monday
+    except Exception as e:
+        raise ValueError(f"iso_week_monday: неверный формат week_key='{week_key}'. Ожидалось 'YYYY-W##'.") from e
 
 
-def build_history(df_raw: pd.DataFrame) -> pd.DataFrame:
+def week_label(start: date, end: date, ref_year: Optional[int] = None) -> str:
     """
-    Таблица history:
-    - period_type (week/month/quarter/year)
-    - period_key
-    - reviews (кол-во отзывов)
-    - avg10 (средняя оценка /10)
-    - pos/neu/neg (кол-во отзывов по общей тональности)
+    Возвращает короткую подпись недели: '13–19 окт 2025' или '27 янв – 2 фев 2025',
+    если неделя пересекает месяцы. Год добавляется, если он отличается от ref_year
+    (или ref_year не указан) либо неделя пересекает границу года.
+
+    :param start: дата понедельника
+    :param end: дата воскресенья
+    :param ref_year: Год-эталон (обычно текущий год отчёта). Если совпадает со start.year и end.year,
+                     подпись может не включать год.
     """
-    rows = []
-    for ptype, col in PERIOD_LEVELS:
-        if col not in df_raw.columns:
-            continue
-        sub = df_raw.dropna(subset=[col])
-        if sub.empty:
-            continue
+    same_month = start.year == end.year and start.month == end.month
+    show_year = (ref_year is None) or (start.year != ref_year) or (start.year != end.year)
 
-        for pkey, g in sub.groupby(col, dropna=True):
-            rows.append({
-                "period_type": ptype,
-                "period_key":  pkey,
-                "reviews":     int(g["review_id"].nunique()),
-                "avg10":       round(float(g["rating10"].dropna().mean()), 2)
-                               if g["rating10"].notna().any() else "",
-                "pos":         int((g["sentiment_overall"] == "pos").sum()),
-                "neu":         int((g["sentiment_overall"] == "neu").sum()),
-                "neg":         int((g["sentiment_overall"] == "neg").sum()),
-            })
+    if same_month:
+        core = f"{start.day}–{end.day} {RU_MONTH_SHORT[start.month]}"
+        if show_year:
+            core += f" {end.year}"
+        return core
 
-    out = pd.DataFrame(rows)
-    if out.empty:
-        return pd.DataFrame(columns=["period_type","period_key","reviews","avg10","pos","neu","neg"])
-
-    # сортируем красиво: сначала week, потом month, потом quarter, потом year
-    order = {p:i for i,(p,_) in enumerate(PERIOD_LEVELS)}
-    out["__ord"] = out["period_type"].map(order).fillna(999)
-    out = out.sort_values(by=["__ord", "period_key"], ascending=[True, True], ignore_index=True)
-    out = out.drop(columns="__ord")
-    return out
+    # пересечение месяцев/лет
+    core = f"{start.day} {RU_MONTH_SHORT[start.month]} – {end.day} {RU_MONTH_SHORT[end.month]}"
+    if show_year:
+        # если разные годы, лучше явно указать год конца
+        core += f" {end.year}"
+    return core
 
 
-def build_sources_history(df_raw: pd.DataFrame) -> pd.DataFrame:
+def month_label(d: date) -> str:
+    """'октябрь 2025' (в нижнем регистре для единообразия; обёртки могут капитализировать)."""
+    return f"{RU_MONTH_FULL[d.month]} {d.year}"
+
+
+def quarter_label(d: date) -> str:
+    """'IV кв. 2025'."""
+    q = (d.month - 1) // 3 + 1
+    return f"{_ROMAN[q]} кв. {d.year}"
+
+
+def year_label(d: date) -> str:
+    """'2025'."""
+    return str(d.year)
+
+
+def period_ranges_for_week(week_monday: date) -> Dict[str, Dict[str, date]]:
     """
-    Таблица sources_history:
-    - week_key
-    - source
-    - reviews
-    - avg10
-    - pos/neu/neg
-    Используется в блоке C (матрица Источник × Период).
+    Возвращает границы периодов для недельного отчёта:
+    - 'week': [понедельник; воскресенье]
+    - 'mtd' : [1 число месяца; min(конец месяца, воскресенье недели)]
+    - 'qtd' : [начало квартала; min(конец квартала, воскресенье недели)]
+    - 'ytd' : [01.01; min(31.12, воскресенье недели)]
+
+    Эти границы ожидаются surveys_weekly_report_agent.
     """
-    if "week_key" not in df_raw.columns or "source" not in df_raw.columns:
-        return pd.DataFrame(columns=["week_key","source","reviews","avg10","pos","neu","neg"])
+    w_start = week_monday
+    w_end = week_monday + timedelta(days=6)
 
-    sub = df_raw.dropna(subset=["week_key","source"])
-    if sub.empty:
-        return pd.DataFrame(columns=["week_key","source","reviews","avg10","pos","neu","neg"])
+    # MTD
+    m_start = date(w_start.year, w_start.month, 1)
+    m_end = min(_last_day_of_month(w_start), w_end)
 
-    rows = []
-    for (wk, src), g in sub.groupby(["week_key","source"], dropna=True):
-        rows.append({
-            "week_key": wk,
-            "source":   src,
-            "reviews":  int(g["review_id"].nunique()),
-            "avg10":    round(float(g["rating10"].dropna().mean()), 2)
-                        if g["rating10"].notna().any() else "",
-            "pos":      int((g["sentiment_overall"] == "pos").sum()),
-            "neu":      int((g["sentiment_overall"] == "neu").sum()),
-            "neg":      int((g["sentiment_overall"] == "neg").sum()),
-        })
+    # QTD
+    q_start = _quarter_start(w_start)
+    q_end = min(_quarter_end(w_start), w_end)
 
-    out = pd.DataFrame(rows)
-    out = out.sort_values(by=["week_key","source"], ascending=[True,True], ignore_index=True)
-    return out
+    # YTD
+    y_start = date(w_start.year, 1, 1)
+    y_end = min(date(w_start.year, 12, 31), w_end)
+
+    return {
+        "week": {"start": w_start, "end": w_end},
+        "mtd": {"start": m_start, "end": m_end},
+        "qtd": {"start": q_start, "end": q_end},
+        "ytd": {"start": y_start, "end": y_end},
+    }
 
 
-def build_semantic_agg_aspects_period(df_raw: pd.DataFrame) -> pd.DataFrame:
+# =============================================================================
+# Ниже — функции агрегации «истории» отзывов (не используются анкетами напрямую),
+# оставлены ради совместимости и будущего расширения.
+# =============================================================================
+
+def _require_columns(df: pd.DataFrame, cols: Iterable[str], where: str) -> None:
+    missing = [c for c in cols if c not in df.columns]
+    if missing:
+        raise KeyError(f"{where}: отсутствуют обязательные колонки: {missing}")
+
+
+def build_history(raw_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Таблица semantic_agg_aspects_period:
-    - period_type / period_key
-    - source_scope ("all" и отдельно каждый источник)
-    - aspect_key
-    - mentions_total / pos_mentions / neg_mentions / neu_mentions
-    - pos_share / neg_share
-    - pos_weight / neg_weight
-      *pos_weight* ~= насколько этот аспект свойственен позитивным отзывам недели
-      *neg_weight* ~= насколько этот аспект свойственен негативным отзывам недели
+    Превращает сырые отзывы в «историю» по неделям.
+    Ожидаемые колонки raw_df: ['review_id','source','created_at','week_key','rating10','sentiment_overall'].
+    Необязательные: ['language','topic','aspect'].
 
-    Это прямой источник для блоков B1 (сильные стороны), B2 (риски),
-    B3 (существенные отклонения).
+    Возвращает DataFrame с колонками:
+      ['week_key','week_start','week_end','reviews','avg10','pos','neu','neg']
     """
-    rows = []
-    # список уникальных источников для source_scope
-    sources = sorted([s for s in df_raw["source"].dropna().unique().tolist() if s])
-
-    for ptype, col in PERIOD_LEVELS:
-        if col not in df_raw.columns:
-            continue
-        sub_per = df_raw.dropna(subset=[col])
-        if sub_per.empty:
-            continue
-
-        for scope in ["all"] + sources:
-            if scope == "all":
-                scoped = sub_per
-            else:
-                scoped = sub_per[sub_per["source"] == scope]
-
-            if scoped.empty:
-                continue
-
-            # какие отзывы считаем «позитивными» / «негативными»
-            pos_reviews = set(scoped.loc[scoped["sentiment_overall"]=="pos","review_id"])
-            neg_reviews = set(scoped.loc[scoped["sentiment_overall"]=="neg","review_id"])
-            pos_total = len(pos_reviews)
-            neg_total = len(neg_reviews)
-
-            for pkey, g in scoped.groupby(col, dropna=True):
-
-                # собираем статистику по аспектам
-                aspects_stats: Dict[str, Dict[str,set]] = {}
-                # структура: aspect_key -> { "m": all_mentions, "p":pos_mentions, "n":neg_mentions, "u":neu_mentions }
-                # где значения — множества review_id
-
-                for _, r in g.iterrows():
-                    rid = r["review_id"]
-                    topics_all = set(_json_list(r.get("topics_all")))
-                    topics_pos = set(_json_list(r.get("topics_pos")))
-                    topics_neg = set(_json_list(r.get("topics_neg")))
-                    topics_neu = topics_all - topics_pos - topics_neg
-
-                    for a in topics_all:
-                        aspects_stats.setdefault(a, {"m":set(),"p":set(),"n":set(),"u":set()})["m"].add(rid)
-                    for a in topics_pos:
-                        aspects_stats.setdefault(a, {"m":set(),"p":set(),"n":set(),"u":set()})["p"].add(rid)
-                    for a in topics_neg:
-                        aspects_stats.setdefault(a, {"m":set(),"p":set(),"n":set(),"u":set()})["n"].add(rid)
-                    for a in topics_neu:
-                        aspects_stats.setdefault(a, {"m":set(),"p":set(),"n":set(),"u":set()})["u"].add(rid)
-
-                for aspect_key, bucket in aspects_stats.items():
-                    mentions_total = len(bucket["m"])
-                    pos_mentions   = len(bucket["p"])
-                    neg_mentions   = len(bucket["n"])
-                    neu_mentions   = len(bucket["u"])
-
-                    # «вес» аспекта в позитиве/негативе —
-                    # доля позитивных/негативных отзывов недели,
-                    # в которых этот аспект упомянут
-                    pos_weight = (
-                        len(bucket["p"].intersection(pos_reviews))/pos_total
-                        if pos_total else 0.0
-                    )
-                    neg_weight = (
-                        len(bucket["n"].intersection(neg_reviews))/neg_total
-                        if neg_total else 0.0
-                    )
-
-                    rows.append({
-                        "period_type": ptype,
-                        "period_key": pkey,
-                        "source_scope": scope,
-                        "aspect_key": aspect_key,
-                        "mentions_total": mentions_total,
-                        "pos_mentions": pos_mentions,
-                        "neg_mentions": neg_mentions,
-                        "neu_mentions": neu_mentions,
-                        "pos_share": round(pos_mentions/mentions_total,4) if mentions_total else 0.0,
-                        "neg_share": round(neg_mentions/mentions_total,4) if mentions_total else 0.0,
-                        "pos_weight": round(pos_weight,4),
-                        "neg_weight": round(neg_weight,4),
-                    })
-
-    out = pd.DataFrame(rows)
-    if out.empty:
+    if raw_df is None or len(raw_df) == 0:
         return pd.DataFrame(columns=[
-            "period_type","period_key","source_scope","aspect_key",
-            "mentions_total","pos_mentions","neg_mentions","neu_mentions",
-            "pos_share","neg_share","pos_weight","neg_weight",
+            "week_key","week_start","week_end","reviews","avg10","pos","neu","neg"
         ])
 
-    # сортируем чтобы смотреть глазами:
-    # 1. week -> month -> quarter -> year
-    # 2. period_key по возрастанию
-    # 3. сначала scope=all, потом конкретные источники
-    # 4. внутри — по mentions_total по убыванию (что чаще всего всплывает)
-    order = {p:i for i,(p,_) in enumerate(PERIOD_LEVELS)}
-    out["__o"] = out["period_type"].map(order).fillna(999)
-    out["__s"] = out["source_scope"].apply(lambda s: 0 if s=="all" else 1)
-    out = out.sort_values(
-        by=["__o","period_key","__s","mentions_total"],
-        ascending=[True,True,True,False],
-        ignore_index=True
+    df = raw_df.copy()
+
+    # week_key — обязателен для агрегирования по неделям
+    _require_columns(df, ["week_key", "rating10", "sentiment_overall"], "build_history")
+
+    # Нормализуем week_start/week_end для удобства последующего мерджа
+    df["week_start"] = df["week_key"].astype(str).map(iso_week_monday)
+    df["week_end"] = df["week_start"] + pd.to_timedelta(6, unit="D")
+
+    # Сентимент -> one-hot
+    def _one_hot_sentiment(s: Any) -> Tuple[int, int, int]:
+        s = str(s).lower()
+        if s.startswith("pos"):
+            return 1, 0, 0
+        if s.startswith("neg"):
+            return 0, 0, 1
+        return 0, 1, 0
+
+    oh = df["sentiment_overall"].map(_one_hot_sentiment)
+    df[["pos","neu","neg"]] = pd.DataFrame(list(oh), index=df.index)
+
+    grp = (
+        df.groupby(["week_key","week_start","week_end"], as_index=False)
+          .agg(
+              reviews=("review_id", "nunique") if "review_id" in df.columns else ("week_key","size"),
+              avg10=("rating10", "mean"),
+              pos=("pos", "sum"),
+              neu=("neu", "sum"),
+              neg=("neg", "sum"),
+          )
     )
-    out = out.drop(columns=["__o","__s"])
-    return out
+    # Безопасно округлим «красиво», оставляя float
+    grp["avg10"] = grp["avg10"].astype(float).round(2)
+    return grp.sort_values("week_start").reset_index(drop=True)
 
 
-def build_semantic_agg_pairs_period(df_raw: pd.DataFrame) -> pd.DataFrame:
+def build_sources_history(reviews_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Таблица semantic_agg_pairs_period:
-    - period_type / period_key
-    - source_scope ("all" и по источникам)
-    - pair_key (строка "aspectA|aspectB" в сортированном порядке)
-    - category (systemic_risk / expectations_conflict / loyalty_driver)
-    - distinct_reviews (сколько разных отзывов упомянули эту пару)
-    - example_quote (какой-нибудь характерный фрагмент)
+    История по источникам (week_key × source).
+    Ожидаемые колонки: как в build_history + 'source'.
 
-    Это источник блока B4.
+    Возвращает DataFrame с колонками:
+      ['week_key','week_start','week_end','source','reviews','avg10','pos','neu','neg']
     """
-    rows = []
-    sources = sorted([s for s in df_raw["source"].dropna().unique().tolist() if s])
-
-    for ptype, col in PERIOD_LEVELS:
-        if col not in df_raw.columns:
-            continue
-        sub_per = df_raw.dropna(subset=[col])
-        if sub_per.empty:
-            continue
-
-        for scope in ["all"] + sources:
-            if scope == "all":
-                scoped = sub_per
-            else:
-                scoped = sub_per[sub_per["source"] == scope]
-
-            if scoped.empty:
-                continue
-
-            for pkey, g in scoped.groupby(col, dropna=True):
-
-                pair_to_reviews: Dict[Tuple[str,str], set] = {}
-                pair_to_quote: Dict[Tuple[str,str], str] = {}
-
-                for _, r in g.iterrows():
-                    rid    = r["review_id"]
-                    pairs  = _json_list(r.get("pair_tags"))
-                    quotes = _json_list(r.get("quote_candidates"))
-                    quote0 = quotes[0] if quotes else ""
-
-                    for p in pairs:
-                        a = (p.get("a") or "").strip()
-                        b = (p.get("b") or "").strip()
-                        cat = (p.get("cat") or "").strip()
-                        if not a or not b or not cat:
-                            continue
-
-                        pair_sorted = "|".join(sorted([a,b]))
-                        key = (pair_sorted, cat)
-
-                        pair_to_reviews.setdefault(key, set()).add(rid)
-                        # сохраняем первую увиденную цитату как пример
-                        if key not in pair_to_quote and quote0:
-                            pair_to_quote[key] = quote0
-
-                for (pair_key, cat), revs in pair_to_reviews.items():
-                    rows.append({
-                        "period_type": ptype,
-                        "period_key": pkey,
-                        "source_scope": scope,
-                        "pair_key": pair_key,
-                        "category": cat,
-                        "distinct_reviews": len(revs),
-                        "example_quote": pair_to_quote.get((pair_key, cat), ""),
-                    })
-
-    out = pd.DataFrame(rows)
-    if out.empty:
+    if reviews_df is None or len(reviews_df) == 0:
         return pd.DataFrame(columns=[
-            "period_type","period_key","source_scope",
-            "pair_key","category","distinct_reviews","example_quote"
+            "week_key","week_start","week_end","source","reviews","avg10","pos","neu","neg"
         ])
 
-    order = {p:i for i,(p,_) in enumerate(PERIOD_LEVELS)}
-    out["__o"] = out["period_type"].map(order).fillna(999)
-    out["__s"] = out["source_scope"].apply(lambda s: 0 if s=="all" else 1)
-    out = out.sort_values(
-        by=["__o","period_key","__s","distinct_reviews"],
-        ascending=[True,True,True,False],
-        ignore_index=True
+    df = reviews_df.copy()
+    _require_columns(df, ["week_key", "rating10", "sentiment_overall", "source"], "build_sources_history")
+
+    df["week_start"] = df["week_key"].astype(str).map(iso_week_monday)
+    df["week_end"] = df["week_start"] + pd.to_timedelta(6, unit="D")
+
+    def _one_hot_sentiment(s: Any) -> Tuple[int, int, int]:
+        s = str(s).lower()
+        if s.startswith("pos"):
+            return 1, 0, 0
+        if s.startswith("neg"):
+            return 0, 0, 1
+        return 0, 1, 0
+
+    oh = df["sentiment_overall"].map(_one_hot_sentiment)
+    df[["pos","neu","neg"]] = pd.DataFrame(list(oh), index=df.index)
+
+    grp = (
+        df.groupby(["week_key","week_start","week_end","source"], as_index=False)
+          .agg(
+              reviews=("review_id", "nunique") if "review_id" in df.columns else ("week_key","size"),
+              avg10=("rating10", "mean"),
+              pos=("pos", "sum"),
+              neu=("neu", "sum"),
+              neg=("neg", "sum"),
+          )
     )
-    out = out.drop(columns=["__o","__s"])
-    return out
+    grp["avg10"] = grp["avg10"].astype(float).round(2)
+    return grp.sort_values(["week_start","source"]).reset_index(drop=True)
+
+
+# Экспортируем публичный API, на который опираются другие модули.
+__all__ = [
+    # даты/подписи (используются анкетами)
+    "iso_week_monday",
+    "week_label",
+    "month_label",
+    "quarter_label",
+    "year_label",
+    "period_ranges_for_week",
+    # будущие и совместимые функции для отзывов
+    "build_history",
+    "build_sources_history",
+]
