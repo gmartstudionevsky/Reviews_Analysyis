@@ -306,21 +306,6 @@ def main() -> None:
     
     LOG.info(f"Файлов к обработке: {len(selected)}")
 
-    # отфильтруем по дате из имени
-    selected: List[Dict[str, Any]] = []
-    for f in files:
-        d = _parse_date_from_name(f.get("name", ""))
-        if d is None:
-            continue
-        if start_date <= d <= end_date:
-            selected.append(f)
-
-    if not selected:
-        LOG.warning("За указанный период не найдено файлов с распознанной датой в имени.")
-        return
-
-    LOG.info(f"Файлов к обработке: {len(selected)}")
-
     # --- Чтение/парсинг всех файлов периода ---
     all_inputs: List[reviews_core.ReviewRecordInput] = []
     raw_has_response_pairs: List[Tuple[str, Any]] = []
