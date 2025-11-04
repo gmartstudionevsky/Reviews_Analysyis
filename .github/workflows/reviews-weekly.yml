@@ -7,50 +7,60 @@ on:
   # запуск вручную из Actions
   workflow_dispatch: {}
 
+concurrency:
+  group: surveys-weekly
+  cancel-in-progress: true
+
 jobs:
-  build-and-run:
+  run:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
+      - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
-      - name: Install deps
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pandas numpy openpyxl \
-                     google-api-python-client google-auth google-auth-httplib2 google-auth-oauthlib
+          pip install pandas numpy google-api-python-client google-auth google-auth-httplib2 openpyxl matplotlib
 
-      - name: Decode service account (if provided)
-        if: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON_B64 != '' }}
-        run: |
-          mkdir -p agent/.secrets
-          echo "${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON_B64 }}" | base64 -d > agent/.secrets/sa.json
-
-      - name: Run weekly agent
+      # декодируем сервисный ключ из base64 → sa.json и пробрасываем путь
+      - name: Prepare service account (from b64)
         env:
-          # --- Google Drive / Sheets ---
-          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ github.workspace }}/agent/.secrets/sa.json
-          REVIEWS_DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
-          REVIEWS_HISTORY_FILE_ID: ${{ secrets.SHEETS_HISTORY_ID }}
-
-          # --- Email / SMTP ---
-          SMTP_USER: ${{ secrets.SMTP_USER }}
-          SMTP_PASS: ${{ secrets.SMTP_PASS }}
-          MAIL_FROM: ${{ secrets.SMTP_FROM }}
-          MAIL_TO: ${{ secrets.RECIPIENTS }}
-          MAIL_SUBJECT_PREFIX: "[Reviews Weekly]"
-
-          # --- Output directory for artifacts ---
-          OUT_DIR: ${{ github.workspace }}/agent/artifacts
+          GOOGLE_SERVICE_ACCOUNT_JSON_B64: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON_B64 }}
         run: |
-          mkdir -p "$OUT_DIR"
-          python agent/reviews_weekly_report_agent.py
+          set -euo pipefail
+          export GOOGLE_SERVICE_ACCOUNT_JSON="$GITHUB_WORKSPACE/sa.json"
+          echo "$GOOGLE_SERVICE_ACCOUNT_JSON_B64" | base64 -d > "$GOOGLE_SERVICE_ACCOUNT_JSON"
+          test -s "$GOOGLE_SERVICE_ACCOUNT_JSON"
+          head -c 1 "$GOOGLE_SERVICE_ACCOUNT_JSON" | grep -q '{'
+          echo "GOOGLE_SERVICE_ACCOUNT_JSON=$GOOGLE_SERVICE_ACCOUNT_JSON" >> "$GITHUB_ENV"
+
+      # еженедельный отчёт по анкетам:
+      # - тянет последний Report_*.xlsx из Google Drive
+      # - делает upsert только текущей недели в surveys_history
+      # - считает неделю / месяц / квартал / год / итого
+      # - шлёт письмо со сводкой и графиками
+      - name: Send weekly surveys report
+        env:
+          DRIVE_FOLDER_ID:   ${{ secrets.DRIVE_FOLDER_ID }}
+          SHEETS_HISTORY_ID: ${{ secrets.SHEETS_HISTORY_ID }}
+          RECIPIENTS:        ${{ secrets.RECIPIENTS }}
+          SMTP_USER:         ${{ secrets.SMTP_USER }}
+          SMTP_PASS:         ${{ secrets.SMTP_PASS }}
+          SMTP_FROM:         ${{ secrets.SMTP_FROM }}
+          # SMTP_HOST / SMTP_PORT берутся по умолчанию,
+          # но можно переопределить через секреты при желании:
+          # SMTP_HOST:       smtp.gmail.com
+          # SMTP_PORT:       587
+          
+        run: |
+          python -m agent.reviews_weekly_report_agent
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
