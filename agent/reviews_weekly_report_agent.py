@@ -75,6 +75,23 @@ def _last_completed_week_key(anchor: Optional[str] = None) -> str:
 def _build_credentials(sa_json_path: str):
     return service_account.Credentials.from_service_account_file(sa_json_path, scopes=DRIVE_SCOPES + SHEETS_SCOPES)
 
+def _b64_to_sa_json_path(b64_env: str) -> str:
+    """
+    Декодирует GOOGLE_SERVICE_ACCOUNT_JSON_B64 в /tmp/sa.json и возвращает путь.
+    """
+    content_b64 = os.environ.get(b64_env) or ""
+    if not content_b64:
+        raise RuntimeError(f"{b64_env} не задан.")
+    raw = base64.b64decode(content_b64)
+    out_path = "/tmp/sa.json"
+    with open(out_path, "wb") as f:
+        f.write(raw)
+    return out_path
+
+def _build_credentials_from_b64():
+    sa_path = _b64_to_sa_json_path("GOOGLE_SERVICE_ACCOUNT_JSON_B64")
+    return service_account.Credentials.from_service_account_file(sa_path, scopes=DRIVE_SCOPES + SHEETS_SCOPES)
+
 def _build_drive(creds):
     return build("drive", "v3", credentials=creds, cache_discovery=False)
 
@@ -336,7 +353,6 @@ def _send_email(
 # -----------------------------------------------------------------------------
 def main() -> None:
     # --- ENV ---
-    sa_json_path = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON") or ""
     drive_folder_id = os.environ.get("DRIVE_FOLDER_ID") or ""
     sheets_id = os.environ.get("SHEETS_HISTORY_ID") or ""
     recipients_env = os.environ.get("RECIPIENTS") or ""
@@ -346,8 +362,8 @@ def main() -> None:
     week_key_env = os.environ.get("WEEK_KEY") or ""
     dry_run = (os.environ.get("DRY_RUN") or "false").strip().lower() == "true"
 
-    if not sa_json_path or not os.path.exists(sa_json_path):
-        raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON не задан или файл не найден.")
+    if not (os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON_B64") or "").strip():
+        raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON_B64 не задан.")
     if not drive_folder_id:
         raise RuntimeError("DRIVE_FOLDER_ID не задан.")
     if not sheets_id:
@@ -363,7 +379,7 @@ def main() -> None:
     LOG.info(f"Anchor week: {anchor_week_key} ({week_start}..{week_end})")
 
     # --- Google clients ---
-    creds = _build_credentials(sa_json_path)
+    creds = _build_credentials_from_b64()
     drive = _build_drive(creds)
     sheets = _build_sheets(creds)
 
