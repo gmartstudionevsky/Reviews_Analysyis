@@ -1,0 +1,68 @@
+name: Reviews Backfill
+
+on:
+  workflow_dispatch:
+    inputs:
+      date_from:
+        description: "Начало периода (YYYY-MM-DD)"
+        required: false
+        type: string
+      date_to:
+        description: "Окончание периода (YYYY-MM-DD)"
+        required: false
+        type: string
+      dry_run:
+        description: "Только расчёт, без записи в Sheets (true/false)"
+        required: false
+        type: choice
+        options: ["false", "true"]
+        default: "false"
+
+concurrency:
+  group: reviews-backfill
+  cancel-in-progress: true
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          if [ -f agent/requirements.txt ]; then
+            pip install -r agent/requirements.txt
+          else
+            pip install pandas numpy google-api-python-client google-auth google-auth-httplib2 openpyxl xlrd matplotlib python-dateutil
+          fi
+
+      - name: Prepare service account (from b64)
+        env:
+          GOOGLE_SERVICE_ACCOUNT_JSON_B64: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON_B64 }}
+        run: |
+          set -euo pipefail
+          export GOOGLE_SERVICE_ACCOUNT_JSON="$GITHUB_WORKSPACE/sa.json"
+          echo "$GOOGLE_SERVICE_ACCOUNT_JSON_B64" | base64 -d > "$GOOGLE_SERVICE_ACCOUNT_JSON"
+          test -s "$GOOGLE_SERVICE_ACCOUNT_JSON"
+          head -c 1 "$GOOGLE_SERVICE_ACCOUNT_JSON" | grep -q '{'
+          echo "GOOGLE_SERVICE_ACCOUNT_JSON=$GOOGLE_SERVICE_ACCOUNT_JSON" >> "$GITHUB_ENV"
+
+      - name: Run reviews backfill
+        env:
+          DRIVE_FOLDER_ID:   ${{ secrets.DRIVE_FOLDER_ID }}
+          SHEETS_HISTORY_ID: ${{ secrets.SHEETS_HISTORY_ID }}
+          # Параметры периода и dry-run для агента
+          START_DATE:        ${{ github.event.inputs.date_from }}
+          END_DATE:          ${{ github.event.inputs.date_to }}
+          DRY_RUN:           ${{ github.event.inputs.dry_run }}
+        run: |
+          python -m agent.reviews_backfill_agent
