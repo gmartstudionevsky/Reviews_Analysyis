@@ -10,11 +10,12 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import pandas as pd
 
-# --- импорт интерфейсов для сборки входов в ядро ---
+# Берём датакласс входа из ядра отзывов (надёжный импорт)
 try:
-    from agent.reviews_core import ReviewRecordInput
-except ModuleNotFoundError:
-    from reviews_core import ReviewRecordInput  # type: ignore
+    import agent.reviews_core as _rc
+except Exception:
+    import reviews_core as _rc  # type: ignore
+ReviewRecordInput = _rc.ReviewRecordInput
 
 
 # --------------------------------------------------------------------------------------
