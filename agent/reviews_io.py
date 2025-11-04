@@ -10,12 +10,9 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import pandas as pd
 
-# Берём датакласс входа из ядра отзывов (надёжный импорт)
-try:
-    import agent.reviews_core as _rc
-except Exception:
-    import reviews_core as _rc  # type: ignore
-ReviewRecordInput = _rc.ReviewRecordInput
+# Пакетный импорт из agent
+from .reviews_core import ReviewRecordInput
+
 
 
 # --------------------------------------------------------------------------------------
