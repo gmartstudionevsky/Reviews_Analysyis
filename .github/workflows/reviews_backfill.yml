@@ -3,14 +3,6 @@ name: Reviews Backfill
 on:
   workflow_dispatch:
     inputs:
-      BACKFILL_START:
-        description: 'Начало периода (YYYY-MM-DD)'
-        required: true
-        type: string
-      BACKFILL_END:
-        description: 'Конец периода (YYYY-MM-DD)'
-        required: true
-        type: string
       DRY_RUN:
         description: 'Сухой прогон (без записи в Google Sheets)'
         required: false
