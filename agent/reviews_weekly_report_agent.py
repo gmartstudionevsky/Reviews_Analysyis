@@ -1081,8 +1081,6 @@ def main() -> None:
       </p>
     </body></html>
     """
-dy></html>
-    """
 
     attachments: List[Tuple[str, bytes]] = []
     # CSV с обзорной таблицей по отзывам недели
