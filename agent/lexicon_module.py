@@ -15822,7 +15822,9 @@ class Lexicon:
         )
 
         # -------- топики / подтемы --------
-        self._topic_schema = topic_schema
+         self._topic_schema = topic_schema
+         self._compiled_topics = self._compile_topics(topic_schema)
+
 
     # ------------------------------------------------------------------
     # Компиляция тональностей
@@ -16030,7 +16032,136 @@ class Lexicon:
         if rule is None:
             return None
         return rule.long_hint
-
+      
+      # --- Публичные свойства для совместимости с LexiconProtocol ---
+      
+      @property
+      def compiled_sentiment(self) -> Dict[str, Dict[str, List[re.Pattern]]]:
+          """
+          Псевдоним к внутреннему словарю скомпилированных паттернов тональностей.
+          Ожидаемая структура:
+          {
+            "positive_strong": {"ru": [re.Pattern,...], "en": [...] , ...},
+            "positive_soft":   {...},
+            "negative_soft":   {...},
+            "negative_strong": {...},
+            "neutral":         {...},
+          }
+          """
+          return self._compiled_sentiment_lexicon
+      
+      @property
+      def compiled_aspects(self) -> Dict[str, Dict[str, List[re.Pattern]]]:
+          """
+          Псевдоним к внутренним скомпилированным правилам аспектов.
+          Ожидаемая структура:
+          { "aspect_code": {"ru":[...], "en":[...], ...}, ... }
+          """
+          return self._compiled_aspect_rules
+      
+      @property
+      def topic_schema(self) -> Dict[str, Dict[str, Any]]:
+          """
+          Исходная схема тем (как загружена/передана при инициализации).
+          Ожидается формат с категориями -> подтемами.
+          """
+          return self._topic_schema
+      
+      @property
+      def compiled_topics(self) -> Dict[str, Dict[str, Dict[str, List[re.Pattern]]]]:
+          """
+          Скомпилированные паттерны тем/подтем по языкам.
+          Структура:
+          {
+            "<topic_key>": {
+              "<subtopic_key>": {
+                "ru": [re.Pattern, ...],
+                "en": [...],
+                ...
+              },
+              ...
+            },
+            ...
+          }
+          """
+          return self._compiled_topics
+      
+      # --- Компиляция тем/подтем ---
+      
+      def _compile_topics(
+          self,
+          topic_schema: Dict[str, Dict[str, Any]],
+      ) -> Dict[str, Dict[str, Dict[str, List[re.Pattern]]]]:
+          """
+          Поддерживает оба варианта схемы:
+          - "patterns": {"ru":[...], "en":[...], ...}
+          - "patterns_by_lang": {"ru":[...], ...}
+          """
+          compiled: Dict[str, Dict[str, Dict[str, List[re.Pattern]]]] = {}
+          for topic_key, topic_def in topic_schema.items():
+              subtopics: Dict[str, Any] = topic_def.get("subtopics", {})
+              for sub_key, sub_def in subtopics.items():
+                  raw = sub_def.get("patterns")
+                  if raw is None:
+                      raw = sub_def.get("patterns_by_lang")  # fallback на альтернативное имя
+                  if not raw:
+                      continue
+                  for lang_code, patterns in raw.items():
+                      compiled \
+                          .setdefault(topic_key, {}) \
+                          .setdefault(sub_key, {}) \
+                          .setdefault(lang_code, []) \
+                          .extend(_compile_regex_list(patterns))
+          return compiled
+      
+      # --- Матчинг тем/подтем в тексте (по предложениям можно вызывать наружу при желании) ---
+      
+      def match_topics(self, text: str, lang: str) -> List[Tuple[str, str]]:
+          """
+          Простой матчинг пар (topic, subtopic) в целом тексте.
+          Возвращает уникальные пары.
+          """
+          if not text:
+              return []
+          found: List[Tuple[str, str]] = []
+          seen: set[Tuple[str, str]] = set()
+          candidates = _candidate_langs(lang)
+          for topic_key, sub_map in self._compiled_topics.items():
+              for sub_key, lang_map in sub_map.items():
+                  pats: List[re.Pattern] = []
+                  for c in candidates:
+                      pats.extend(lang_map.get(c, []))
+                  if any(p.search(text) for p in pats):
+                      pair = (topic_key, sub_key)
+                      if pair not in seen:
+                          seen.add(pair)
+                          found.append(pair)
+          return found
+      
+      # --- Детект языка (минималистичный хак без внешних зависимостей) ---
+      
+      def detect_lang(self, text: str) -> str:
+          """
+          Грубая эвристика:
+          - кириллица -> 'ru'
+          - арабская письменность -> 'ar'
+          - турецкие специфичные буквы -> 'tr'
+          - CJK диапазоны -> 'zh'
+          - иначе -> 'en'
+          """
+          if not text:
+              return "en"
+          s = text
+          # Упростим определение по диапазонам/символам
+          if re.search(r"[А-Яа-яЁё]", s):
+              return "ru"
+          if re.search(r"[\u0600-\u06FF]", s):  # Arabic
+              return "ar"
+          if re.search(r"[ıİğĞşŞçÇöÖüÜ]", s):
+              return "tr"
+          if re.search(r"[\u4E00-\u9FFF]", s):  # CJK Unified Ideographs
+              return "zh"
+          return "en"
 
     # ------------------------------------------------------------------
     # Утилиты для дебага / отладки
@@ -16049,3 +16180,4 @@ class Lexicon:
 
         return {lang: sorted(list(aspects)) for lang, aspects in coverage.items()}
 
+      LexiconModule = Lexicon  # совместимость с импортами вида lexicon_module.LexiconModule
