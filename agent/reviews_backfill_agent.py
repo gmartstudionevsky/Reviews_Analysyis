@@ -34,6 +34,8 @@ HISTORY_SHEET_NAME = "reviews_history"  # отдельная вкладка в �
 # Поддерживаемые паттерны имён файлов (даты в именах)
 _RE_FNAME_DMY = re.compile(r"(?i)\breviews?_?(\d{2})-(\d{2})-(\d{4})\b")
 _RE_FNAME_YMD = re.compile(r"(?i)\breviews?_?(\d{4})-(\d{2})-(\d{2})\b")
+# Годовой агрегат: reviews_2019-25.xls (с 2019 по 2025)
+_RE_FNAME_YEAR_RANGE = re.compile(r"(?i)\breviews?_?(\d{4})-(\d{2})\b")
 
 
 # -----------------------------------------------------------------------------
@@ -243,19 +245,67 @@ def main() -> None:
     if not sheets_id:
         raise RuntimeError("SHEETS_HISTORY_ID не задан.")
 
-    # Даты периода бэкфилла (включительно)
-    start_date = _date_from_env("BACKFILL_START")  # YYYY-MM-DD
-    end_date = _date_from_env("BACKFILL_END")      # YYYY-MM-DD
-    if end_date < start_date:
-        raise RuntimeError("BACKFILL_END раньше BACKFILL_START.")
-
+    # --- Режим выбора входных файлов ---
+    # 1) Если задан BACKFILL_FILE — берём его (по id или имени).
+    # 2) Иначе пробуем найти агрегированный файл формата reviews_2019-25.xls.
+    # 3) Иначе падаем в прежний "date-range" режим с BACKFILL_START/BACKFILL_END.
+    backfill_file = (os.environ.get("BACKFILL_FILE") or "").strip()
+    
+    range_mode = False
+    start_date: Optional[date] = None
+    end_date: Optional[date] = None
+    selected: List[Dict[str, Any]] = []
+    
     # --- Google clients (через B64 секрет) ---
     creds = _build_credentials_from_b64()
     drive = _build_drive(creds)
     sheets = _build_sheets(creds)
-
-    # --- Список файлов ---
+    
+    # --- Список файлов в папке ---
     files = _drive_list_files_in_folder(drive, drive_folder_id)
+    
+    if backfill_file:
+        # точное совпадение по id или по имени (без учёта регистра)
+        for f in files:
+            name = f.get("name", "")
+            if f["id"] == backfill_file or name.lower() == backfill_file.lower():
+                selected = [f]
+                LOG.info(f"BACKFILL_FILE: выбран файл '{name}' (id={f['id']}).")
+                break
+        if not selected:
+            raise RuntimeError(f"BACKFILL_FILE='{backfill_file}' не найден в папке.")
+    else:
+        # пробуем годовой агрегат reviews_YYYY-YY.xls
+        yr_file = None
+        for f in files:
+            name = f.get("name", "")
+            if _RE_FNAME_YEAR_RANGE.search(name):
+                yr_file = f
+                break  # файлы уже отсортированы по modifiedTime desc
+        if yr_file:
+            selected = [yr_file]
+            LOG.info(f"Обнаружен агрегированный файл: {yr_file.get('name')}")
+        else:
+            # fallback: старый режим — по диапазону дат из ENV
+            range_mode = True
+            start_date = _date_from_env("BACKFILL_START")  # YYYY-MM-DD
+            end_date = _date_from_env("BACKFILL_END")      # YYYY-MM-DD
+            if end_date < start_date:
+                raise RuntimeError("BACKFILL_END раньше BACKFILL_START.")
+    
+            for f in files:
+                d = _parse_date_from_name(f.get("name", ""))
+                if d is None:
+                    continue
+                if start_date <= d <= end_date:
+                    selected.append(f)
+    
+    if not selected:
+        LOG.warning("Не найдено входных файлов по выбранному режиму (file/year-range/date-range).")
+        return
+    
+    LOG.info(f"Файлов к обработке: {len(selected)}")
+
     # отфильтруем по дате из имени
     selected: List[Dict[str, Any]] = []
     for f in files:
@@ -313,15 +363,20 @@ def main() -> None:
     df_reviews = reviews_core.build_reviews_dataframe(analyzed)
     # df_aspects = reviews_core.build_aspects_dataframe(analyzed)  # для истории не требуется
 
-    # --- Идемпотентная запись по неделям, попавшим в период ---
-    # ограничим строки по датам входящего периода (на случай, если вн. дата и имя расходятся)
-    mask_period = (pd.to_datetime(df_reviews["created_at"]).dt.date >= start_date) & \
-                  (pd.to_datetime(df_reviews["created_at"]).dt.date <= end_date)
-    df_reviews_period = df_reviews.loc[mask_period].copy()
-
+    # --- Идемпотентная запись по неделям ---
+    if range_mode:
+        # в режиме date-range ограничиваем по датам
+        mask_period = (pd.to_datetime(df_reviews["created_at"]).dt.date >= start_date) & \
+                      (pd.to_datetime(df_reviews["created_at"]).dt.date <= end_date)
+        df_reviews_period = df_reviews.loc[mask_period].copy()
+    else:
+        # в file/year-range режиме используем весь файл
+        df_reviews_period = df_reviews.copy()
+    
     if df_reviews_period.empty:
-        LOG.warning("После фильтра по датам внутри файлов — пусто.")
+        LOG.warning("После отбора записей — пусто (ничего писать в историю).")
         return
+
 
     weeks = sorted(set(df_reviews_period["week_key"].tolist()))
     LOG.info(f"Недели к upsert: {', '.join(weeks)}")
