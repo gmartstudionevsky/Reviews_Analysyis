@@ -75,15 +75,18 @@ from typing import (
 import re
 import pandas as pd
 
-# Мы хотим заюзать AspectRule напрямую
-from lexicon_module import AspectRule  # не создаёт циклов, lexicon_module не импортирует reviews_core
-
-# --- period slicing helpers (shared with surveys) ---
+# Периодизация (общая с surveys)
 try:
     from agent.metrics_core import iso_week_monday, period_ranges_for_week
 except ModuleNotFoundError:
     from metrics_core import iso_week_monday, period_ranges_for_week  # type: ignore
 
+# Мы хотим заюзать AspectRule напрямую
+# --- AspectRule: поддерживаем и пакетный, и локальный импорт ---
+try:
+    from agent.lexicon_module import AspectRule
+except ModuleNotFoundError:
+    from lexicon_module import AspectRule  # type: ignore
 
 # -----------------------------------------------------------------------------
 # 1. Доп. типы / протоколы
