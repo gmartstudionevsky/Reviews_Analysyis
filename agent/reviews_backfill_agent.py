@@ -11,13 +11,9 @@ from datetime import date, datetime, timedelta
 
 import pandas as pd
 
-# --- наши модули ---
-try:
-    from agent import reviews_io
-    from agent import reviews_core
-except ModuleNotFoundError:
-    import reviews_io  # type: ignore
-    import reviews_core  # type: ignore
+# --- наши модули (пакетные импорты) ---
+from . import reviews_io, reviews_core
+from .metrics_core import iso_week_monday, period_ranges_for_week
 
 # --- Google API ---
 from google.oauth2 import service_account
@@ -309,10 +305,7 @@ def main() -> None:
     df_raw_map = pd.DataFrame(raw_has_response_pairs, columns=["review_id","has_response"]).drop_duplicates("review_id")
 
     # --- Анализ через Lexicon ---
-    try:
-        from agent.lexicon_module import Lexicon
-    except ModuleNotFoundError:
-        from lexicon_module import Lexicon  # type: ignore
+    from .lexicon_module import Lexicon
 
     lexicon = Lexicon()
     analyzed = reviews_core.analyze_reviews_bulk(all_inputs, lexicon)
