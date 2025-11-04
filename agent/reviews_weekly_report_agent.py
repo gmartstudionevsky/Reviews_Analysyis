@@ -621,9 +621,28 @@ def _maybe_send_email(subject: str, html: str, attachments: list[tuple[str, byte
     to   = os.getenv("MAIL_TO")
     from_ = os.getenv("MAIL_FROM") or user
 
+    if not host or not port:
+        # авто-настройка по домену почты
+        domain = (user or "").split("@")[-1].lower()
+        guess = {
+            "gmail.com": ("smtp.gmail.com", 587),
+            "yandex.ru": ("smtp.yandex.ru", 587),
+            "ya.ru": ("smtp.yandex.ru", 587),
+            "yandex.com": ("smtp.yandex.com", 587),
+            "outlook.com": ("smtp.office365.com", 587),
+            "office365.com": ("smtp.office365.com", 587),
+            "hotmail.com": ("smtp.office365.com", 587),
+            "live.com": ("smtp.office365.com", 587),
+            "mail.ru": ("smtp.mail.ru", 587),
+            "bk.ru": ("smtp.mail.ru", 587),
+            "inbox.ru": ("smtp.mail.ru", 587),
+            "list.ru": ("smtp.mail.ru", 587),
+        }
+        if domain in guess:
+            host, port = guess[domain]
+
     if not (host and port and user and pwd and to and from_):
-        print("[info] SMTP не настроен — письмо не отправляется. "
-              "Задайте SMTP_* и MAIL_* переменные, если нужно расслать отчёт.")
+        print("[info] SMTP не настроен — письмо не отправляется.")
         return
 
     msg = MIMEMultipart()
@@ -633,7 +652,6 @@ def _maybe_send_email(subject: str, html: str, attachments: list[tuple[str, byte
     msg["Subject"] = f"{prefix} {subject}".strip()
 
     msg.attach(MIMEText(html, "html", "utf-8"))
-
     for fname, data in attachments:
         part = MIMEApplication(data, Name=os.path.basename(fname))
         part["Content-Disposition"] = f'attachment; filename="{os.path.basename(fname)}"'
@@ -644,6 +662,7 @@ def _maybe_send_email(subject: str, html: str, attachments: list[tuple[str, byte
         s.login(user, pwd)
         s.send_message(msg)
         print(f"[ok] Письмо отправлено: {to}")
+
 
 
 # ------------------------------------------------------------
