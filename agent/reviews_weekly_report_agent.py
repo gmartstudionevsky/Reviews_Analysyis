@@ -182,27 +182,42 @@ def _load_from_local(path: str) -> pd.DataFrame:
 
 
 def _drive_service_from_env():
-    """Возвращает Drive service или None, если не сконфигурено."""
     if not _DRIVE_AVAILABLE:
         return None
-
     sa_path = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
     sa_content = os.getenv("GOOGLE_SERVICE_ACCOUNT_CONTENT") or os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON_CONTENT")
+    b64 = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON_B64")
+
     creds = None
+    if not sa_content and not sa_path and b64:
+        try:
+            sa_content = base64.b64decode(b64).decode("utf-8")
+        except Exception:
+            pass
 
     if sa_content:
         info = json.loads(sa_content)
-        creds = service_account.Credentials.from_service_account_info(info, scopes=["https://www.googleapis.com/auth/drive.readonly"])
+        creds = service_account.Credentials.from_service_account_info(
+            info, scopes=["https://www.googleapis.com/auth/drive.readonly"])
     elif sa_path and os.path.exists(sa_path):
-        creds = service_account.Credentials.from_service_account_file(sa_path, scopes=["https://www.googleapis.com/auth/drive.readonly"])
+        creds = service_account.Credentials.from_service_account_file(
+            sa_path, scopes=["https://www.googleapis.com/auth/drive.readonly"])
     else:
         return None
 
     return gbuild("drive", "v3", credentials=creds, cache_discovery=False)
 
 
-def _drive_download_file(file_id: str, service) -> bytes:
-    request = service.files().get_media(fileId=file_id)
+def _drive_download_generic(file_id: str, service) -> bytes:
+    meta = service.files().get(fileId=file_id, fields="id,name,mimeType").execute()
+    mime = meta.get("mimeType", "")
+    if mime == "application/vnd.google-apps.spreadsheet":
+        request = service.files().export(
+            fileId=file_id,
+            mimeType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+    else:
+        request = service.files().get_media(fileId=file_id)
     buf = io.BytesIO()
     downloader = MediaIoBaseDownload(buf, request)
     done = False
@@ -213,46 +228,42 @@ def _drive_download_file(file_id: str, service) -> bytes:
 
 def _drive_find_history_file(service, folder_id: str, explicit_file_id: str | None = None) -> bytes:
     if explicit_file_id:
-        return _drive_download_file(explicit_file_id, service)
+        return _drive_download_generic(explicit_file_id, service)
 
-    # ищем файл с "History" в имени и xls/xlsx
     q = f"'{folder_id}' in parents and trashed = false and (mimeType contains 'spreadsheet' or name contains '.xls')"
-    resp = service.files().list(q=q, pageSize=1000, fields="files(id,name,mimeType,modifiedTime)").execute()
+    resp = service.files().list(q=q, pageSize=1000,
+                                fields="files(id,name,mimeType,modifiedTime)").execute()
     files = resp.get("files", [])
-    # сортируем по приоритету: в name есть 'history' -> по времени
+    if not files:
+        raise FileNotFoundError("В папке на Drive не найден файл истории отзывов.")
+    # приоритет: имя с 'history/истори' и табличные расширения → самая свежая
     def score(f):
-        name = f["name"].lower()
-        has_hist = ("history" in name) or ("истори" in name)
-        ext_ok = any(name.endswith(ext) for ext in [".xlsx", ".xls"])
-        return (1 if has_hist else 0, 1 if ext_ok else 0, f["modifiedTime"])
-
-    files_sorted = sorted(files, key=score, reverse=True)
-    if not files_sorted:
-        raise FileNotFoundError("В папке на Drive не найден подходящий файл истории отзывов.")
-
-    return _drive_download_file(files_sorted[0]["id"], service)
+        n = f["name"].lower()
+        hist = ("history" in n) or ("истори" in n)
+        xls = n.endswith(".xlsx") or n.endswith(".xls") or "spreadsheet" in f.get("mimeType","")
+        return (1 if hist else 0, 1 if xls else 0, f["modifiedTime"])
+    file = sorted(files, key=score, reverse=True)[0]
+    return _drive_download_generic(file["id"], service)
 
 
 def load_reviews_history() -> pd.DataFrame:
-    """
-    Ищет историю отзывов:
-    - сначала REVIEWS_HISTORY_PATH (локально),
-    - затем (если задано) REVIEWS_HISTORY_FILE_ID / REVIEWS_DRIVE_FOLDER_ID в Google Drive.
-    """
+    # 1) локальный путь (опционально)
     path = os.getenv("REVIEWS_HISTORY_PATH")
     if path:
         return _load_from_local(path)
 
-    folder_id = os.getenv("REVIEWS_DRIVE_FOLDER_ID")
-    file_id = os.getenv("REVIEWS_HISTORY_FILE_ID")
+    # 2) Google Drive (секреты с твоими именами)
+    folder_id = os.getenv("REVIEWS_DRIVE_FOLDER_ID") or os.getenv("DRIVE_FOLDER_ID")
+    file_id = os.getenv("REVIEWS_HISTORY_FILE_ID") or os.getenv("SHEETS_HISTORY_ID")
 
-    service = _drive_service_from_env() if folder_id or file_id else None
+    service = _drive_service_from_env() if (folder_id or file_id) else None
     if service is not None:
         raw = _drive_find_history_file(service, folder_id or "root", explicit_file_id=file_id)
+        # читаем экспорт в pandas
         return pd.read_excel(io.BytesIO(raw))
 
-    raise RuntimeError("Не задан ни REVIEWS_HISTORY_PATH, ни креды Google Drive. "
-                       "Укажите путь к файлу или переменные для Drive.")
+    raise RuntimeError("Не задан ни локальный путь, ни переменные для Drive.")
+
 
 
 # ------------------------------------------------------------
@@ -592,8 +603,12 @@ small {{ color:#6b7280 }}
     return html
 
 
+def _out_dir() -> str:
+    return os.getenv("OUT_DIR") or "/mnt/data"
+
 def _save_csv(df: pd.DataFrame, fname: str) -> str:
-    path = os.path.join("/mnt/data", fname)
+    os.makedirs(_out_dir(), exist_ok=True)
+    path = os.path.join(_out_dir(), fname)
     df.to_csv(path, index=False)
     return path
 
@@ -672,7 +687,7 @@ def run(reference_date: dt.date | None = None) -> dict:
         paths["sample_csv"] = p4
 
     # 6) сохранить HTML (на всякий случай)
-    html_path = os.path.join("/mnt/data", f"reviews_weekly_report_{start:%Y%m%d}_{end:%Y%m%d}.html")
+    html_path = os.path.join(_out_dir(), f"reviews_weekly_report_{start:%Y%m%d}_{end:%Y%m%d}.html")
     with open(html_path, "w", encoding="utf-8") as f:
         f.write(html)
     paths["html"] = html_path
