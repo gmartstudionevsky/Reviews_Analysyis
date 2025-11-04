@@ -60,7 +60,8 @@ jobs:
           # SMTP_PORT:       587
           
         run: |
-          python -m agent.reviews_weekly_report_agent
+          mkdir -p "$OUT_DIR"
+          python agent/reviews_weekly_report_agent.py
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
