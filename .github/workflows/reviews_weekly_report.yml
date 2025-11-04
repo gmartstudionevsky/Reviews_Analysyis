@@ -1,0 +1,72 @@
+name: Reviews Weekly Report
+
+on:
+  # Пн 12:10 МСК (UTC+3 → 09:10 UTC), как в surveys
+  schedule:
+    - cron: "10 9 * * 1"
+  # Ручной запуск
+  workflow_dispatch:
+    inputs:
+      week_key:
+        description: "Неделя в формате YYYY-W## (опционально, для ad-hoc)"
+        required: false
+        type: string
+      dry_run:
+        description: "Не отправлять письмо, только расчёт (true/false)"
+        required: false
+        type: choice
+        options: ["false", "true"]
+        default: "false"
+
+concurrency:
+  group: reviews-weekly
+  cancel-in-progress: true
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          if [ -f agent/requirements.txt ]; then
+            pip install -r agent/requirements.txt
+          else
+            pip install pandas numpy google-api-python-client google-auth google-auth-httplib2 openpyxl xlrd matplotlib python-dateutil
+          fi
+
+      # Декодируем сервисный ключ из base64 → sa.json и пробрасываем путь
+      - name: Prepare service account (from b64)
+        env:
+          GOOGLE_SERVICE_ACCOUNT_JSON_B64: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON_B64 }}
+        run: |
+          set -euo pipefail
+          export GOOGLE_SERVICE_ACCOUNT_JSON="$GITHUB_WORKSPACE/sa.json"
+          echo "$GOOGLE_SERVICE_ACCOUNT_JSON_B64" | base64 -d > "$GOOGLE_SERVICE_ACCOUNT_JSON"
+          test -s "$GOOGLE_SERVICE_ACCOUNT_JSON"
+          head -c 1 "$GOOGLE_SERVICE_ACCOUNT_JSON" | grep -q '{'
+          echo "GOOGLE_SERVICE_ACCOUNT_JSON=$GOOGLE_SERVICE_ACCOUNT_JSON" >> "$GITHUB_ENV"
+
+      - name: Send weekly reviews report
+        env:
+          DRIVE_FOLDER_ID:   ${{ secrets.DRIVE_FOLDER_ID }}
+          SHEETS_HISTORY_ID: ${{ secrets.SHEETS_HISTORY_ID }}
+          RECIPIENTS:        ${{ secrets.RECIPIENTS }}
+          SMTP_USER:         ${{ secrets.SMTP_USER }}
+          SMTP_PASS:         ${{ secrets.SMTP_PASS }}
+          SMTP_FROM:         ${{ secrets.SMTP_FROM }}
+          # ad-hoc параметры (могут быть пустыми при cron-запуске)
+          WEEK_KEY:          ${{ github.event.inputs.week_key }}
+          DRY_RUN:           ${{ github.event.inputs.dry_run }}
+        run: |
+          python -m agent.reviews_weekly_report_agent
