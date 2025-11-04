@@ -25,19 +25,9 @@ import matplotlib.pyplot as plt
 
 import pandas as pd
 
-# --- наши модули (не трогаем surveys) ---
-try:
-    from agent import reviews_io
-    from agent import reviews_core
-except ModuleNotFoundError:
-    import reviews_io  # type: ignore
-    import reviews_core  # type: ignore
-
-# --- периодизация (общая с surveys) ---
-try:
-    from agent.metrics_core import iso_week_monday, period_ranges_for_week
-except ModuleNotFoundError:
-    from metrics_core import iso_week_monday, period_ranges_for_week  # type: ignore
+# --- наши модули (пакетные импорты) ---
+from . import reviews_io, reviews_core
+from .metrics_core import iso_week_monday, period_ranges_for_week
 
 # --- Google API ---
 from google.oauth2 import service_account
