@@ -33,7 +33,6 @@ except ModuleNotFoundError:
     import reviews_io  # type: ignore
     import reviews_core  # type: ignore
 
-from reviews_core import slice_periods, build_source_pivot, compute_aspect_impacts
 # --- периодизация (общая с surveys) ---
 try:
     from agent.metrics_core import iso_week_monday, period_ranges_for_week
