@@ -919,10 +919,7 @@ def main() -> None:
     # --- Анализ ---
     # В реальном запуске сюда передаётся ваш Lexicon() из lexicon_module.
     # Чтобы каркас не падал на пустом лексиконе, поддержим lazy import.
-    try:
-        from agent.lexicon_module import Lexicon
-    except ModuleNotFoundError:
-        from lexicon_module import Lexicon  # type: ignore
+    from .lexicon_module import Lexicon
 
     lexicon = Lexicon()  # ВАЖНО: предполагается, что в модуле реализованы compiled_topics/topic_schema и т.д.
     analyzed = reviews_core.analyze_reviews_bulk(inputs, lexicon)
