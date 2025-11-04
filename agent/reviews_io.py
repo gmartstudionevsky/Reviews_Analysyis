@@ -158,7 +158,7 @@ def normalize_source(raw: str) -> str:
     if not raw:
         return "other"
     s = str(raw).strip().lower()
-    s = s.replace(" ", " ")  # NBSP → space
+    s = s.replace("\u00A0", " ")
     s = re.sub(r"\s+", " ", s)
     return SOURCE_ALIASES.get(s, s if s in CANON_SOURCES else "other")
 
