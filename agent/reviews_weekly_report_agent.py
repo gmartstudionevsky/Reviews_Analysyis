@@ -16,6 +16,13 @@ from email.message import EmailMessage
 from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
+import numpy as np
+
+# Графики для вложений
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
 import pandas as pd
 
 # --- наши модули (не трогаем surveys) ---
@@ -514,6 +521,352 @@ def _section_B0_dynamics(week_df: pd.DataFrame, df_hist_all: pd.DataFrame, ancho
         return (f"<p>Средняя оценка текущей недели — {'' if a_cur!=a_cur else f'{a_cur:.2f}/10'}. "
                 f"Показатели позитивных/негативных отзывов близки к уровню последних четырёх недель.</p>")
 
+def _df_to_inputs_for_lexicon(df_subset: pd.DataFrame) -> List[reviews_core.ReviewRecordInput]:
+    """
+    Готовим минимальный набор ReviewRecordInput для повторного анализа лексиконом.
+    Берём review_id, source, created_at(date), rating10, lang, raw_text.
+    """
+    out: List[reviews_core.ReviewRecordInput] = []
+    if df_subset is None or len(df_subset) == 0:
+        return out
+    for _, r in df_subset.iterrows():
+        dt = pd.to_datetime(r.get("created_at")).date() if pd.notna(r.get("created_at")) else None
+        if dt is None:
+            continue
+        txt = str(r.get("raw_text") or "").strip()
+        if not txt:
+            continue
+        out.append(reviews_core.ReviewRecordInput(
+            review_id=str(r.get("review_id")),
+            source=str(r.get("source")),
+            created_at=dt,
+            rating10=(None if pd.isna(r.get("rating10")) else float(r.get("rating10"))),
+            lang=str(r.get("lang") or "en"),
+            text=txt,
+        ))
+    return out
+
+def _recompute_aspects_for_period(df_subset: pd.DataFrame, lexicon) -> pd.DataFrame:
+    """
+    Пересчитываем аспекты для произвольного среза df_hist_all.
+    Возвращает DataFrame в формате build_aspects_dataframe (минимальный набор колонок).
+    """
+    if df_subset is None or len(df_subset) == 0:
+        return pd.DataFrame(columns=[
+            "aspect_code","review_id","polarity_hint","topic_key","subtopic_key","display_short","long_hint","week_key"
+        ])
+    inputs = _df_to_inputs_for_lexicon(df_subset)
+    if not inputs:
+        return pd.DataFrame(columns=[
+            "aspect_code","review_id","polarity_hint","topic_key","subtopic_key","display_short","long_hint","week_key"
+        ])
+    analyzed = reviews_core.analyze_reviews_bulk(inputs, lexicon)
+    return reviews_core.build_aspects_dataframe(analyzed)
+
+def _section_B3_deviations(
+    week_df: pd.DataFrame,
+    df_hist_all: pd.DataFrame,
+    aspects_week: pd.DataFrame,
+    lexicon
+) -> str:
+    """
+    Возвращает HTML с пунктами «ниже исторического уровня» и «выше исторического уровня».
+    Для базы сравнения берём: среднее предыдущих 4 недель и историю (all).
+    """
+    if week_df is None or len(week_df) == 0 or aspects_week is None:
+        return "<p>Критических отклонений относительно обычного уровня не зафиксировано.</p>"
+
+    # Соберём предыдущие 4 недели
+    try:
+        wk = str(week_df.iloc[0]["week_key"])
+        yr, w = wk.split("-W"); yr = int(yr); w = int(w)
+        prev_keys = [f"{yr}-W{i:02d}" for i in range(w-4, w) if i > 0]
+    except Exception:
+        prev_keys = []
+
+    prev4_df = df_hist_all[df_hist_all["week_key"].isin(prev_keys)].copy() if prev_keys else pd.DataFrame()
+    aspects_prev4 = _recompute_aspects_for_period(prev4_df, lexicon) if not prev4_df.empty else pd.DataFrame()
+    aspects_all   = _recompute_aspects_for_period(df_hist_all, lexicon) if not df_hist_all.empty else pd.DataFrame()
+
+    def _baseline_stats(asp_df: pd.DataFrame) -> pd.DataFrame:
+        if asp_df is None or len(asp_df) == 0:
+            return pd.DataFrame(columns=[
+                "aspect_code","neg_share","intensity_neg","negative_impact_index"
+            ])
+        # пересчёт индексов на базовом срезе
+        joined = reviews_core.compute_aspect_impacts(
+            df_reviews_period=df_hist_all if asp_df is aspects_all else prev4_df,
+            df_aspects_period=asp_df
+        )
+        out = joined[["aspect_code","neg_hits","pos_hits","intensity_neg","negative_impact_index"]].copy()
+        hits = out["neg_hits"].fillna(0) + out["pos_hits"].fillna(0)
+        out["neg_share"] = np.where(hits > 0, out["neg_hits"] / hits, 0.0)
+        return out[["aspect_code","neg_share","intensity_neg","negative_impact_index"]]
+
+    base_prev4 = _baseline_stats(aspects_prev4)
+    base_all   = _baseline_stats(aspects_all)
+
+    # Сопоставим недельные метрики с базами
+    week = aspects_week.copy()
+    week_hits = week["neg_hits"].fillna(0) + week["pos_hits"].fillna(0)
+    week["neg_share"] = np.where(week_hits > 0, week["neg_hits"] / week_hits, 0.0)
+
+    def _compare(week: pd.DataFrame, base: pd.DataFrame, label: str) -> List[str]:
+        if base is None or len(base) == 0:
+            return []
+        merged = week.merge(base, on="aspect_code", how="left", suffixes=("_w", "_b"))
+        alerts: List[str] = []
+        for _, r in merged.iterrows():
+            # игнорируем редкие аспекты (менее 2 отзывов недели)
+            if int(r.get("reviews_with_aspect", 0)) < 2:
+                continue
+            # прирост негативной доли ≥ 5 п.п. или рост интенсивности ≥ 1.5× или рост индекса ≥ 0.15
+            neg_share_w = float(r.get("neg_share_w") or 0.0)
+            neg_share_b = float(r.get("neg_share_b") or 0.0)
+            intensity_w = float(r.get("intensity_neg_w") or 0.0)
+            intensity_b = float(r.get("intensity_neg_b") or 0.0001)
+            idx_w = float(r.get("negative_impact_index_w") or 0.0)
+            idx_b = float(r.get("negative_impact_index_b") or 0.0)
+
+            cond = (
+                (neg_share_w - neg_share_b) >= 0.05 or
+                (intensity_w >= 1.5 * intensity_b) or
+                (idx_w - idx_b) >= 0.15
+            )
+            if cond:
+                name = r.get("display_short") or r.get("aspect_code")
+                alerts.append(f"<li><b>{name}</b> — {label}: негативная доля {neg_share_w:.0%} (база {neg_share_b:.0%}); интенсивность {intensity_w:.2f} (база {intensity_b:.2f}).</li>")
+        return alerts
+
+    below_hist = _compare(week, base_all, "хуже исторического уровня")
+    above_hist = []
+    # для «выше уровня» возьмём положительный индекс (драйвер)
+    # если нет базы — сработает пустой список
+    if base_all is not None and len(base_all) > 0:
+        m = week.merge(base_all, on="aspect_code", how="left", suffixes=("_w", "_b"))
+        for _, r in m.iterrows():
+            if int(r.get("reviews_with_aspect", 0)) < 2:
+                continue
+            # рост положительного индекса ≥ 0.15
+            pos_w = float(r.get("positive_impact_index_w") or 0.0)
+            pos_b = float(r.get("positive_impact_index_b") or 0.0)
+            if (pos_w - pos_b) >= 0.15:
+                name = r.get("display_short") or r.get("aspect_code")
+                above_hist.append(f"<li><b>{name}</b> — выше исторического уровня: драйвит высокие оценки (индекс {pos_w:.2f}, база {pos_b:.2f}).</li>")
+
+    if not below_hist and not above_hist:
+        return "<p>Критических отклонений относительно обычного уровня не зафиксировано. Динамика близка к норме.</p>"
+
+    parts = []
+    if below_hist:
+        parts.append("<p><b>Ниже общего исторического уровня —</b></p><ul>" + "".join(below_hist) + "</ul>")
+    if above_hist:
+        parts.append("<p><b>Выше общего исторического уровня —</b></p><ul>" + "".join(above_hist) + "</ul>")
+    return "".join(parts)
+
+def _section_B4_experience_cards(week_df: pd.DataFrame, aspects_week: pd.DataFrame) -> str:
+    if week_df is None or len(week_df) == 0 or aspects_week is None or len(aspects_week) == 0:
+        return "<p>Повторяющихся сценариев на этой неделе не зафиксировано.</p>"
+
+    # соберём аспекты на уровне отзывов
+    m = aspects_week[["review_id","aspect_code","polarity_hint","display_short"]].copy()
+    m["display_short"] = m["display_short"].fillna(m["aspect_code"])
+    rev = week_df[["review_id","rating10","raw_text"]].copy()
+
+    j = m.merge(rev, on="review_id", how="left")
+
+    cards = []
+
+    # 1) Системные жалобы: низкие оценки + >=2 негативных аспектов
+    low = j[(j["rating10"].fillna(10) <= 6.0) & (j["polarity_hint"] == "negative")]
+    grp_low = low.groupby("review_id")
+    sys_examples = []
+    for rid, g in grp_low:
+        if g["aspect_code"].nunique() >= 2:
+            names = ", ".join(sorted(set(g["display_short"].tolist())))
+            sys_examples.append(f"«{names}» → низкая оценка")
+    sys_examples = list(dict.fromkeys(sys_examples))  # уникальные
+    if sys_examples:
+        cards.append("<p><b>Системная жалоба:</b> " + "; ".join(sys_examples[:3]) + ".</p>")
+
+    # 2) Конфликт «цена ↔ качество»
+    val_words = re.compile(r"(дорог|цена|стоимость|не стоит|value|worth|expens)", re.I)
+    val = j[j["raw_text"].astype(str).str.contains(val_words, na=False)]
+    if not val.empty:
+        cards.append("<p><b>Конфликт ожиданий / ценности:</b> встречаются формулировки про цену/ценность; это снижает готовность рекомендовать.</p>")
+
+    # 3) Драйвер лояльности: высокие оценки + позитивные аспекты
+    hi = j[(j["rating10"].fillna(0) >= 9.0) & (j["polarity_hint"] == "positive")]
+    grp_hi = hi.groupby("review_id")
+    loy_examples = []
+    for rid, g in grp_hi:
+        names = ", ".join(sorted(set(g["display_short"].tolist())))
+        if names:
+            loy_examples.append(f"«{names}» → оценки 9–10/10")
+    loy_examples = list(dict.fromkeys(loy_examples))
+    if loy_examples:
+        cards.append("<p><b>Драйвер лояльности:</b> " + "; ".join(loy_examples[:3]) + ".</p>")
+
+    if not cards:
+        return "<p>Повторяющихся сценариев на этой неделе не зафиксировано. Отзывы разнонаправленные.</p>"
+    return "".join(cards)
+
+def _section_B5_quotes(week_df: pd.DataFrame) -> str:
+    if week_df is None or len(week_df) == 0:
+        return "<p>Характерные цитаты за неделю не приводятся: мало данных.</p>"
+    quotes = []
+    pos = week_df[(week_df["rating10"].fillna(0) >= 9.0) & (week_df["raw_text"].astype(str).str.len() >= 20)]
+    neg = week_df[(week_df["rating10"].fillna(10) <= 6.0) & (week_df["raw_text"].astype(str).str.len() >= 20)]
+
+    def _pick(df, k):
+        out = []
+        for _, r in df.sort_values("rating10", ascending=False).head(k).iterrows():
+            t = str(r["raw_text"]).strip().replace("\n", " ")
+            t = t[:280] + ("…" if len(t) > 280 else "")
+            out.append(f"«{t}»")
+        return out
+
+    quotes.extend(_pick(pos, 2))
+    quotes.extend(_pick(neg, 2))
+
+    if not quotes:
+        return "<p>Характерные цитаты за неделю не приводятся: большинство отзывов короткие и без детализации.</p>"
+    return "<ul>" + "".join(f"<li>{q}</li>" for q in quotes) + "</ul>"
+
+def _slice_by_dates(df: pd.DataFrame, start: date, end: date) -> pd.DataFrame:
+    if df is None or len(df) == 0:
+        return df
+    m = (pd.to_datetime(df["created_at"]).dt.date >= start) & (pd.to_datetime(df["created_at"]).dt.date <= end)
+    return df.loc[m].copy()
+
+def _period_metrics(df: pd.DataFrame) -> Tuple[Optional[float], int, Optional[float], Optional[float]]:
+    if df is None or len(df) == 0:
+        return (None, 0, None, None)
+    avg = float(df["rating10"].mean()) if "rating10" in df.columns else None
+    pos = ((df["rating10"] >= 9.0) | (df["sentiment_overall"] == "positive")).mean()
+    neg = ((df["rating10"] <= 6.0) | (df["sentiment_overall"] == "negative")).mean()
+    return (avg, int(df["review_id"].nunique()), float(pos), float(neg))
+
+def _section_D_yoy(df_hist_all: pd.DataFrame, week_start: date, week_end: date, ranges_now: Dict[str, Dict[str, date]]) -> str:
+    if df_hist_all is None or len(df_hist_all) == 0:
+        return "<p>Для сравнения с прошлым годом недостаточно исторических данных на этот момент.</p>"
+
+    # прошлогодние диапазоны (сдвиг на 365 дней; достаточно для отчёта)
+    def shift(p):
+        return {"start": p["start"] - timedelta(days=365), "end": p["end"] - timedelta(days=365)}
+
+    rng_last_year = {k: shift(v) for k, v in ranges_now.items()}
+
+    # текущие метрики
+    now_week = _slice_by_dates(df_hist_all, ranges_now["week"]["start"], ranges_now["week"]["end"])
+    now_mtd  = _slice_by_dates(df_hist_all, ranges_now["mtd"]["start"],  ranges_now["mtd"]["end"])
+    now_qtd  = _slice_by_dates(df_hist_all, ranges_now["qtd"]["start"],  ranges_now["qtd"]["end"])
+    now_ytd  = _slice_by_dates(df_hist_all, ranges_now["ytd"]["start"],  ranges_now["ytd"]["end"])
+
+    # прошлогодние метрики
+    prev_week = _slice_by_dates(df_hist_all, rng_last_year["week"]["start"], rng_last_year["week"]["end"])
+    prev_mtd  = _slice_by_dates(df_hist_all, rng_last_year["mtd"]["start"],  rng_last_year["mtd"]["end"])
+    prev_qtd  = _slice_by_dates(df_hist_all, rng_last_year["qtd"]["start"],  rng_last_year["qtd"]["end"])
+    prev_ytd  = _slice_by_dates(df_hist_all, rng_last_year["ytd"]["start"],  rng_last_year["ytd"]["end"])
+
+    rows = []
+    def row(lbl, now_df, prev_df):
+        a1, c1, p1, n1 = _period_metrics(now_df)
+        a0, c0, p0, n0 = _period_metrics(prev_df)
+
+        def fmt_pair(a, b, kind: str):
+            if a is None or (prev_df is not None and len(prev_df) == 0) or b is None:
+                return "— / — / —"
+            if kind == "avg":
+                delta = a - b
+                return f"{a:.2f} / {b:.2f} / {delta:+.2f}"
+            if kind == "cnt":
+                delta = c1 - c0
+                return f"{c1} / {c0} / {delta:+d}"
+            if kind == "pct":
+                return f"{(a*100):.1f}% / {(b*100):.1f}% / {((a-b)*100):+.1f} п.п."
+            return ""
+
+        rows.append(
+            "<tr>"
+            f"<td>{lbl}</td>"
+            f"<td>{fmt_pair(a1, a0, 'avg')}</td>"
+            f"<td>{fmt_pair(c1, c0, 'cnt')}</td>"
+            f"<td>{fmt_pair(p1, p0, 'pct')}</td>"
+            f"<td>{fmt_pair(n1, n0, 'pct')}</td>"
+            "</tr>"
+        )
+
+    row("Неделя", now_week, prev_week)
+    row("Месяц-to-date", now_mtd, prev_mtd)
+    row("Квартал-to-date", now_qtd, prev_qtd)
+    row("Год-to-date", now_ytd, prev_ytd)
+
+    table = (
+        "<table border='1' cellspacing='0' cellpadding='6'>"
+        "<thead><tr><th></th><th>Средняя оценка</th><th>Кол-во отзывов</th><th>% позитивных</th><th>% негативных</th></tr></thead>"
+        "<tbody>" + "".join(rows) + "</tbody></table>"
+        "<p style='color:#666'>Сравнение построено по одинаковым календарным участкам прошлого года (накопленные данные на аналогичную дату).</p>"
+    )
+    return table
+
+def _png_plot_to_bytes() -> bytes:
+    buf = io.BytesIO()
+    plt.savefig(buf, format="png", bbox_inches="tight", dpi=144)
+    plt.close()
+    return buf.getvalue()
+
+def _make_plot_weekly_rating(df_hist_all: pd.DataFrame) -> Tuple[str, bytes]:
+    if df_hist_all is None or len(df_hist_all) == 0:
+        return ("weekly_rating.png", b"")
+    # последние 8 недель
+    tmp = df_hist_all.copy()
+    tmp["created_at"] = pd.to_datetime(tmp["created_at"])
+    agg = tmp.groupby("week_key", as_index=False)["rating10"].mean().tail(8)
+    plt.figure()
+    plt.plot(agg["week_key"], agg["rating10"], marker="o")
+    plt.title("Динамика средней оценки (последние 8 недель)")
+    plt.xlabel("Недели")
+    plt.ylabel("Средняя оценка (/10)")
+    plt.xticks(rotation=30)
+    return ("weekly_rating.png", _png_plot_to_bytes())
+
+def _make_plot_negative_factors(aspects_week: pd.DataFrame, aspects_prev4: pd.DataFrame) -> Tuple[str, bytes]:
+    # top-3 рисков по negative_impact_index на неделе; сравним с базой prev4
+    if aspects_week is None or len(aspects_week) == 0 or aspects_prev4 is None or len(aspects_prev4) == 0:
+        return ("negative_factors.png", b"")
+    base = aspects_prev4[["aspect_code","negative_impact_index"]].groupby("aspect_code", as_index=False).mean()
+    cur = aspects_week.sort_values("negative_impact_index", ascending=False).head(3).copy()
+    m = cur.merge(base, on="aspect_code", how="left", suffixes=("_week","_prev4")).fillna(0.0)
+    labels = [a or c for a, c in zip(m.get("display_short", m["aspect_code"]), m["aspect_code"])]
+    x = np.arange(len(m))
+    w = m["negative_impact_index_week"].to_numpy()
+    b = m["negative_impact_index_prev4"].to_numpy()
+    plt.figure()
+    width = 0.35
+    plt.bar(x - width/2, w, width, label="неделя")
+    plt.bar(x + width/2, b, width, label="среднее 4 недель")
+    plt.title("Негативные факторы: неделя vs предыдущие 4 недели")
+    plt.xlabel("Аспекты")
+    plt.ylabel("Негативный индекс (0..1)")
+    plt.xticks(x, labels, rotation=20)
+    plt.legend()
+    return ("negative_factors.png", _png_plot_to_bytes())
+
+def _make_plot_sources_week(src_week: pd.DataFrame) -> Tuple[str, bytes]:
+    if src_week is None or len(src_week) == 0:
+        return ("sources_week.png", b"")
+    lbls = [reviews_io.source_display_name(s) for s in src_week["source"].astype(str).tolist()]
+    vals = src_week["reviews"].astype(int).tolist()
+    x = np.arange(len(lbls))
+    plt.figure()
+    plt.bar(x, vals)
+    plt.title("Структура отзывов по источникам (неделя)")
+    plt.xlabel("Источник")
+    plt.ylabel("Кол-во отзывов")
+    plt.xticks(x, lbls, rotation=30)
+    return ("sources_week.png", _png_plot_to_bytes())
+
 # -----------------------------------------------------------------------------
 # MAIN
 # -----------------------------------------------------------------------------
@@ -669,6 +1022,23 @@ def main() -> None:
     a_block = _section_A_summary(week_df, mtd_df, qtd_df, ytd_df, all_df)
     b0_line = _section_B0_dynamics(week_df, df_hist_all, anchor_week_key)
     b1_html, b2_html = _section_B_drivers_and_risks(aspects_week)
+    # B3 — отклонения недели
+    b3_html = _section_B3_deviations(
+        week_df=week_df,
+        df_hist_all=df_hist_all,
+        aspects_week=aspects_week,
+        lexicon=lexicon
+    )
+
+    # B4 — карты опыта
+    b4_html = _section_B4_experience_cards(week_df=week_df, aspects_week=aspects_week)
+
+    # B5 — цитаты
+    b5_html = _section_B5_quotes(week_df=week_df)
+
+    # D — сравнение с прошлым годом
+    d_html = _section_D_yoy(df_hist_all, week_start, week_end, ranges)
+
 
     sources_html = _render_sources_block_html({
         "week": src_week, "mtd": src_mtd, "qtd": src_qtd, "ytd": src_ytd, "all": src_all
@@ -690,8 +1060,21 @@ def main() -> None:
       <h4>B2. Что тянет оценки вниз (зоны риска)</h4>
       {b2_html}
 
+      <h4>B3. Существенные отклонения этой недели</h4>
+      {b3_html}
+
+      <h4>B4. Связанные причины впечатления гостей (карты опыта)</h4>
+      {b4_html}
+
+      <h4>B5. Цитаты гостей</h4>
+      {b5_html}
+
       <h4>C1. Источники × Период</h4>
       {sources_html}
+      
+      <h4>D. Сравнение с прошлым годом</h4>
+      {d_html}
+
       <p style="color:#666;margin-top:8px">
         Примечание: для TL: Marketing, Trip.com, Яндекс, 2GIS, Google, TripAdvisor в колонке «Нативная» отображается 5-балльная шкала; все расчёты ведутся в 10-балльной.
       </p>
@@ -721,6 +1104,32 @@ dy></html>
     if dry_run:
         LOG.info("DRY_RUN=true — письмо не отправляем.")
         return
+
+    # Графики (PNG) — секция E
+    try:
+        # подготовим базу prev4 для графика негативных факторов
+        try:
+            wk = anchor_week_key
+            yr, w = wk.split("-W"); yr = int(yr); w = int(w)
+            prev_keys = [f"{yr}-W{i:02d}" for i in range(w-4, w) if i > 0]
+        except Exception:
+            prev_keys = []
+        prev4_df = df_hist_all[df_hist_all["week_key"].isin(prev_keys)].copy() if prev_keys else pd.DataFrame()
+        aspects_prev4 = _recompute_aspects_for_period(prev4_df, lexicon) if not prev4_df.empty else pd.DataFrame()
+
+        fn1, p1 = _make_plot_weekly_rating(df_hist_all)
+        if p1:
+            attachments.append((fn1, p1))
+
+        fn2, p2 = _make_plot_negative_factors(aspects_week, aspects_prev4)
+        if p2:
+            attachments.append((fn2, p2))
+
+        fn3, p3 = _make_plot_sources_week(src_week)
+        if p3:
+            attachments.append((fn3, p3))
+    except Exception as e:
+        LOG.warning(f"Не удалось подготовить графики: {e}")
 
     # SMTP-хост. По аналогии с анкетами предполагаем внешний хост (если другой — поправим в секрете/окружении)
     smtp_host = "smtp.yandex.com" if "yandex" in (smtp_user or "").lower() else "smtp.gmail.com"
