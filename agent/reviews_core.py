@@ -78,6 +78,12 @@ import pandas as pd
 # Мы хотим заюзать AspectRule напрямую
 from lexicon_module import AspectRule  # не создаёт циклов, lexicon_module не импортирует reviews_core
 
+# --- period slicing helpers (shared with surveys) ---
+try:
+    from agent.metrics_core import iso_week_monday, period_ranges_for_week
+except ModuleNotFoundError:
+    from metrics_core import iso_week_monday, period_ranges_for_week  # type: ignore
+
 
 # -----------------------------------------------------------------------------
 # 1. Доп. типы / протоколы
@@ -299,6 +305,74 @@ def _candidate_langs(lang: str) -> List[str]:
     if "en" not in cands:
         cands.append("en")
     return cands
+
+def _label_pos_neg_neu(sentiment_overall: str, rating10: Optional[float]) -> str:
+    """
+    Классификация отзыва недели:
+      - Позитив: (тональность overall == 'positive') ИЛИ (rating10 >= 9)
+      - Негатив: (тональность overall == 'negative') ИЛИ (rating10 <= 6)
+      - Иначе: neutral
+    """
+    is_pos = (sentiment_overall == "positive") or (rating10 is not None and rating10 >= 9.0)
+    is_neg = (sentiment_overall == "negative") or (rating10 is not None and rating10 <= 6.0)
+    if is_pos and not is_neg:
+        return "positive"
+    if is_neg and not is_pos:
+        return "negative"
+    return "neutral"
+
+def slice_periods(df_reviews: "pd.DataFrame", anchor_week_key: str) -> Dict[str, "pd.DataFrame"]:
+    """
+    Возвращает словарь { 'week','mtd','qtd','ytd','all' } → DataFrame.
+    Ожидается, что df_reviews содержит 'created_at' (date) и 'week_key'.
+    """
+    if df_reviews is None or len(df_reviews) == 0:
+        return {"week": df_reviews.copy(), "mtd": df_reviews.copy(),
+                "qtd": df_reviews.copy(), "ytd": df_reviews.copy(), "all": df_reviews.copy()}
+
+    wk_monday = iso_week_monday(anchor_week_key)
+    ranges = period_ranges_for_week(wk_monday)  # {'week':{'start','end'}, ...}
+
+    def _cut(df, start, end):
+        m = (df["created_at"] >= start) & (df["created_at"] <= end)
+        return df.loc[m].copy()
+
+    out = {
+        "week": _cut(df_reviews, ranges["week"]["start"], ranges["week"]["end"]),
+        "mtd":  _cut(df_reviews, ranges["mtd"]["start"],  ranges["mtd"]["end"]),
+        "qtd":  _cut(df_reviews, ranges["qtd"]["start"],  ranges["qtd"]["end"]),
+        "ytd":  _cut(df_reviews, ranges["ytd"]["start"],  ranges["ytd"]["end"]),
+        "all":  df_reviews.copy(),
+    }
+    return out
+
+def build_source_pivot(df_period: "pd.DataFrame") -> "pd.DataFrame":
+    """
+    Сводка по источникам за выбранный период.
+    На выходе: source, reviews, avg10, pos_pct, neg_pct, pos_cnt, neg_cnt.
+    (Визуальная нативная шкала /5 делается на уровне отчёта, не здесь.)
+    """
+    import pandas as pd  # локальный импорт, чтобы не ломать ранние импорты
+
+    if df_period is None or len(df_period) == 0:
+        return pd.DataFrame(columns=["source","reviews","avg10","pos_pct","neg_pct","pos_cnt","neg_cnt"])
+
+    df = df_period.copy()
+    df["__label__"] = df.apply(lambda r: _label_pos_neg_neu(r.get("sentiment_overall"), r.get("rating10")), axis=1)
+
+    grp = df.groupby("source", dropna=False)
+    agg = grp.agg(
+        reviews=("review_id", "nunique"),
+        avg10=("rating10", "mean"),
+        pos_cnt=("__label__", lambda s: (s == "positive").sum()),
+        neg_cnt=("__label__", lambda s: (s == "negative").sum()),
+    ).reset_index()
+
+    agg["pos_pct"] = (agg["pos_cnt"] / agg["reviews"]).fillna(0.0).round(4)
+    agg["neg_pct"] = (agg["neg_cnt"] / agg["reviews"]).fillna(0.0).round(4)
+    agg["avg10"] = agg["avg10"].round(2)
+
+    return agg[["source","reviews","avg10","pos_pct","neg_pct","pos_cnt","neg_cnt"]].sort_values("reviews", ascending=False).reset_index(drop=True)
 
 def _score_from_flags_and_rating(flags: Dict[str, bool], rating10: Optional[float]) -> float:
     """
@@ -668,6 +742,116 @@ def build_aspects_dataframe(
     df = pd.DataFrame(rows)
     return df
 
+def compute_aspect_impacts(
+    df_reviews_period: "pd.DataFrame",
+    df_aspects_period: "pd.DataFrame",
+) -> "pd.DataFrame":
+    """
+    Возвращает таблицу по аспектам с метриками частоты, интенсивности и связи с экстремальными оценками.
+    Формулы (см. ТЗ 0.4):
+      - freq = уникальные отзывы с аспектом / все отзывы периода
+      - intensity_pos: средняя "сила" для положительных аспектов (1.0 при rating10>=9, 0.6 при 7..8, иначе 0; если rating10 NaN, учитываем sentiment_overall)
+      - intensity_neg: аналогично для отрицательных аспектов (1.0 при rating10<=6, 0.6 при 7..8, иначе 0)
+      - share_hi = доля упоминаний аспекта в отзывах с rating10>=9
+      - share_lo = доля упоминаний аспекта в отзывах с rating10<=6
+      - positive_impact_index  = 0.50*freq + 0.30*intensity_pos + 0.20*share_hi
+      - negative_impact_index  = 0.50*freq + 0.30*intensity_neg + 0.20*share_lo
+    """
+    import numpy as np
+    import pandas as pd
+
+    # Пустые входы → пустая сводка
+    if df_reviews_period is None or len(df_reviews_period) == 0:
+        return pd.DataFrame(columns=[
+            "aspect_code","topic_key","subtopic_key","display_short","long_hint",
+            "reviews_with_aspect","freq","pos_hits","neg_hits",
+            "intensity_pos","intensity_neg","share_hi","share_lo",
+            "positive_impact_index","negative_impact_index",
+        ])
+    if df_aspects_period is None or len(df_aspects_period) == 0:
+        # аспектов нет — вернём пустую, чтобы отчёт корректно отработал "в пределах фона"
+        return pd.DataFrame(columns=[
+            "aspect_code","topic_key","subtopic_key","display_short","long_hint",
+            "reviews_with_aspect","freq","pos_hits","neg_hits",
+            "intensity_pos","intensity_neg","share_hi","share_lo",
+            "positive_impact_index","negative_impact_index",
+        ])
+
+    # Берём только нужные колонки
+    rev = df_reviews_period[["review_id","rating10","sentiment_overall"]].drop_duplicates("review_id").copy()
+    asp = df_aspects_period[[
+        "aspect_code","review_id","polarity_hint","topic_key","subtopic_key","display_short","long_hint"
+    ]].copy()
+
+    # Дедуп: один отзыв считается один раз на аспект
+    asp = asp.drop_duplicates(subset=["aspect_code","review_id"]).copy()
+
+    # Join для оценок/тональности отзыва
+    m = asp.merge(rev, on="review_id", how="left")
+
+    # Бинарные признаки
+    m["is_pos_hit"] = (m["polarity_hint"] == "positive")
+    m["is_neg_hit"] = (m["polarity_hint"] == "negative")
+
+    # Бины оценок
+    r = m["rating10"]
+    m["hi"]  = r.ge(9.0).fillna(False)
+    m["mid"] = r.between(7.0, 8.0, inclusive="both").fillna(False)
+    m["lo"]  = r.le(6.0).fillna(False)
+
+    # Весовые contribution для интенсивности
+    so = m["sentiment_overall"].fillna("neutral")
+    m["w_pos"] = np.where(m["is_pos_hit"] & m["hi"], 1.0,
+                   np.where(m["is_pos_hit"] & m["mid"], 0.6,
+                   np.where(m["is_pos_hit"] & (so == "positive"), 0.6, 0.0)))
+    m["w_neg"] = np.where(m["is_neg_hit"] & m["lo"], 1.0,
+                   np.where(m["is_neg_hit"] & m["mid"], 0.6,
+                   np.where(m["is_neg_hit"] & (so == "negative"), 0.6, 0.0)))
+
+    total_reviews = max(1, rev["review_id"].nunique())
+
+    def _agg(group: "pd.DataFrame") -> "pd.Series":
+        reviews_with_aspect = group["review_id"].nunique()
+        freq = reviews_with_aspect / total_reviews
+
+        pos_hits = int((group["is_pos_hit"]).sum())
+        neg_hits = int((group["is_neg_hit"]).sum())
+
+        # интенсивности считаем только по соответствующим знакам; если нет — 0
+        intensity_pos = float(group.loc[group["is_pos_hit"], "w_pos"].mean()) if pos_hits > 0 else 0.0
+        intensity_neg = float(group.loc[group["is_neg_hit"], "w_neg"].mean()) if neg_hits > 0 else 0.0
+
+        total_mentions = max(1, len(group))
+        share_hi = float(group["hi"].sum()) / total_mentions
+        share_lo = float(group["lo"].sum()) / total_mentions
+
+        positive_impact_index = 0.50*freq + 0.30*intensity_pos + 0.20*share_hi
+        negative_impact_index = 0.50*freq + 0.30*intensity_neg + 0.20*share_lo
+
+        return pd.Series({
+            "reviews_with_aspect": reviews_with_aspect,
+            "freq": round(freq, 4),
+            "pos_hits": pos_hits,
+            "neg_hits": neg_hits,
+            "intensity_pos": round(float(intensity_pos), 4),
+            "intensity_neg": round(float(intensity_neg), 4),
+            "share_hi": round(float(share_hi), 4),
+            "share_lo": round(float(share_lo), 4),
+            "positive_impact_index": round(float(positive_impact_index), 4),
+            "negative_impact_index": round(float(negative_impact_index), 4),
+        })
+
+    agg = (m.groupby(["aspect_code","topic_key","subtopic_key","display_short","long_hint"], dropna=False)
+             .apply(_agg)
+             .reset_index())
+
+    # Сортировка: сначала сильные риски, затем драйверы (для удобства отбора)
+    agg = agg.sort_values(
+        by=["negative_impact_index","positive_impact_index","reviews_with_aspect"],
+        ascending=[False, False, False]
+    ).reset_index(drop=True)
+
+    return agg
 
 # -----------------------------------------------------------------------------
 # 7. Публичный API этого модуля
@@ -684,4 +868,7 @@ __all__ = [
     # функции агрегации в датафреймы
     "build_reviews_dataframe",
     "build_aspects_dataframe",
+    "slice_periods",
+    "build_source_pivot",
+    "compute_aspect_impacts",
 ]
