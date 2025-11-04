@@ -1,9 +1,11 @@
 name: Reviews Weekly Report
 
 on:
-  workflow_dispatch:
+  # расписание: каждый понедельник 12:10 по МСК (UTC+3 → 09:10 UTC)
   schedule:
-    - cron: '15 6 * * MON'  # каждый понедельник 06:15 UTC (неделя полностью закрыта)
+    - cron: "10 9 * * 1"
+  # запуск вручную из Actions
+  workflow_dispatch: {}
 
 jobs:
   build-and-run:
