@@ -210,6 +210,7 @@ class ReviewAnalysisResult:
 
     sentiment_overall: str
     sentiment_detail: Dict[str, bool]
+    sentiment_score: float
 
     topic_hits: Set[Tuple[str, str]]
     aspects: List[AspectHit] = field(default_factory=list)
@@ -223,18 +224,31 @@ class ReviewAnalysisResult:
 
 _SENTENCE_SPLIT_RE = re.compile(r"[.!?…]+|\n+")
 
+_URL_RE = re.compile(r"https?://\S+|www\.\S+", re.IGNORECASE)
+_EMAIL_RE = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.IGNORECASE)
+
+def _normalize_text(text: str) -> str:
+    """
+    Мягкая нормализация: убираем URL/Email, схлопываем пробелы.
+    Ничего принципиального не выкидываем, чтобы не ломать матчи.
+    """
+    if not text:
+        return ""
+    s = _URL_RE.sub(" ", text)
+    s = _EMAIL_RE.sub(" ", s)
+    s = re.sub(r"\s+", " ", s, flags=re.UNICODE).strip()
+    return s
 
 def _split_into_sentences(text: str) -> List[str]:
     """
     Очень простой сплиттер на "предложения" / смысловые фрагменты.
-    Нам не нужна идеальная лингвистика, нам важно локализовать паттерны.
+    Нормализуем мягко и режем по знакам конца фразы / переводу строки.
     """
     if not text:
         return []
+    text = _normalize_text(text)
     parts = _SENTENCE_SPLIT_RE.split(text)
-    # подчистим пустые
     return [p.strip() for p in parts if p and p.strip()]
-
 
 def _safe_to_date(d: Any) -> date:
     """
@@ -270,6 +284,41 @@ def _match_any(patterns: List[re.Pattern], s: str) -> bool:
             return True
     return False
 
+def _candidate_langs(lang: str) -> List[str]:
+    """
+    "ru-RU" -> ["ru-ru", "ru", "en"]; пустой -> ["en"].
+    """
+    lang = (lang or "").strip().lower()
+    cands: List[str] = []
+    if lang:
+        cands.append(lang)
+        if "-" in lang:
+            short = lang.split("-")[0]
+            if short not in cands:
+                cands.append(short)
+    if "en" not in cands:
+        cands.append("en")
+    return cands
+
+def _score_from_flags_and_rating(flags: Dict[str, bool], rating10: Optional[float]) -> float:
+    """
+    Возвращает sentiment_score в диапазоне [-1.0 .. 1.0].
+    Комбинация: текст (60%) + оценка гостя (40%, если есть).
+    Текстовая сила:
+      pos_strong=+1.0, pos_soft=+0.6, neg_soft=-0.6, neg_strong=-1.0; суммируем и клипуем.
+    Нормализация оценки 1..10 -> [-1..1]: (x - 5.5)/4.5.
+    """
+    pos = (1.0 if flags.get("positive_strong") else 0.0) + (0.6 if flags.get("positive_soft") else 0.0)
+    neg = (1.0 if flags.get("negative_strong") else 0.0) + (0.6 if flags.get("negative_soft") else 0.0)
+    text_score = pos - neg
+    text_score = max(-1.0, min(1.0, text_score))
+
+    if rating10 is None:
+        return float(text_score)
+
+    rating_norm = (float(rating10) - 5.5) / 4.5
+    rating_norm = max(-1.0, min(1.0, rating_norm))
+    return float(round(0.6 * text_score + 0.4 * rating_norm, 4))
 
 # -----------------------------------------------------------------------------
 # 3. Поиск тональности на уровне всего отзыва
@@ -283,25 +332,11 @@ def detect_sentiment_for_review(
     """
     Возвращает:
       (sentiment_overall, sentiment_detail_flags)
-
-    sentiment_detail_flags:
-        {
-            "positive_strong": bool,
-            "positive_soft": bool,
-            "negative_soft": bool,
-            "negative_strong": bool,
-            "neutral": bool
-        }
-
-    sentiment_overall:
-        - 'negative' если есть жёсткий негатив,
-        - 'positive' если есть позитив без негатива,
-        - 'mixed'   если есть и позитив, и негатив,
-        - иначе 'neutral'.
-
-    Логика может эволюционировать, но это минимально рабочая версия.
+    Логика:
+      - ищем ключевые корзины тональностей по списку кандидатов языков,
+      - учитываем мягкую нормализацию текста,
+      - итог: 'negative' / 'positive' / 'mixed' / 'neutral'.
     """
-
     buckets = [
         "positive_strong",
         "positive_soft",
@@ -309,22 +344,19 @@ def detect_sentiment_for_review(
         "negative_strong",
         "neutral",
     ]
-
     flags: Dict[str, bool] = {b: False for b in buckets}
-
-    # если язык не поддержан вообще, всё False -> упадём в neutral
     if not review_text:
         return "neutral", flags
 
-    text = review_text
-
+    text = _normalize_text(review_text)
     for b in buckets:
         lang_map = lexicon.compiled_sentiment.get(b, {})
-        pats = lang_map.get(lang, [])
+        pats: List[re.Pattern] = []
+        for cand in _candidate_langs(lang):
+            pats.extend(lang_map.get(cand, []))
         if pats and _match_any(pats, text):
             flags[b] = True
 
-    # теперь решим общий лейбл
     any_pos = flags["positive_strong"] or flags["positive_soft"]
     any_neg = flags["negative_strong"] or flags["negative_soft"]
 
@@ -335,10 +367,10 @@ def detect_sentiment_for_review(
     elif any_pos and any_neg:
         overall = "mixed"
     else:
-        # ни позитива, ни негатива -> либо neutral, либо "neutral" (сигналы)
         overall = "neutral"
 
     return overall, flags
+
 
 
 # -----------------------------------------------------------------------------
@@ -352,25 +384,23 @@ def _topics_in_sentence(
 ) -> List[Tuple[str, str]]:
     """
     Вернёт список (topic_key, subtopic_key), которые встречаются в тексте sent.
+    Учитываем кандидатов языка: lang, short-lang, en.
     """
     hits: List[Tuple[str, str]] = []
+    if not sent:
+        return hits
 
-    # бежим по всем темам
     for topic_key, topic_data in lexicon.topic_schema.items():
         subtopics = topic_data.get("subtopics", {})
-        for subtopic_key, subtopic_data in subtopics.items():
-            compiled_per_lang = (
-                lexicon.compiled_topics
-                .get(topic_key, {})
-                .get(subtopic_key, {})
-                .get(lang, [])
-            )
-            if not compiled_per_lang:
-                continue
-            if _match_any(compiled_per_lang, sent):
+        for subtopic_key, _sub_def in subtopics.items():
+            pats: List[re.Pattern] = []
+            compiled_map = lexicon.compiled_topics.get(topic_key, {}).get(subtopic_key, {})
+            for cand in _candidate_langs(lang):
+                pats.extend(compiled_map.get(cand, []))
+            if pats and _match_any(pats, sent):
                 hits.append((topic_key, subtopic_key))
-
     return hits
+
 
 
 def _aspects_in_sentence(
@@ -381,41 +411,29 @@ def _aspects_in_sentence(
     base_review_meta: Dict[str, Any],
 ) -> List[AspectHit]:
     """
-    sentence_topics:
-        список (topic_key, subtopic_key), найденных в ЭТОМ ЖЕ предложении.
-
-    Возвращаем список AspectHit.
-    Мы считаем аспект валидным только если он "привязан" хотя бы к одной
-    из найденных подтем (topic_key, subtopic_key) через lexicon.aspect_to_subtopics.
+    Валидируем аспект только если он "подвязан" к найденным в предложении подтемам.
     """
-
-    if not sentence_topics:
+    if not sentence_topics or not sent:
         return []
 
     sentence_topic_set = set(sentence_topics)
     out: List[AspectHit] = []
 
     for aspect_code, rule in lexicon.aspect_rules.items():
-        compiled_lang_list = lexicon.compiled_aspects.get(aspect_code, {}).get(lang, [])
-        if not compiled_lang_list:
+        pats: List[re.Pattern] = []
+        compiled_lang_map = lexicon.compiled_aspects.get(aspect_code, {})
+        for cand in _candidate_langs(lang):
+            pats.extend(compiled_lang_map.get(cand, []))
+        if not pats or not _match_any(pats, sent):
             continue
 
-        if not _match_any(compiled_lang_list, sent):
-            continue
-
-        # есть лексическое совпадение по аспекту. Совместим ли он с подтемами,
-        # которые мы нашли в этом предложении?
         allowed_pairs = set(lexicon.aspect_to_subtopics.get(aspect_code, []))
         common_pairs = sentence_topic_set.intersection(allowed_pairs)
         if not common_pairs:
-            # аспект не "привязан" ни к одной подтеме, найденной в этом предложении,
-            # значит, мы не считаем его валидным.
             continue
 
-        # Если несколько пар совпали, задокументируем первую.
         topic_key, subtopic_key = next(iter(common_pairs))
-
-        hit = AspectHit(
+        out.append(AspectHit(
             review_id=base_review_meta["review_id"],
             aspect_code=aspect_code,
             topic_key=topic_key,
@@ -429,8 +447,7 @@ def _aspects_in_sentence(
             rating10=base_review_meta["rating10"],
             sentiment_overall=base_review_meta["sentiment_overall"],
             lang=base_review_meta["lang"],
-        )
-        out.append(hit)
+        ))
 
     return out
 
@@ -461,6 +478,9 @@ def analyze_single_review(
         lang=raw.lang,
         lexicon=lexicon,
     )
+    # числовой скоринг тональности
+    sentiment_score = _score_from_flags_and_rating(sentiment_detail, raw.rating10)
+
 
     # метаданные, которые нужны аспектам:
     base_meta = {
@@ -504,6 +524,7 @@ def analyze_single_review(
         lang=raw.lang,
         sentiment_overall=sentiment_overall,
         sentiment_detail=sentiment_detail,
+        sentiment_score=sentiment_score,
         topic_hits=all_topic_hits,
         aspects=all_aspect_hits,
         raw_text=raw.text,
@@ -576,12 +597,13 @@ def build_reviews_dataframe(
             "topics": topics_list,
             "aspects": aspects_list,
             "raw_text": r.raw_text,
+            "sentiment_score": r.sentiment_score,
         })
 
     if not rows:
         return pd.DataFrame(columns=[
             "review_id","source","created_at","week_key","rating10",
-            "sentiment_overall","lang","topics","aspects","raw_text",
+            "sentiment_overall","sentiment_score","lang","topics","aspects","raw_text",
         ])
 
     df = pd.DataFrame(rows)
