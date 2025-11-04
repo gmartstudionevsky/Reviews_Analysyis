@@ -22,43 +22,137 @@ except ModuleNotFoundError:
 # =========================================
 
 # Алиасы → каноническое имя источника
+# Алиасы → внутренний канон-код источника (латиницей), display-имя зададим ниже отдельно.
 SOURCE_ALIASES: Dict[str, str] = {
-    # Google
-    "google": "google",
-    "google maps": "google",
-    "gmaps": "google",
-
-    # Booking (и близкие)
-    "booking": "booking",
-    "booking.com": "booking",
-
-    # Яндекс
-    "yandex": "yandex",
-    "yandex travel": "yandex",
-    "яндекс": "yandex",
-    "яндекс путешествия": "yandex",
-
-    # 2GIS
-    "2gis": "2gis",
-
-    # TripAdvisor
-    "tripadvisor": "tripadvisor",
+    # TL: Marketing
+    "tl: marketing": "tlmarketing",
+    "tl marketing": "tlmarketing",
+    "tl": "tlmarketing",
 
     # Trip.com
     "trip.com": "tripcom",
     "tripcom": "tripcom",
 
-    # Соцсети и прочее
-    "instagram": "instagram",
-    "vk": "vk",
-    "facebook": "facebook",
-    "fb": "facebook",
+    # Яндекс (объединяем 'Яндекс' и 'Яндекс Путешествия' в один канон)
+    "yandex": "yandex",
+    "yandex travel": "yandex",
+    "яндекс": "yandex",
+    "яндекс путешествия": "yandex",
+
+    # Ostrovok.ru (Emerging Travel Group)
+    "ostrovok": "ostrovok",
+    "ostrovok.ru": "ostrovok",
+
+    # 2GIS
+    "2gis": "2gis",
+
+    # Sutochno → «Суточно.ру»
+    "sutochno": "sutochno",
+    "sutochno.ru": "sutochno",
+    "суточно": "sutochno",
+    "суточно.ру": "sutochno",
+
+    # Google
+    "google": "google",
+    "google maps": "google",
+    "gmaps": "google",
+
+    # TripAdvisor
+    "tripadvisor": "tripadvisor",
+
+    # OneTwoTrip
+    "onetwotrip": "onetwotrip",
+    "one two trip": "onetwotrip",
+
+    # 101Hotels.com
+    "101hotels": "101hotels",
+    "101hotels.com": "101hotels",
+
+    # Tvil.ru
+    "tvil": "tvil",
+    "tvil.ru": "tvil",
+
+    # TopHotels
+    "tophotels": "tophotels",
+
+    # Booking.com
+    "booking": "booking",
+    "booking.com": "booking",
 }
 
-CANON_SOURCES: set = set(SOURCE_ALIASES.values()) | {
-    "google", "booking", "yandex", "2gis", "tripadvisor", "tripcom",
-    "instagram", "vk", "facebook", "other"
+# Полный список допустимых канон-кодов + 'other'
+CANON_SOURCES: set = {
+    "tlmarketing",
+    "tripcom",
+    "yandex",
+    "ostrovok",
+    "2gis",
+    "sutochno",
+    "google",
+    "tripadvisor",
+    "onetwotrip",
+    "101hotels",
+    "tvil",
+    "tophotels",
+    "booking",
+    "other",
 }
+
+# Отображаемое имя источника для отчётов/таблиц
+SOURCE_DISPLAY_NAME: Dict[str, str] = {
+    "tlmarketing": "TL: Marketing",
+    "tripcom": "Trip.com",
+    "yandex": "Яндекс",
+    "ostrovok": "Ostrovok.ru",
+    "2gis": "2GIS",
+    "sutochno": "Суточно.ру",
+    "google": "Google",
+    "tripadvisor": "TripAdvisor",
+    "onetwotrip": "OneTwoTrip",
+    "101hotels": "101Hotels.com",
+    "tvil": "Tvil.ru",
+    "tophotels": "TopHotels",
+    "booking": "Booking.com",
+    "other": "Other",
+}
+
+def source_display_name(source_code: str) -> str:
+    return SOURCE_DISPLAY_NAME.get(source_code, source_code)
+
+# Источники, где нативная внешняя шкала — 1..5 (для блока C «Источник×Период»)
+FIVE_STAR_SOURCES: set = {
+    "tlmarketing",
+    "tripcom",
+    "yandex",
+    "2gis",
+    "google",
+    "tripadvisor",
+}
+
+def source_native_scale(source_code: str) -> str:
+    """
+    'five' → нативная 1..5; 'ten' → нативная 1..10 (или нефиксированная, показываем 10-балльную норму).
+    Используем позже при формировании таблиц по источникам.
+    """
+    return "five" if source_code in FIVE_STAR_SOURCES else "ten"
+
+def to_native_for_sources_block(rating10: Optional[float], source_code: str) -> Optional[float]:
+    """
+    Возвращает значение для визуального вывода в таблице C1 «Источник×Период».
+    - Для источников с нативной 5-балльной шкалой (см. FIVE_STAR_SOURCES)
+      конвертируем 10→5 делением на 2.
+    - Для остальных источников оставляем 10-балльное значение как есть.
+    В остальных расчётах (агрегации, метрики) продолжаем использовать 10-балльную шкалу.
+    """
+    if rating10 is None:
+        return None
+    try:
+        r = float(rating10)
+    except Exception:
+        return None
+    if not (1.0 <= r <= 10.0):
+        return None
+    return round(r / 2.0, 2) if source_code in FIVE_STAR_SOURCES else round(r, 2)
 
 def normalize_source(raw: str) -> str:
     if not raw:
@@ -120,11 +214,9 @@ def _parse_date_any(x) -> date:
 
 def normalize_rating10(source: str, rating_value) -> Optional[float]:
     """
-    Унификация в шкалу 1..10:
-    - если пусто → None
-    - если число ≤5 → умножаем на 2 (нативная «звёздная» шкала)
-    - если число ≤10 → оставляем
-    - иначе → None (странное значение)
+    В сырых данных все рейтинги уже в 10-балльной шкале.
+    Задача: принять число в диапазоне 1..10 и вернуть float.
+    Любые значения вне диапазона или нечисловые → None.
     """
     if rating_value is None:
         return None
@@ -132,14 +224,9 @@ def normalize_rating10(source: str, rating_value) -> Optional[float]:
         x = float(rating_value)
     except Exception:
         return None
-    if x <= 0:
+    if not (1.0 <= x <= 10.0):
         return None
-    if x <= 5:
-        return round(x * 2.0, 2)
-    if x <= 10:
-        return round(x, 2)
-    return None
-
+    return round(x, 2)
 
 def _text_norm_for_key(text: str) -> str:
     t = (text or "").strip().lower()
