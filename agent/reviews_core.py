@@ -1,65 +1,5 @@
 from __future__ import annotations
 
-"""
-reviews_core.py
-
-Задача модуля:
-1. Принять сырые отзывы из внешних источников.
-2. Прогнать через лексический модуль (lexicon_module) для:
-   - общей тональности отзыва,
-   - тем / подтем (topic -> subtopic),
-   - аспектов (aspect_code + человекочитаемые подписи).
-3. Вернуть:
-   a) нормализованный список разобранных отзывов (для метрик и хронологии),
-   b) плоский список "хитов аспектов" (для топ-проблем / топ-драйверов).
-
-Важно:
-- Здесь мы НЕ делаем ML, только regex-правила.
-- Аспект считается валидным ТОЛЬКО если:
-    (1) аспект сработал в предложении,
-    (2) в этом же предложении есть хотя бы одна подходящая (topic, subtopic),
-    (3) этот (topic, subtopic) указан в aspect_to_subtopics для данного аспекта.
-- Тональность агрегируется на уровне всего отзыва.
-
-Ожидания по lexicon_module:
-- Есть dataclass AspectRule (с display_short и long_hint).
-- Есть класс LexiconModule (или совместимый объект), у которого:
-    compiled_sentiment: Dict[str, Dict[str, List[Pattern]]]
-        # ключи sentiment buckets:
-        #   'positive_strong', 'positive_soft',
-        #   'negative_soft', 'negative_strong',
-        #   'neutral'
-        # внутри каждого: lang -> [compiled_regex,...]
-
-    topic_schema: Dict[str, Dict[str, Any]]
-        # topic_schema[topic_key]["subtopics"][subtopic_key] = {
-        #     "display": str,
-        #     "patterns": {lang: [raw_regex,...]},  # исходно
-        #     ... }
-        # нам важны ключи тем/подтем, чтобы репортить
-
-    compiled_topics: Dict[str, Dict[str, Dict[str, List[Pattern]]]]
-        # compiled_topics[topic_key][subtopic_key][lang] -> [Pattern,...]
-
-    aspect_rules: Dict[str, AspectRule]
-        # AspectRule включает:
-        #   aspect_code: str
-        #   polarity_hint: str ("positive"/"negative"/"neutral")
-        #   patterns_by_lang: Dict[str, List[str]]   # сырой
-        #   display_short: str
-        #   long_hint: str
-
-    compiled_aspects: Dict[str, Dict[str, List[Pattern]]]
-        # compiled_aspects[aspect_code][lang] -> [Pattern,...]
-
-    aspect_to_subtopics: Dict[str, List[Tuple[str, str]]]
-        # пример:
-        #   "spir_friendly": [("staff_spir", "staff_attitude"), ...]
-
-Всё это уже есть (или у тебя почти есть) в lexicon_module после шагов 1-3.
-Мы просто используем.
-"""
-
 from dataclasses import dataclass, field
 from datetime import datetime, date
 from typing import (
@@ -75,18 +15,10 @@ from typing import (
 import re
 import pandas as pd
 
-# Периодизация (общая с surveys)
-try:
-    from agent.metrics_core import iso_week_monday, period_ranges_for_week
-except ModuleNotFoundError:
-    from metrics_core import iso_week_monday, period_ranges_for_week  # type: ignore
+# --- пакетные импорты внутри agent ---
+from .metrics_core import iso_week_monday, period_ranges_for_week
+from .lexicon_module import AspectRule
 
-# Мы хотим заюзать AspectRule напрямую
-# --- AspectRule: поддерживаем и пакетный, и локальный импорт ---
-try:
-    from agent.lexicon_module import AspectRule
-except ModuleNotFoundError:
-    from lexicon_module import AspectRule  # type: ignore
 
 # -----------------------------------------------------------------------------
 # 1. Доп. типы / протоколы
