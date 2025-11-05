@@ -346,21 +346,17 @@ def main() -> None:
     analyzed = reviews_core.analyze_reviews_bulk(all_inputs, lexicon)
 
     df_reviews = reviews_core.build_reviews_dataframe(analyzed)
-    # df_aspects = reviews_core.build_aspects_dataframe(analyzed)  # для истории не требуется
-
-    # --- Идемпотентная запись по неделям ---
-    if range_mode:
-        # в режиме date-range ограничиваем по датам
-        mask_period = (pd.to_datetime(df_reviews["created_at"]).dt.date >= start_date) & \
-                      (pd.to_datetime(df_reviews["created_at"]).dt.date <= end_date)
-        df_reviews_period = df_reviews.loc[mask_period].copy()
-    else:
-        # в file/year-range режиме используем весь файл
-        df_reviews_period = df_reviews.copy()
     
+    # --- Идемпотентная запись по неделям (file/year-range-режим: берём весь файл) ---
+    df_reviews_period = df_reviews.copy()
     if df_reviews_period.empty:
         LOG.warning("После отбора записей — пусто (ничего писать в историю).")
         return
+    
+    # (не обязательно, но полезно для дебага)
+    LOG.info(f"Готовим к записи строк: {len(df_reviews_period)}; "
+             f"диапазон дат: {df_reviews_period['created_at'].min()} — {df_reviews_period['created_at'].max()}")
+
 
 
     weeks = sorted(set(df_reviews_period["week_key"].tolist()))
