@@ -271,7 +271,18 @@ def read_reviews_xls(xls_bytes: bytes) -> pd.DataFrame:
             df[need] = None
 
     # типы
-    df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.date
+# --- Дата: поддерживаем datetime, 'DD.MM.YYYY', 'YYYY-MM-DD' ---
+    # если уже datetime — просто .dt.date; иначе парсим со строгим dayfirst=True
+    if pd.api.types.is_datetime64_any_dtype(df["date"]) or pd.api.types.is_datetime64tz_dtype(df["date"]):
+        df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.date
+    else:
+        df["date"] = pd.to_datetime(
+            df["date"].astype(str).str.strip(),
+            errors="coerce",
+            dayfirst=True,               # КРИТИЧНО: российские выгрузки в формате ДД.ММ.ГГГГ
+            infer_datetime_format=True,
+        ).dt.date
+
     if "rating10" in df.columns:
         df["rating10"] = pd.to_numeric(df["rating10"], errors="coerce")
     else:
