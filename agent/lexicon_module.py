@@ -15815,10 +15815,6 @@ class Lexicon:
         self._compiled_sentiment_lexicon: Dict[str, Dict[str, List[re.Pattern]]] = (
             self._compile_sentiments(self._sentiment_lexicon_raw)
         )
-        # Публичное поле, которое ожидает reviews_core.detect_sentiment_for_review
-        self.compiled_sentiment: Dict[str, Dict[str, List[re.Pattern]]] = (
-            self._compiled_sentiment_lexicon
-        )
 
         # -------- аспекты --------
         self.aspect_rules: Dict[str, AspectRule] = aspect_rules or ASPECT_RULES
@@ -15828,17 +15824,10 @@ class Lexicon:
         self._compiled_aspect_rules: Dict[str, Dict[str, List[re.Pattern]]] = (
             self._compile_aspects(self.aspect_rules)
         )
-        # Публичное поле для совместимости (если где-то используют lexicon.compiled_aspects)
-        self.compiled_aspects: Dict[str, Dict[str, List[re.Pattern]]] = (
-            self._compiled_aspect_rules
-        )
 
         # -------- топики / подтемы --------
         self._topic_schema: Dict[str, Dict[str, Any]] = topic_schema or TOPIC_SCHEMA
         self._compiled_topics: Dict[str, Any] = self._compile_topics(self._topic_schema)
-
-
-
 
     # ------------------------------------------------------------------
     # Компиляция тональностей
