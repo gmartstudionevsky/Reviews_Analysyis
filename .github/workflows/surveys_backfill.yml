@@ -4,8 +4,8 @@ on:
   workflow_dispatch: {}
 
 concurrency:
-  group: surveys-backfill
-  cancel-in-progress: true
+  group: surveys-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   run:
