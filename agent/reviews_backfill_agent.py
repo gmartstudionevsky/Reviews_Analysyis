@@ -306,6 +306,22 @@ def main() -> None:
     
     LOG.info(f"Файлов к обработке: {len(selected)}")
 
+    inputs = reviews_io.df_to_inputs(df)  # если ты раньше передавал df сразу в ядро — теперь явно сделай inputs
+    LOG.info(f"Собрано inputs: {len(inputs)}")
+    
+    if len(inputs) == 0:
+        # чтобы понять, где отсекается — посчитаем, сколько было скачано и сколько с валидной датой
+        LOG.warning("Inputs пусты. Вероятно, проблема с парсингом даты/текста. "
+                    "Проверь лог [reviews_io] отброшено строк без даты ...")
+        return
+
+analyzed = reviews_core.analyze_reviews_bulk(inputs)
+LOG.info(f"Анализировано записей: {len(analyzed)}")
+if len(analyzed) == 0:
+    LOG.warning("После анализа записей нет. Проверь lexicon/topic schema или фильтры в analyze.")
+    return
+
+
     # --- Чтение/парсинг всех файлов периода ---
     all_inputs: List[reviews_core.ReviewRecordInput] = []
     raw_has_response_pairs: List[Tuple[str, Any]] = []
