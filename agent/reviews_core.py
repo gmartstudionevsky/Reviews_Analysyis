@@ -813,10 +813,16 @@ def compute_aspect_impacts(
             "positive_impact_index": round(float(positive_impact_index), 4),
             "negative_impact_index": round(float(negative_impact_index), 4),
         })
+        
+    group_cols = ["aspect_code", "topic_key", "subtopic_key", "display_short", "long_hint"]
+    value_cols = ["review_id", "is_pos_hit", "is_neg_hit", "w_pos", "w_neg", "hi", "lo"]
 
-    agg = (m.groupby(["aspect_code","topic_key","subtopic_key","display_short","long_hint"], dropna=False)
-             .apply(_agg)
-             .reset_index())
+    agg = (
+        m.groupby(group_cols, dropna=False)[value_cols]
+        .apply(_agg)
+        .reset_index()
+    )
+
 
     # Сортировка: сначала сильные риски, затем драйверы (для удобства отбора)
     agg = agg.sort_values(
