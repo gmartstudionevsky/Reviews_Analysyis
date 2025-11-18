@@ -1720,7 +1720,7 @@ def main():
     Prev = surveys_aggregate_period(hist, prev_start, prev_end)
     L4   = surveys_aggregate_period(hist, l4_start, l4_end)
 
-    # Лог-сводка по текущей неделе
+    # Лог-сводка по текущей неделе + Summary для GitHub Actions
     try:
         totals = W.get("totals", {}) if isinstance(W, dict) else {}
         surveys_total = int(totals.get("surveys_total") or 0)
@@ -1747,6 +1747,18 @@ def main():
             f"[INFO] Неделя {wk_key} ({w_start}..{w_end}): "
             f"анкет {surveys_total}, средняя оценка {overall_txt}/5, NPS {nps_txt}"
         )
+
+        summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+        if summary_path:
+            try:
+                with open(summary_path, "a", encoding="utf-8") as fh:
+                    fh.write(f"### Surveys weekly report {wk_key}\n\n")
+                    fh.write(f"- Период: {w_start} .. {w_end}\n")
+                    fh.write(f"- Анкет: {surveys_total}\n")
+                    fh.write(f"- Средняя оценка: {overall_txt}/5\n")
+                    fh.write(f"- NPS: {nps_txt}\n\n")
+            except Exception as e2:
+                print(f"[DEBUG] Не удалось записать summary для недели {wk_key}: {e2}")
     except Exception as e:
         print(f"[WARN] Не удалось сформировать краткую сводку по неделе {wk_key}: {e}")
 
