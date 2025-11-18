@@ -1078,20 +1078,15 @@ def main() -> None:
                 f"(последняя дата отзыва {last_dt})"
             )
 
-    # --- Нарезаем периоды относительно этой якорной недели ---
     periods = reviews_core.slice_periods(df_hist_all, anchor_week_key)
     ranges = periods["ranges"]
-    week_start = ranges["week"]["start"]
-    week_end = ranges["week"]["end"]
-    LOG.info(f"Anchor week: {anchor_week_key} ({week_start}..{week_end})")
-
-    # сразу достаём датафреймы периодов для блока A/B
-    week_df = periods["week"]["df"]
-    mtd_df = periods["mtd"]["df"]
-    qtd_df = periods["qtd"]["df"]
-    ytd_df = periods["ytd"]["df"]
-    all_df = periods["all"]["df"]
-
+    
+    # здесь "week", "mtd", "qtd", "ytd", "all" уже являются DataFrame
+    week_df = periods["week"]
+    mtd_df = periods["mtd"]
+    qtd_df = periods["qtd"]
+    ytd_df = periods["ytd"]
+    all_df = periods["all"]
 
     # базовая сводка по источникам по всем периодам (ядро блока C1)
     src_week = reviews_core.build_source_pivot(week_df)
