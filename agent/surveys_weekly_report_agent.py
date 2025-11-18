@@ -1669,6 +1669,8 @@ def send_email(subject, html_body, attachments=None):
 # =========================================
 
 def main():
+    dry_run = (os.environ.get("DRY_RUN") or "false").strip().lower() == "true"
+
     # 1) последний Report_*.xlsx из Диска
     file_id, fname, fdate = latest_report_from_drive()
     data = drive_download(file_id)
@@ -1878,10 +1880,13 @@ def main():
 
     # 12) тема письма
     subject = f"ARTSTUDIO Nevsky. Анкеты TL: Marketing — неделя {week_col_label}"
-
+    
     # 13) отправка
-    send_email(subject, html_body, attachments=charts)
+    if dry_run:
+        print("[INFO] DRY_RUN=true — письмо не отправляем.")
+        return
 
+    send_email(subject, html_body, attachments=charts)
 
 if __name__ == "__main__":
     main()
