@@ -274,6 +274,66 @@ def _upsert_reviews_history_week(
     _append_rows_to_sheet(sheets, spreadsheet_id, HISTORY_SHEET_NAME, to_append)
     return len(to_append)
 
+def _upsert_reviews_history_bulk(
+    sheets,
+    spreadsheet_id: str,
+    df_reviews: pd.DataFrame,
+    df_raw_with_has_response: pd.DataFrame,
+    existing_keys: set[str],
+) -> int:
+    """
+    Бэкфилл-режим: собираем все новые строки по всему периоду и
+    отправляем одним append-запросом, чтобы не упираться в лимиты
+    write_requests per minute.
+    """
+    # review_id -> has_response
+    raw_map = (
+        df_raw_with_has_response.set_index("review_id")["has_response"].to_dict()
+        if not df_raw_with_has_response.empty
+        else {}
+    )
+
+    to_append: List[List[Any]] = []
+    now = _now_iso()
+
+    for _, row in df_reviews.iterrows():
+        review_id = str(row.get("review_id"))
+        if not review_id:
+            continue
+        review_key = review_id  # стабильный идентификатор (см. reviews_core)
+
+        if review_key in existing_keys:
+            # уже есть в истории — пропускаем (идемпотентность)
+            continue
+
+        aspects = _serialize_aspects_for_sheet(row.get("aspects"))
+        topics = _serialize_topics_for_sheet(row.get("topics"))
+        has_resp = raw_map.get(review_id, "")
+        text_trimmed = _trim_text(str(row.get("raw_text") or ""), 280)
+
+        vals = [
+            str(row.get("created_at") or ""),
+            str(row.get("week_key") or ""),
+            str(row.get("source") or ""),
+            str(row.get("lang") or ""),
+            "" if pd.isna(row.get("rating10")) else float(row.get("rating10")),
+            "" if pd.isna(row.get("sentiment_score")) else float(row.get("sentiment_score")),
+            str(row.get("sentiment_overall") or ""),
+            aspects,
+            topics,
+            has_resp,
+            review_key,
+            text_trimmed,
+            now,
+        ]
+        to_append.append(vals)
+        existing_keys.add(review_key)
+
+    if not to_append:
+        return 0
+
+    _append_rows_to_sheet(sheets, spreadsheet_id, HISTORY_SHEET_NAME, to_append)
+    return len(to_append)
 
 def _read_existing_review_keys_all(
     sheets,
@@ -447,31 +507,27 @@ def main() -> None:
     if dry_run:
         LOG.info("DRY_RUN=true — запись в Google Sheets не выполняется.")
     else:
-        # 1) гарантируем, что лист существует (одна read-запрос на книгу)
+        # 1) гарантируем, что лист существует (один read-запрос)
         _ensure_sheet_exists(sheets, sheets_id, HISTORY_SHEET_NAME)
 
-        # 2) читаем все уже существующие review_key (ещё один read-запрос)
+        # 2) читаем все уже существующие review_key (один read-запрос)
         existing_keys = _read_existing_review_keys_all(
             sheets,
             sheets_id,
             HISTORY_SHEET_NAME,
         )
 
-        # 3) проходимся по неделям и дописываем только новые записи
-        for wk in weeks:
-            appended = _upsert_reviews_history_week(
-                sheets=sheets,
-                spreadsheet_id=sheets_id,
-                df_reviews=df_reviews_period,
-                df_raw_with_has_response=df_raw_map,
-                week_key=wk,
-                existing_keys=existing_keys,
-            )
-            LOG.info(f"Неделя {wk}: добавлено строк {appended}")
-            total_appended += appended
+        # 3) одним заходом дописываем все новые записи за весь период
+        total_appended = _upsert_reviews_history_bulk(
+            sheets=sheets,
+            spreadsheet_id=sheets_id,
+            df_reviews=df_reviews_period,
+            df_raw_with_has_response=df_raw_map,
+            existing_keys=existing_keys,
+        )
+        LOG.info("В бэкфилл добавлено строк: %d", total_appended)
 
     LOG.info(f"Готово. Всего добавлено: {total_appended}")
-
 
 if __name__ == "__main__":
     main()
