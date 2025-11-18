@@ -13,7 +13,9 @@ from typing import (
     Protocol,
 )
 import re
+import logging
 import pandas as pd
+
 LOG = logging.getLogger("reviews_core")
 
 # --- пакетные импорты внутри agent ---
