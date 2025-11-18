@@ -1014,8 +1014,15 @@ def main() -> None:
     # Для остальных периодов у нас нет разметки аспектов в истории; пока используем week-грануляцию (позже добавим накопление)
 
     # --- Сводка по источникам за неделю (ядро блока C1) ---
-    df_week = df_reviews.loc[(df_reviews["created_at"] >= pd.to_datetime(week_start)) &
-                             (df_reviews["created_at"] <= pd.to_datetime(week_end))].copy()
+    # Нормализуем created_at в Timestamp, чтобы сравнивать с week_start/week_end без ошибок pandas 2.x
+    created_ts = pd.to_datetime(df_reviews["created_at"], errors="coerce")
+    week_start_ts = pd.Timestamp(week_start)
+    week_end_ts = pd.Timestamp(week_end)
+
+    df_week = df_reviews.loc[
+        (created_ts >= week_start_ts) & (created_ts <= week_end_ts)
+    ].copy()
+
     try:
         # если добавите в reviews_core build_source_pivot — можно заменить этим вызовом
         # df_sources = reviews_core.build_source_pivot(df_week)
