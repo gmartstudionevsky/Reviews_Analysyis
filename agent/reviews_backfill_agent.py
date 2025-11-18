@@ -379,5 +379,14 @@ def main() -> None:
 
     LOG.info(f"Готово. Всего добавлено: {total_appended}")
 
+    # DEBUG: посмотрим шапку и типы
+    try:
+        LOG.info(f"Колонки: {list(df.columns)}")
+        LOG.info(f"Типы: {df.dtypes.to_dict()}")
+        LOG.info(f"Пример дат (первые 5): {df['date'].astype(str).head(5).tolist()}")
+    except Exception:
+        pass
+
+
 if __name__ == "__main__":
     main()
