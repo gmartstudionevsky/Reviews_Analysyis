@@ -1720,6 +1720,36 @@ def main():
     Prev = surveys_aggregate_period(hist, prev_start, prev_end)
     L4   = surveys_aggregate_period(hist, l4_start, l4_end)
 
+    # Лог-сводка по текущей неделе
+    try:
+        totals = W.get("totals", {}) if isinstance(W, dict) else {}
+        surveys_total = int(totals.get("surveys_total") or 0)
+        overall5 = totals.get("overall5")
+        nps = totals.get("nps")
+
+        overall_txt = "n/a"
+        if isinstance(overall5, (int, float)):
+            try:
+                if not math.isnan(overall5):
+                    overall_txt = f"{overall5:.2f}"
+            except Exception:
+                pass
+
+        nps_txt = "n/a"
+        if isinstance(nps, (int, float)):
+            try:
+                if not math.isnan(nps):
+                    nps_txt = f"{nps:.1f}"
+            except Exception:
+                pass
+
+        print(
+            f"[INFO] Неделя {wk_key} ({w_start}..{w_end}): "
+            f"анкет {surveys_total}, средняя оценка {overall_txt}/5, NPS {nps_txt}"
+        )
+    except Exception as e:
+        print(f"[WARN] Не удалось сформировать краткую сводку по неделе {wk_key}: {e}")
+
     # 8) подписи периодов
     week_lbl_no_g   = week_label(w_start, w_end)          # "13–19 окт 2025"
     week_col_label  = add_year_suffix(week_lbl_no_g)      # "13–19 окт 2025 г."
