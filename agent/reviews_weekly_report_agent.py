@@ -995,7 +995,13 @@ def main() -> None:
 
     # --- Файл из Drive ---
     all_files = _drive_list_files_in_folder(drive, drive_folder_id)
-    best = _pick_best_reviews_file(all_files, week_end)
+
+    # На этом этапе мы ещё не знаем week_end из периодов,
+    # поэтому в качестве верхней границы берём "сегодня".
+    # _pick_best_reviews_file просто выберет самый свежий файл
+    # с датой в имени, не позже указанной.
+    best = _pick_best_reviews_file(all_files, _today())
+
     LOG.info(f"Выбран файл: {best.get('name')}  (id={best.get('id')})")
     blob = _drive_download_file_bytes(drive, best["id"])
 
