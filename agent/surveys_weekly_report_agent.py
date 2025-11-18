@@ -1,57 +1,4 @@
 # agent/surveys_weekly_report_agent.py
-#
-# ARTSTUDIO Nevsky — еженедельный отчёт по анкетам TL: Marketing
-#
-# Версия с расширенной аналитикой и финальными штрихами оформления:
-# - корректные расчёты по 5-балльной шкале (без avg10)
-# - NPS считается в п.п. и выводится как %
-# - оформление письма с акцентами жирным, фирменными цветами и мягким фоном
-# - в тексте НЕ упоминаем "/5", кроме методики в сноске
-# - в шапке вместо " · " используем обычные точки
-# - вклад недели формулируется в понятных терминах ("Текущая неделя дала около 62% всех анкет за месяц")
-# - при описании отклонений по параметрам выводим отдельными строками "Ниже..." и "Выше..."
-#   и перечисляем несколько параметров сразу при необходимости
-#
-# Структура письма:
-#   1. Шапка:
-#      - "Итоги недели ..."
-#      - Месяц / Квартал / Год / Итого:
-#           • показатели периода
-#           • вклад текущей недели
-#           • влияние этой недели на среднюю оценку и NPS
-#           • существенные отклонения по параметрам (ниже / выше уровня периода)
-#           • цветной маркер ▲ / ▼ перед названием периода
-#   2. Таблица параметров качества
-#   3. Динамика и точки внимания:
-#      - текущая неделя vs предыдущая
-#      - текущая неделя vs средний уровень последних недель
-#      - ключевые сигналы этой недели
-#      - тревожные точки (⚠)
-#   4. Сравнение с прошлым годом:
-#      - таблица
-#      - комментарий с плюсами и минусами
-#   5. Сноска с методикой
-#
-# Цветовая палитра (бренд):
-#   Основные:
-#     RGB 196 154 95   -> #C49A5F  (границы / акценты)
-#     RGB 38 45 54     -> #262D36  (основной текст)
-#     RGB 255 255 255  -> #FFFFFF  (фон письма / графиков)
-#   Дополнительные:
-#     RGB 255 246 229  -> #FFF6E5  (мягкий фон блоков/таблиц/графиков)
-#     RGB 239 125 23   -> #EF7D17  (снижение ▼)
-#     RGB 255 204 0    -> #FFCC00  (рост ▲)
-#
-# Требуемые Secrets:
-#   DRIVE_FOLDER_ID
-#   SHEETS_HISTORY_ID
-#   GOOGLE_SERVICE_ACCOUNT_JSON или GOOGLE_SERVICE_ACCOUNT_JSON_CONTENT
-#   RECIPIENTS, SMTP_USER, SMTP_PASS, SMTP_FROM
-#
-# Лист surveys_history должен иметь шапку:
-#   week_key | param | surveys_total | answered | avg5 |
-#   promoters | detractors | nps_answers | nps_value
-#
 
 import os, io, re, sys, json, math, datetime as dt
 from datetime import date
@@ -67,6 +14,7 @@ import smtplib, mimetypes
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
+from .connectors import build_credentials_from_env, get_drive_client, get_sheets_client
 
 # headless matplotlib
 import matplotlib
@@ -113,23 +61,9 @@ except ModuleNotFoundError:
 # ENV, creds, Google API clients
 # =========================================
 
-SCOPES = [
-    "https://www.googleapis.com/auth/drive.readonly",
-    "https://www.googleapis.com/auth/spreadsheets",
-]
-
-SA_PATH    = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
-SA_CONTENT = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON_CONTENT")
-
-if SA_CONTENT and SA_CONTENT.strip().startswith("{"):
-    CREDS = Credentials.from_service_account_info(json.loads(SA_CONTENT), scopes=SCOPES)
-else:
-    if not SA_PATH:
-        raise RuntimeError("No GOOGLE_SERVICE_ACCOUNT_JSON or GOOGLE_SERVICE_ACCOUNT_JSON_CONTENT provided.")
-    CREDS = Credentials.from_service_account_file(SA_PATH, scopes=SCOPES)
-
-DRIVE  = build("drive",  "v3", credentials=CREDS)
-SHEETS = build("sheets", "v4", credentials=CREDS).spreadsheets()
+CREDS = build_credentials_from_env()
+DRIVE = get_drive_client(CREDS)
+SHEETS = get_sheets_client(CREDS).spreadsheets()
 
 DRIVE_FOLDER_ID   = os.environ["DRIVE_FOLDER_ID"]
 HISTORY_SHEET_ID  = os.environ["SHEETS_HISTORY_ID"]
