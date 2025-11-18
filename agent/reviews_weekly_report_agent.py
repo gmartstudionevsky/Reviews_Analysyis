@@ -632,15 +632,14 @@ def _section_C_sources_short(sources_dict: Dict[str, pd.DataFrame]) -> str:
         "all": df_src_all,
       }
 
-    Все df должны содержать колонки:
-      - source (ключ источника)
-      - label (человекочитаемое имя источника)
-      - avg10 (средняя оценка в 10-балльной шкале)
+    Все df должны содержать по крайней мере:
+      - source  (ключ источника)
+      - label   (человекочитаемое имя источника, если есть)
+      - n_reviews / count  (кол-во отзывов)
+      - avg10   (средняя оценка в 10-балльной шкале)
       - avg_native (средняя в нативной шкале, если есть)
-      - count (кол-во отзывов)
       - pct_pos, pct_neg (доли положительных/негативных)
     """
-
     week_df = sources_dict.get("week")
     mtd_df = sources_dict.get("mtd")
     all_df = sources_dict.get("all")
@@ -651,7 +650,56 @@ def _section_C_sources_short(sources_dict: Dict[str, pd.DataFrame]) -> str:
             "по источникам репутационная картина не изменилась.</p>"
         )
 
-    # Игнорируем Booking.com как неактуальный для РФ
+    # Работаем с копией
+    week_df = week_df.copy()
+
+    # --- Нормализация имён колонок под внутренний контракт ---
+
+    cols = set(week_df.columns)
+
+    # количество отзывов
+    if "count" not in cols:
+        if "n_reviews" in cols:
+            week_df = week_df.rename(columns={"n_reviews": "count"})
+        elif "reviews_count" in cols:
+            week_df = week_df.rename(columns={"reviews_count": "count"})
+
+    # человекочитаемое название источника
+    if "label" not in week_df.columns:
+        if "source_label" in cols:
+            week_df = week_df.rename(columns={"source_label": "label"})
+        elif "label_ru" in cols:
+            week_df = week_df.rename(columns={"label_ru": "label"})
+
+    # средняя оценка в 10-балльной шкале
+    if "avg10" not in week_df.columns:
+        for cand in ("avg_rating10", "mean10", "rating10_mean"):
+            if cand in cols:
+                week_df = week_df.rename(columns={cand: "avg10"})
+                break
+
+    # доли позитивных / негативных
+    if "pct_pos" not in week_df.columns:
+        for cand in ("share_pos", "pct_positive"):
+            if cand in cols:
+                week_df = week_df.rename(columns={cand: "pct_pos"})
+                break
+
+    if "pct_neg" not in week_df.columns:
+        for cand in ("share_neg", "pct_negative"):
+            if cand in cols:
+                week_df = week_df.rename(columns={cand: "pct_neg"})
+                break
+
+    # если вдруг нет ключевого столбца source — честно отваливаемся
+    if "source" not in week_df.columns:
+        return (
+            "<p>Данные по источникам за неделю получены, но их структура не соответствует ожидаемой. "
+            "Нужна проверка функции build_source_pivot.</p>"
+        )
+
+    # --- Фильтрация источников: Booking убираем как неактуальный для РФ ---
+
     week_df = week_df.loc[week_df["source"] != "booking"].copy()
 
     if week_df.empty:
@@ -660,25 +708,42 @@ def _section_C_sources_short(sources_dict: Dict[str, pd.DataFrame]) -> str:
             "отзывы не зафиксированы.</p>"
         )
 
-    # Для текста нам нужно несколько ключевых вещей
-    week_total = int(week_df["count"].sum())
-    week_top = (
-        week_df.sort_values("count", ascending=False)
-               .head(3)
-               .to_dict(orient="records")
-    )
+    # --- C2. Краткий аналитический комментарий по текущему положению ---
+
+    # сколько всего отзывов по актуальным источникам
+    if "count" in week_df.columns:
+        week_total = int(week_df["count"].sum())
+        sort_col = "count"
+    else:
+        # fallback: считаем по количеству строк
+        week_total = int(len(week_df))
+        sort_col = None
+
+    # топ-3 источника по объёму
+    if sort_col is not None:
+        week_top = (
+            week_df.sort_values(sort_col, ascending=False)
+                   .head(3)
+                   .to_dict(orient="records")
+        )
+    else:
+        week_top = week_df.head(3).to_dict(orient="records")
 
     parts: List[str] = []
 
-    # C2. Краткий аналитический комментарий по текущему положению
-    # Где основной поток отзывов и каковы оценки
-    main_sources_desc = []
+    main_sources_desc: List[str] = []
     for row in week_top:
         label = row.get("label") or row.get("source")
         avg10 = row.get("avg10")
-        cnt = int(row.get("count") or 0)
+        cnt = row.get("count") or row.get("n_reviews") or 0
         pct_pos = row.get("pct_pos")
         pct_neg = row.get("pct_neg")
+
+        # подстрахуемся от None
+        try:
+            cnt = int(cnt)
+        except Exception:
+            cnt = 0
 
         main_sources_desc.append(
             f"{label}: средняя {avg10:.2f}/10, отзывов {cnt}, "
@@ -692,58 +757,80 @@ def _section_C_sources_short(sources_dict: Dict[str, pd.DataFrame]) -> str:
         + ".</p>"
     )
 
-    # C3. Комментарий по динамике источников (сравниваем с all_df)
+    # --- C3. Комментарий по динамике источников (сравнение с историей) ---
+
     if all_df is not None and not all_df.empty:
-        # тоже уберём Booking из сравнения
+        all_df = all_df.copy()
+        # тоже приводим к тем же именам (на всякий случай)
+        all_cols = set(all_df.columns)
+
+        if "avg10" not in all_df.columns:
+            for cand in ("avg_rating10", "mean10", "rating10_mean"):
+                if cand in all_cols:
+                    all_df = all_df.rename(columns={cand: "avg10"})
+                    break
+
+        if "pct_neg" not in all_df.columns:
+            for cand in ("share_neg", "pct_negative"):
+                if cand in all_cols:
+                    all_df = all_df.rename(columns={cand: "pct_neg"})
+                    break
+
+        # фильтруем Booking
         all_df = all_df.loc[all_df["source"] != "booking"].copy()
-        merged = week_df.merge(
-            all_df[["source", "avg10", "pct_neg"]],
-            on="source",
-            how="left",
-            suffixes=("_week", "_hist"),
-        )
 
-        risk_lines = []
-        loyalty_lines = []
-
-        for _, row in merged.iterrows():
-            src = row.get("label") or row.get("source")
-            avg_w = row.get("avg10_week")
-            avg_h = row.get("avg10_hist")
-            neg_w = row.get("pct_neg_week")
-            neg_h = row.get("pct_neg_hist")
-
-            if pd.isna(avg_h) or pd.isna(neg_h):
-                continue
-
-            delta_avg = avg_w - avg_h
-            delta_neg = neg_w - neg_h
-
-            # Простая эвристика: если негатив вырос >= 5 п.п. или средняя просела >= 0.3
-            if delta_neg >= 5 or delta_avg <= -0.3:
-                risk_lines.append(
-                    f"{src}: средняя оценка ниже обычного (Δ {delta_avg:+.2f} пунктов), "
-                    f"доля негатива выше исторической (Δ {delta_neg:+.1f} п.п.)."
-                )
-            # А если наоборот, всё лучше исторического
-            elif delta_neg <= -5 and delta_avg >= 0.3:
-                loyalty_lines.append(
-                    f"{src}: средняя оценка выше обычного (Δ {delta_avg:+.2f}), "
-                    f"негатив заметно ниже (Δ {delta_neg:+.1f} п.п.)."
-                )
-
-        if risk_lines:
-            parts.append(
-                "<p><b>Где концентрируется риск</b><br>"
-                + " ".join(risk_lines)
-                + "</p>"
+        if (
+            "source" in all_df.columns
+            and "avg10" in all_df.columns
+            and "pct_neg" in all_df.columns
+        ):
+            merged = week_df.merge(
+                all_df[["source", "avg10", "pct_neg"]],
+                on="source",
+                how="left",
+                suffixes=("_week", "_hist"),
             )
-        if loyalty_lines:
-            parts.append(
-                "<p><b>Где накапливается лояльность</b><br>"
-                + " ".join(loyalty_lines)
-                + "</p>"
-            )
+
+            risk_lines: List[str] = []
+            loyalty_lines: List[str] = []
+
+            for _, row in merged.iterrows():
+                src = row.get("label") or row.get("source")
+                avg_w = row.get("avg10_week")
+                avg_h = row.get("avg10_hist")
+                neg_w = row.get("pct_neg_week")
+                neg_h = row.get("pct_neg_hist")
+
+                if pd.isna(avg_h) or pd.isna(neg_h):
+                    continue
+
+                delta_avg = avg_w - avg_h
+                delta_neg = neg_w - neg_h
+
+                # простая эвристика: если негатив вырос >= 5 п.п. или средняя просела >= 0.3
+                if delta_neg >= 5 or delta_avg <= -0.3:
+                    risk_lines.append(
+                        f"{src}: средняя оценка ниже обычного (Δ {delta_avg:+.2f} пунктов), "
+                        f"доля негатива выше исторической (Δ {delta_neg:+.1f} п.п.)."
+                    )
+                elif delta_neg <= -5 and delta_avg >= 0.3:
+                    loyalty_lines.append(
+                        f"{src}: средняя оценка выше обычного (Δ {delta_avg:+.2f}), "
+                        f"негатив заметно ниже (Δ {delta_neg:+.1f} п.п.)."
+                    )
+
+            if risk_lines:
+                parts.append(
+                    "<p><b>Где концентрируется риск</b><br>"
+                    + " ".join(risk_lines)
+                    + "</p>"
+                )
+            if loyalty_lines:
+                parts.append(
+                    "<p><b>Где накапливается лояльность</b><br>"
+                    + " ".join(loyalty_lines)
+                    + "</p>"
+                )
 
     if not parts:
         return (
@@ -752,6 +839,7 @@ def _section_C_sources_short(sources_dict: Dict[str, pd.DataFrame]) -> str:
         )
 
     return "\n".join(parts)
+
 
 def _df_to_inputs_for_lexicon(df_subset: pd.DataFrame) -> List[reviews_core.ReviewRecordInput]:
     """
