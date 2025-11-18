@@ -31,8 +31,6 @@ from .metrics_core import iso_week_monday, period_ranges_for_week
 from .connectors import build_credentials_from_b64, get_drive_client, get_sheets_client
 
 # --- Google API ---
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 
 # -----------------------------------------------------------------------------
