@@ -12,6 +12,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: reviews-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   backfill:
     runs-on: ubuntu-latest
