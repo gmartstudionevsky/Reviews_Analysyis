@@ -619,6 +619,140 @@ def _section_B0_dynamics(week_df: pd.DataFrame, df_hist_all: pd.DataFrame, ancho
         return (f"<p>Средняя оценка текущей недели — {'' if a_cur!=a_cur else f'{a_cur:.2f}/10'}. "
                 f"Показатели позитивных/негативных отзывов близки к уровню последних четырёх недель.</p>")
 
+def _section_C_sources_short(sources_dict: Dict[str, pd.DataFrame]) -> str:
+    """
+    Короткий человекочитаемый блок C: источники и репутационные риски.
+
+    Ожидает dict:
+      {
+        "week": df_src_week,
+        "mtd": df_src_mtd,
+        "qtd": df_src_qtd,
+        "ytd": df_src_ytd,
+        "all": df_src_all,
+      }
+
+    Все df должны содержать колонки:
+      - source (ключ источника)
+      - label (человекочитаемое имя источника)
+      - avg10 (средняя оценка в 10-балльной шкале)
+      - avg_native (средняя в нативной шкале, если есть)
+      - count (кол-во отзывов)
+      - pct_pos, pct_neg (доли положительных/негативных)
+    """
+
+    week_df = sources_dict.get("week")
+    mtd_df = sources_dict.get("mtd")
+    all_df = sources_dict.get("all")
+
+    if week_df is None or week_df.empty:
+        return (
+            "<p>На этой неделе отзывов не зафиксировано, "
+            "по источникам репутационная картина не изменилась.</p>"
+        )
+
+    # Игнорируем Booking.com как неактуальный для РФ
+    week_df = week_df.loc[week_df["source"] != "booking"].copy()
+
+    if week_df.empty:
+        return (
+            "<p>На этой неделе по актуальным источникам (кроме Booking.com) "
+            "отзывы не зафиксированы.</p>"
+        )
+
+    # Для текста нам нужно несколько ключевых вещей
+    week_total = int(week_df["count"].sum())
+    week_top = (
+        week_df.sort_values("count", ascending=False)
+               .head(3)
+               .to_dict(orient="records")
+    )
+
+    parts: List[str] = []
+
+    # C2. Краткий аналитический комментарий по текущему положению
+    # Где основной поток отзывов и каковы оценки
+    main_sources_desc = []
+    for row in week_top:
+        label = row.get("label") or row.get("source")
+        avg10 = row.get("avg10")
+        cnt = int(row.get("count") or 0)
+        pct_pos = row.get("pct_pos")
+        pct_neg = row.get("pct_neg")
+
+        main_sources_desc.append(
+            f"{label}: средняя {avg10:.2f}/10, отзывов {cnt}, "
+            f"позитив {pct_pos:.1f}%, негатив {pct_neg:.1f}%"
+        )
+
+    parts.append(
+        "<p><b>Где формируется внешний образ на этой неделе</b><br>"
+        f"Всего за неделю — {week_total} отзыв(ов). Основные источники: "
+        + "; ".join(main_sources_desc)
+        + ".</p>"
+    )
+
+    # C3. Комментарий по динамике источников (сравниваем с all_df)
+    if all_df is not None and not all_df.empty:
+        # тоже уберём Booking из сравнения
+        all_df = all_df.loc[all_df["source"] != "booking"].copy()
+        merged = week_df.merge(
+            all_df[["source", "avg10", "pct_neg"]],
+            on="source",
+            how="left",
+            suffixes=("_week", "_hist"),
+        )
+
+        risk_lines = []
+        loyalty_lines = []
+
+        for _, row in merged.iterrows():
+            src = row.get("label") or row.get("source")
+            avg_w = row.get("avg10_week")
+            avg_h = row.get("avg10_hist")
+            neg_w = row.get("pct_neg_week")
+            neg_h = row.get("pct_neg_hist")
+
+            if pd.isna(avg_h) or pd.isna(neg_h):
+                continue
+
+            delta_avg = avg_w - avg_h
+            delta_neg = neg_w - neg_h
+
+            # Простая эвристика: если негатив вырос >= 5 п.п. или средняя просела >= 0.3
+            if delta_neg >= 5 or delta_avg <= -0.3:
+                risk_lines.append(
+                    f"{src}: средняя оценка ниже обычного (Δ {delta_avg:+.2f} пунктов), "
+                    f"доля негатива выше исторической (Δ {delta_neg:+.1f} п.п.)."
+                )
+            # А если наоборот, всё лучше исторического
+            elif delta_neg <= -5 and delta_avg >= 0.3:
+                loyalty_lines.append(
+                    f"{src}: средняя оценка выше обычного (Δ {delta_avg:+.2f}), "
+                    f"негатив заметно ниже (Δ {delta_neg:+.1f} п.п.)."
+                )
+
+        if risk_lines:
+            parts.append(
+                "<p><b>Где концентрируется риск</b><br>"
+                + " ".join(risk_lines)
+                + "</p>"
+            )
+        if loyalty_lines:
+            parts.append(
+                "<p><b>Где накапливается лояльность</b><br>"
+                + " ".join(loyalty_lines)
+                + "</p>"
+            )
+
+    if not parts:
+        return (
+            "<p>Картина по источникам на этой неделе в пределах обычного фона: "
+            "структура отзывов и уровни оценок близки к историческим значениям.</p>"
+        )
+
+    return "\n".join(parts)
+
 def _df_to_inputs_for_lexicon(df_subset: pd.DataFrame) -> List[reviews_core.ReviewRecordInput]:
     """
     Готовим минимальный набор ReviewRecordInput для повторного анализа лексиконом.
@@ -1189,46 +1323,70 @@ def main() -> None:
     d_html = _section_D_yoy(df_hist_all, week_start, week_end, ranges)
 
 
-    sources_html = _render_sources_block_html({
-        "week": src_week, "mtd": src_mtd, "qtd": src_qtd, "ytd": src_ytd, "all": src_all
+    sources_block_html = _section_C_sources_short({
+        "week": src_week,
+        "mtd": src_mtd,
+        "qtd": src_qtd,
+        "ytd": src_ytd,
+        "all": src_all,
     })
 
     html = f"""
-    <html><body>
-      <h3>Итоги недели {week_start:%d %b} — {week_end:%d %b %Y}</h3>
-
-      <h4>A. Итоги периода</h4>
-      {a_block}
-
-      <h4>B0. Краткая динамическая сводка</h4>
-      {b0_line}
-
-      <h4>B1. Что создаёт высокий балл сейчас (драйверы)</h4>
-      {b1_html}
-
-      <h4>B2. Что тянет оценки вниз (зоны риска)</h4>
-      {b2_html}
-
-      <h4>B3. Существенные отклонения этой недели</h4>
-      {b3_html}
-
-      <h4>B4. Связанные причины впечатления гостей (карты опыта)</h4>
-      {b4_html}
-
-      <h4>B5. Цитаты гостей</h4>
-      {b5_html}
-
-      <h4>C1. Источники × Период</h4>
-      {sources_html}
-      
-      <h4>D. Сравнение с прошлым годом</h4>
-      {d_html}
-
-      <p style="color:#666;margin-top:8px">
-        Примечание: для TL: Marketing, Trip.com, Яндекс, 2GIS, Google, TripAdvisor в колонке «Нативная» отображается 5-балльная шкала; все расчёты ведутся в 10-балльной.
-      </p>
-    </body></html>
+    <html>
+      <body style="margin:0;padding:0;font-family:Arial,Helvetica,sans-serif;font-size:14px;line-height:1.5;color:#262D36;">
+        <div style="max-width:900px;margin:0 auto;padding:16px 20px 24px 20px;">
+          <h2 style="margin:0 0 4px 0;font-size:20px;font-weight:600;">
+            ARTSTUDIO Nevsky. Отчёт по отзывам — неделя {week_start:%d %b}–{week_end:%d %b %Y}
+          </h2>
+          <p style="margin:0 0 16px 0;color:#666666;">
+            Период: {week_start:%d.%m.%Y} — {week_end:%d.%m.%Y}. Отчёт построен по данным отзывов гостей.
+          </p>
+    
+          <h3 style="margin-top:16px;margin-bottom:8px;font-size:16px;">A. Итоги периода</h3>
+          {a_block}
+    
+          <h3 style="margin-top:16px;margin-bottom:8px;font-size:16px;">B0. Краткая динамическая сводка</h3>
+          <p style="margin:0 0 12px 0;">{b0_line}</p>
+    
+          <h3 style="margin-top:16px;margin-bottom:8px;font-size:16px;">B1. Что создаёт высокий балл сейчас (драйверы)</h3>
+          {b1_html}
+    
+          <h3 style="margin-top:16px;margin-bottom:8px;font-size:16px;">B2. Что тянет оценки вниз (зоны риска)</h3>
+          {b2_html}
+    
+          <h3 style="margin-top:16px;margin-bottom:8px;font-size:16px;">B3. Существенные отклонения этой недели</h3>
+          {b3_html}
+    
+          <h3 style="margin-top:16px;margin-bottom:8px;font-size:16px;">B4. Связанные причины впечатления гостей (карты опыта)</h3>
+          {b4_html}
+    
+          <h3 style="margin-top:16px;margin-bottom:8px;font-size:16px;">B5. Цитаты гостей</h3>
+          {b5_html}
+    
+          <h3 style="margin-top:20px;margin-bottom:8px;font-size:16px;">C. Источники и репутационные риски площадок</h3>
+          {sources_block_html}
+    
+          <h3 style="margin-top:20px;margin-bottom:8px;font-size:16px;">D. Сравнение с прошлым годом</h3>
+          {d_block_html}
+    
+          <div style="margin-top:20px;font-size:12px;color:#666666;">
+            <p style="margin:0 0 4px 0;">
+              В приложениях к письму:
+            </p>
+            <ul style="margin:0 0 8px 18px;padding:0;">
+              <li>CSV с агрегированными метриками за неделю: <code>reviews_week_{anchor_week_key}.csv</code></li>
+              <li>CSV с разбором аспектов/тем за неделю: <code>reviews_aspects_week_{anchor_week_key}.csv</code></li>
+              <li>PNG-график динамики средней оценки: <code>weekly_rating.png</code></li>
+            </ul>
+            <p style="margin:0;">
+              Примечание: для TL: Marketing, Trip.com, Яндекс, 2GIS, Google, TripAdvisor в колонке «Нативная» используется 5-балльная шкала; все внутренняя аналитика ведётся в 10-балльной шкале.
+            </p>
+          </div>
+        </div>
+      </body>
+    </html>
     """
+
 
     attachments: List[Tuple[str, bytes]] = []
     # CSV с обзорной таблицей по отзывам недели
