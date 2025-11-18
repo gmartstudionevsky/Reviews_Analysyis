@@ -273,30 +273,30 @@ def read_reviews_xls(xls_bytes: bytes) -> pd.DataFrame:
     # типы
     # --- Дата: устойчивый разбор под строки 'DD.MM.YYYY', 'YYYY-MM-DD', Excel serial, NBSP, и т.п. ---
     
-    def _coerce_date_cell(v: Any) -> Optional[date]:
+    # --- Дата: устойчивый разбор под строки 'DD.MM.YYYY', 'YYYY-MM-DD', Excel serial, NBSP, и т.п. ---
+
+    def _coerce_date_cell(v):
         # уже datetime/date
         if isinstance(v, datetime):
             return v.date()
         if isinstance(v, date):
             return v
-    
-        # числа: возможный Excel serial (напр., 45567)
-        # Excel origin: 1899-12-30
+
+        # числа: возможный Excel serial (напр., 45567) — origin 1899-12-30
         if isinstance(v, (int, float)) and not pd.isna(v):
             iv = int(v)
-            # допускаем диапазон "разумных" дат
             if 30000 <= iv <= 80000:  # ~1982–2120
                 try:
                     return (date(1899, 12, 30) + timedelta(days=iv))
                 except Exception:
                     pass
-    
+
         # строки: чистим NBSP и лишние пробелы
         s = str(v or "").replace("\u00A0", " ").strip()
         if not s:
             return None
-    
-        # сначала пробуем явные шаблоны
+
+        # явный DD.MM.YYYY / DD-MM-YYYY / DD/MM/YYYY
         m = re.match(r"^(\d{1,2})[.\-\/](\d{1,2})[.\-\/](\d{2,4})$", s)
         if m:
             dd, mm, yy = m.groups()
@@ -305,7 +305,8 @@ def read_reviews_xls(xls_bytes: bytes) -> pd.DataFrame:
                 return date(int(yy), int(mm), int(dd))
             except ValueError:
                 return None
-    
+
+        # явный YYYY.MM.DD / YYYY-MM-DD / YYYY/MM/DD
         m = re.match(r"^(\d{4})[.\-\/](\d{1,2})[.\-\/](\d{1,2})$", s)
         if m:
             yy, mm, dd = m.groups()
@@ -313,39 +314,26 @@ def read_reviews_xls(xls_bytes: bytes) -> pd.DataFrame:
                 return date(int(yy), int(mm), int(dd))
             except ValueError:
                 return None
-    
-        # универсальный разбор: dayfirst=True, без устаревших флагов
+
+        # последняя попытка: pandas с dayfirst=True
         try:
             ts = pd.to_datetime(s, errors="coerce", dayfirst=True)
             if pd.notna(ts):
-                # ts может быть Timestamp
-                if isinstance(ts, pd.Timestamp):
-                    return ts.date()
-                if isinstance(ts, datetime):
-                    return ts.date()
+                return (ts.date() if hasattr(ts, "date") else ts)
         except Exception:
             pass
-    
         return None
-    
-    # применяем ко всей колонке
+
     raw_dates = df["date"].copy()
     df["date"] = df["date"].map(_coerce_date_cell)
-    
+
     # защита: выбросим строки без корректной даты и подсветим, если что-то «сгорело»
     before = len(df)
     df = df[df["date"].notna()].copy()
     dropped = before - len(df)
     if dropped > 0:
-        # помогающий лог: первые 5 значений, которые не распарсились
-        bad_samples = (
-            pd.Series(raw_dates[df["date"].isna()] if "date" in df.columns else raw_dates)
-            .astype(str)
-            .head(5)
-            .tolist()
-        )
-        print(f"[reviews_io] отброшено строк без даты: {dropped}; примеры: {bad_samples}")
-
+        print(f"[reviews_io] отброшено строк без даты: {dropped}; примеры: "
+              f"{list(pd.Series(raw_dates)[pd.isna(df.get('date', pd.Series(index=[])))].astype(str).head(5))}")
 
     if "rating10" in df.columns:
         df["rating10"] = pd.to_numeric(df["rating10"], errors="coerce")
