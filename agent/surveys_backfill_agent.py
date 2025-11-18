@@ -5,8 +5,6 @@ from datetime import date
 import pandas as pd
 import numpy as np
 
-from google.oauth2.service_account import Credentials
-from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 from .connectors import build_credentials_from_env, get_drive_client, get_sheets_client
 
