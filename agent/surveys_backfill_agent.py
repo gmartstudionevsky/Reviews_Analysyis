@@ -197,6 +197,8 @@ def write_full_history(df_all: pd.DataFrame):
 # =========================
 
 def main():
+    dry_run = (os.environ.get("DRY_RUN") or "false").strip().lower() == "true"
+    
     # Шаг 1. Собрать список всех источников
     reports = drive_list_all_reports()
     if not reports:
@@ -266,11 +268,13 @@ def main():
         "nps_value",
     ]]
 
-    # Шаг 4. Перезаписываем лист в Google Sheets
-    ensure_tab(HISTORY_SHEET_ID, SURVEYS_TAB, SURVEYS_HEADER)
-    write_full_history(df_all)
-
-    print("[INFO] Backfill завершён успешно.")
+    # Шаг 4. Перезаписываем лист в Google Sheets (если не DRY_RUN)
+    if dry_run:
+        print("[INFO] DRY_RUN=true — лист surveys_history не перезаписываем.")
+    else:
+        ensure_tab(HISTORY_SHEET_ID, SURVEYS_TAB, SURVEYS_HEADER)
+        write_full_history(df_all)
+        print("[INFO] Backfill завершён успешно.")
 
 if __name__ == "__main__":
     main()
