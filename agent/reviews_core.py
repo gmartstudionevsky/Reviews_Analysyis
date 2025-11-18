@@ -546,25 +546,36 @@ def analyze_single_review(
 # -----------------------------------------------------------------------------
 
 def analyze_reviews_bulk(
-    raw_reviews: Iterable[ReviewRecordInput],
-    lexicon: LexiconProtocol,
-) -> List[ReviewAnalysisResult]:
+    records: List[ReviewRecordInput],
+    lexicon: Any,
+) -> List["ReviewAnalysisResult"]:
     """
-    Удобная обёртка: берёт генератор/список ReviewRecordInput,
-    возвращает список ReviewAnalysisResult.
+    Анализирует набор отзывов.
+
+    ВАЖНО:
+    - Не отбрасываем отзывы без аспектов/тем — для истории нам нужен каждый отзыв,
+      даже если лексический модуль не нашёл ни одного совпадения.
+    - Единственное, что пропускаем: явные ошибки анализа (исключения) или res=None.
     """
-    results: List[ReviewAnalysisResult] = []
-    for r in raw_reviews:
+    results: List["ReviewAnalysisResult"] = []
+    if not records:
+        return results
+
+    for rec in records:
         try:
-            res = analyze_single_review(r, lexicon)
-            results.append(res)
+            res = analyze_single_review(rec, lexicon)
         except Exception as e:
-            # продакшен-версия может логировать/репортить.
-            # Здесь мы просто пропускаем падающие отзывы,
-            # но важно не обрушать весь отчёт.
-            # Можно также сохранить "пустой" с neutral.
-            # Пока делаем soft-fail.
+            # можно завести logger в этом модуле; если он уже есть – используй его
+            # LOG.warning(f"Ошибка анализа отзыва {rec.review_id}: {e}")
             continue
+
+        if res is None:
+            # analyze_single_review сам решил пропустить запись
+            continue
+
+        # НИКАКОГО доп. фильтра по аспектам/темам здесь не делаем
+        results.append(res)
+
     return results
 
 
