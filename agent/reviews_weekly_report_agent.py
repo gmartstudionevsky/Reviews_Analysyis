@@ -241,6 +241,53 @@ def _append_rows_to_sheet(sheets, spreadsheet_id: str, title: str, rows: List[Li
         insertDataOption="INSERT_ROWS",
         body=body,
     ).execute()
+    
+def _serialize_aspects_for_sheet(value: Any) -> str:
+    """
+    Превращает список аспектов (['wifi', 'noise', ...]) в строку "wifi;noise".
+    Если уже строка — возвращаем как есть.
+    """
+    if value is None:
+        return ""
+    # если уже str — не трогаем
+    if isinstance(value, str):
+        return value.strip()
+    # list / tuple / set со строками
+    if isinstance(value, (list, tuple, set)):
+        parts = []
+        for v in value:
+            if v is None:
+                continue
+            parts.append(str(v).strip())
+        return ";".join(p for p in parts if p)
+    # на всякий случай fallback
+    return str(value).strip()
+
+def _serialize_topics_for_sheet(value: Any) -> str:
+    """
+    Превращает список пар (topic, subtopic) в строку:
+      [("breakfast","service_dining_staff"), ("checkin_stay","stay_support")]
+      -> "breakfast:service_dining_staff;checkin_stay:stay_support"
+    Если уже строка — возвращаем как есть.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, (list, tuple, set)):
+        parts = []
+        for v in value:
+            # ожидаем кортеж/список длины >=2
+            if isinstance(v, (list, tuple)) and len(v) >= 2:
+                topic_key = str(v[0]).strip()
+                sub_key = str(v[1]).strip()
+                if topic_key or sub_key:
+                    parts.append(f"{topic_key}:{sub_key}")
+            else:
+                # если вдруг прилетел одиночный код
+                parts.append(str(v).strip())
+        return ";".join(p for p in parts if p)
+    return str(value).strip()
 
 def _upsert_reviews_history_week(
     sheets, spreadsheet_id: str, df_reviews: pd.DataFrame, df_raw_with_has_response: pd.DataFrame, week_key: str
@@ -286,9 +333,8 @@ def _upsert_reviews_history_week(
         if review_key in existing_keys:
             continue
 
-        aspects = row.get("aspects") or ""
-        topics  = row.get("topics") or ""
-        # подтянем has_response
+        aspects = _serialize_aspects_for_sheet(row.get("aspects"))
+        topics  = _serialize_topics_for_sheet(row.get("topics"))
         has_resp = raw_map.get(review_id, "")
         text_trimmed = _trim_text(str(row.get("raw_text") or ""), 280)
 
