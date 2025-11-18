@@ -1,4 +1,6 @@
 name: Surveys Backfill
+env:
+  DRY_RUN: "true"
 
 on:
   workflow_dispatch: {}
