@@ -250,8 +250,8 @@ def _upsert_reviews_history_week(
         if review_key in existing_keys:
             continue
 
-        aspects = row.get("aspects") or ""
-        topics  = row.get("topics") or ""
+        aspects = _serialize_aspects_for_sheet(row.get("aspects"))
+        topics  = _serialize_topics_for_sheet(row.get("topics"))
         has_resp = raw_map.get(review_id, "")
         text_trimmed = _trim_text(str(row.get("raw_text") or ""), 280)
 
