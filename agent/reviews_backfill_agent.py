@@ -245,27 +245,17 @@ def main() -> None:
     if not sheets_id:
         raise RuntimeError("SHEETS_HISTORY_ID не задан.")
 
-    # --- Режим выбора входных файлов ---
-    # 1) Если задан BACKFILL_FILE — берём его (по id или имени).
-    # 2) Иначе пробуем найти агрегированный файл формата reviews_2019-25.xls.
-    # 3) Иначе падаем в прежний "date-range" режим с BACKFILL_START/BACKFILL_END.
-    backfill_file = (os.environ.get("BACKFILL_FILE") or "").strip()
-    
-    range_mode = False
-    start_date: Optional[date] = None
-    end_date: Optional[date] = None
-    selected: List[Dict[str, Any]] = []
-    
     # --- Google clients (через B64 секрет) ---
     creds = _build_credentials_from_b64()
     drive = _build_drive(creds)
     sheets = _build_sheets(creds)
-    
-    # --- Список файлов в папке ---
+
+    # --- Выбор файла: BACKFILL_FILE -> reviews_YYYY-YY.* -> ошибка ---
+    backfill_file = (os.environ.get("BACKFILL_FILE") or "").strip()
     files = _drive_list_files_in_folder(drive, drive_folder_id)
-    
+
+    selected: List[Dict[str, Any]] = []
     if backfill_file:
-        # точное совпадение по id или по имени (без учёта регистра)
         for f in files:
             name = f.get("name", "")
             if f["id"] == backfill_file or name.lower() == backfill_file.lower():
@@ -275,54 +265,27 @@ def main() -> None:
         if not selected:
             raise RuntimeError(f"BACKFILL_FILE='{backfill_file}' не найден в папке.")
     else:
-        # пробуем годовой агрегат reviews_YYYY-YY.xls
         yr_file = None
         for f in files:
             name = f.get("name", "")
             if _RE_FNAME_YEAR_RANGE.search(name):
                 yr_file = f
-                break  # файлы уже отсортированы по modifiedTime desc
+                break  # берём самый свежий
         if yr_file:
             selected = [yr_file]
             LOG.info(f"Обнаружен агрегированный файл: {yr_file.get('name')}")
         else:
-            # fallback: старый режим — по диапазону дат из ENV
-            range_mode = True
-            start_date = _date_from_env("BACKFILL_START")  # YYYY-MM-DD
-            end_date = _date_from_env("BACKFILL_END")      # YYYY-MM-DD
-            if end_date < start_date:
-                raise RuntimeError("BACKFILL_END раньше BACKFILL_START.")
-    
-            for f in files:
-                d = _parse_date_from_name(f.get("name", ""))
-                if d is None:
-                    continue
-                if start_date <= d <= end_date:
-                    selected.append(f)
-    
+            raise RuntimeError(
+                "Не найден агрегированный файл reviews_YYYY-YY.* и не задан BACKFILL_FILE."
+            )
+
     if not selected:
-        LOG.warning("Не найдено входных файлов по выбранному режиму (file/year-range/date-range).")
+        LOG.warning("Не найдено входных файлов.")
         return
-    
+
     LOG.info(f"Файлов к обработке: {len(selected)}")
 
-    inputs = reviews_io.df_to_inputs(df)  # если ты раньше передавал df сразу в ядро — теперь явно сделай inputs
-    LOG.info(f"Собрано inputs: {len(inputs)}")
-    
-    if len(inputs) == 0:
-        # чтобы понять, где отсекается — посчитаем, сколько было скачано и сколько с валидной датой
-        LOG.warning("Inputs пусты. Вероятно, проблема с парсингом даты/текста. "
-                    "Проверь лог [reviews_io] отброшено строк без даты ...")
-        return
-
-analyzed = reviews_core.analyze_reviews_bulk(inputs)
-LOG.info(f"Анализировано записей: {len(analyzed)}")
-if len(analyzed) == 0:
-    LOG.warning("После анализа записей нет. Проверь lexicon/topic schema или фильтры в analyze.")
-    return
-
-
-    # --- Чтение/парсинг всех файлов периода ---
+    # --- Чтение/парсинг выбранных файлов ---
     all_inputs: List[reviews_core.ReviewRecordInput] = []
     raw_has_response_pairs: List[Tuple[str, Any]] = []
 
@@ -333,50 +296,67 @@ if len(analyzed) == 0:
             blob = _drive_download_file_bytes(drive, fid)
             df_raw = reviews_io.read_reviews_xls(blob)
 
-            # inputs (дадут review_id)
+            LOG.info(f"OK: {fname} (raw rows: {len(df_raw)})")
+            try:
+                LOG.info(f"Колонки: {list(df_raw.columns)}")
+                if "date" in df_raw.columns:
+                    LOG.info(f"Пример дат: {df_raw['date'].astype(str).head(5).tolist()}")
+            except Exception:
+                pass
+
             inputs = reviews_io.df_to_inputs(df_raw)
+            LOG.info(f"→ inputs: {len(inputs)}")
+
+            if not inputs:
+                LOG.warning(f"Файл {fname}: после нормализации записей нет.")
+                continue
+
             all_inputs.extend(inputs)
 
-            # map review_id -> has_response
-            tmp = []
+            # map review_id -> has_response (по тексту как стабильному ключу в рамках файла)
+            tmp: List[Tuple[str, Any]] = []
             for r in inputs:
-                has_resp = df_raw.loc[df_raw["text"].astype(str).str.strip() == str(r.text).strip(), "has_response"]
+                mask = df_raw["text"].astype(str).str.strip() == str(r.text).strip()
+                has_resp = df_raw.loc[mask, "has_response"]
                 tmp.append((r.review_id, (None if has_resp.empty else has_resp.iloc[0])))
             raw_has_response_pairs.extend(tmp)
-
-            LOG.info(f"OK: {fname} ({len(inputs)} записей)")
 
         except Exception as e:
             LOG.error(f"Ошибка чтения {fname}: {e}")
 
     if not all_inputs:
-        LOG.warning("Нет валидных записей отзывов для периода.")
+        LOG.warning("Нет валидных записей отзывов (inputs пуст). Проверяй парсинг даты/колонки.")
         return
 
-    df_raw_map = pd.DataFrame(raw_has_response_pairs, columns=["review_id","has_response"]).drop_duplicates("review_id")
-
-    # --- Анализ через Lexicon ---
+    # --- Анализ через лексикон ---
     from .lexicon_module import Lexicon
-
     lexicon = Lexicon()
+
     analyzed = reviews_core.analyze_reviews_bulk(all_inputs, lexicon)
+    LOG.info(f"Анализировано записей: {len(analyzed)}")
+    if not analyzed:
+        LOG.warning("После анализа записей нет (analyzed=0).")
+        return
 
     df_reviews = reviews_core.build_reviews_dataframe(analyzed)
-    
-    # --- Идемпотентная запись по неделям (file/year-range-режим: берём весь файл) ---
+    df_raw_map = (
+        pd.DataFrame(raw_has_response_pairs, columns=["review_id", "has_response"])
+        .drop_duplicates("review_id")
+    )
+
+    # --- Берём ВСЕ записи файла (без фильтров по датам) ---
     df_reviews_period = df_reviews.copy()
     if df_reviews_period.empty:
         LOG.warning("После отбора записей — пусто (ничего писать в историю).")
         return
-    
-    # (не обязательно, но полезно для дебага)
-    LOG.info(f"Готовим к записи строк: {len(df_reviews_period)}; "
-             f"диапазон дат: {df_reviews_period['created_at'].min()} — {df_reviews_period['created_at'].max()}")
 
-
+    LOG.info(
+        f"Готовим к записи строк: {len(df_reviews_period)}; "
+        f"диапазон дат: {df_reviews_period['created_at'].min()} — {df_reviews_period['created_at'].max()}"
+    )
 
     weeks = sorted(set(df_reviews_period["week_key"].tolist()))
-    LOG.info(f"Недели к upsert: {', '.join(weeks)}")
+    LOG.info(f"Недели к upsert: {', '.join(weeks) if weeks else '(нет)'}")
 
     total_appended = 0
     if dry_run:
@@ -394,14 +374,6 @@ if len(analyzed) == 0:
             total_appended += appended
 
     LOG.info(f"Готово. Всего добавлено: {total_appended}")
-
-    # DEBUG: посмотрим шапку и типы
-    try:
-        LOG.info(f"Колонки: {list(df.columns)}")
-        LOG.info(f"Типы: {df.dtypes.to_dict()}")
-        LOG.info(f"Пример дат (первые 5): {df['date'].astype(str).head(5).tolist()}")
-    except Exception:
-        pass
 
 
 if __name__ == "__main__":
