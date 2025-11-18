@@ -15796,37 +15796,47 @@ class Lexicon:
     - мы компилируем все регексы один раз при инициализации.
     """
 
-def __init__(
-    self,
-    sentiment_lexicon: Optional[Dict[str, Dict[str, List[str]]]] = None,
-    sentiment_key_to_group: Optional[Dict[str, str]] = None,
-    aspect_rules: Optional[Dict[str, "AspectRule"]] = None,
-    aspect_to_subtopics: Optional[Dict[str, List[Tuple[str, str]]]] = None,
-    topic_schema: Optional[Dict[str, Dict[str, Any]]] = None,
-) -> None:
-    # -------- тональность --------
-    self._sentiment_lexicon_raw: Dict[str, Dict[str, List[str]]] = (
-        sentiment_lexicon or SENTIMENT_LEXICON
-    )
-    self._sentiment_key_to_group: Dict[str, str] = (
-        sentiment_key_to_group or SENTIMENT_KEY_TO_GROUP
-    )
-    self._compiled_sentiment_lexicon: Dict[str, Dict[str, List[re.Pattern]]] = (
-        self._compile_sentiments(self._sentiment_lexicon_raw)
-    )
+class Lexicon:
+    def __init__(
+        self,
+        sentiment_lexicon: Optional[Dict[str, Dict[str, List[str]]]] = None,
+        sentiment_key_to_group: Optional[Dict[str, str]] = None,
+        aspect_rules: Optional[Dict[str, "AspectRule"]] = None,
+        aspect_to_subtopics: Optional[Dict[str, List[Tuple[str, str]]]] = None,
+        topic_schema: Optional[Dict[str, Dict[str, Any]]] = None,
+    ) -> None:
+        # -------- тональность --------
+        self._sentiment_lexicon_raw: Dict[str, Dict[str, List[str]]] = (
+            sentiment_lexicon or SENTIMENT_LEXICON
+        )
+        self._sentiment_key_to_group: Dict[str, str] = (
+            sentiment_key_to_group or SENTIMENT_KEY_TO_GROUP
+        )
+        self._compiled_sentiment_lexicon: Dict[str, Dict[str, List[re.Pattern]]] = (
+            self._compile_sentiments(self._sentiment_lexicon_raw)
+        )
+        # Публичное поле, которое ожидает reviews_core.detect_sentiment_for_review
+        self.compiled_sentiment: Dict[str, Dict[str, List[re.Pattern]]] = (
+            self._compiled_sentiment_lexicon
+        )
 
-    # -------- аспекты --------
-    self.aspect_rules: Dict[str, AspectRule] = aspect_rules or ASPECT_RULES
-    self.aspect_to_subtopics: Dict[str, List[Tuple[str, str]]] = (
-        aspect_to_subtopics or ASPECT_TO_SUBTOPICS
-    )
-    self._compiled_aspect_rules: Dict[str, Dict[str, List[re.Pattern]]] = (
-        self._compile_aspects(self.aspect_rules)
-    )
+        # -------- аспекты --------
+        self.aspect_rules: Dict[str, AspectRule] = aspect_rules or ASPECT_RULES
+        self.aspect_to_subtopics: Dict[str, List[Tuple[str, str]]] = (
+            aspect_to_subtopics or ASPECT_TO_SUBTOPICS
+        )
+        self._compiled_aspect_rules: Dict[str, Dict[str, List[re.Pattern]]] = (
+            self._compile_aspects(self.aspect_rules)
+        )
+        # Публичное поле для совместимости (если где-то используют lexicon.compiled_aspects)
+        self.compiled_aspects: Dict[str, Dict[str, List[re.Pattern]]] = (
+            self._compiled_aspect_rules
+        )
 
-    # -------- топики / подтемы --------
-    self._topic_schema: Dict[str, Dict[str, Any]] = topic_schema or TOPIC_SCHEMA
-    self._compiled_topics: Dict[str, Any] = self._compile_topics(self._topic_schema)
+        # -------- топики / подтемы --------
+        self._topic_schema: Dict[str, Dict[str, Any]] = topic_schema or TOPIC_SCHEMA
+        self._compiled_topics: Dict[str, Any] = self._compile_topics(self._topic_schema)
+
 
 
 
