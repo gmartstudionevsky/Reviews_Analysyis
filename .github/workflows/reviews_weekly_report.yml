@@ -58,7 +58,6 @@ jobs:
           SMTP_USER: ${{ secrets.SMTP_USER }}
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
           # Параметры запуска
-          WEEK_KEY: ${{ inputs.week_key }}
           DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || 'false' }}
         run: |
           python -m agent.reviews_weekly_report_agent
