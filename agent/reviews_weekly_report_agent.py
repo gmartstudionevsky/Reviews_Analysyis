@@ -242,63 +242,69 @@ def _append_rows_to_sheet(sheets, spreadsheet_id: str, title: str, rows: List[Li
         body=body,
     ).execute()
     
-def _serialize_aspects_for_sheet(value: Any) -> str:
+def _serialize_aspects_for_sheet(aspects_val: Any) -> str:
     """
-    Превращает список аспектов (['wifi', 'noise', ...]) в строку "wifi;noise".
-    Если уже строка — возвращаем как есть.
+    Преобразует поле aspects (список/NaN/строка) в компактную строку для Google Sheets.
+    Ожидается, что в ядре aspects — список словарей или строк вида 'topic:subtopic'.
     """
-    if value is None:
+    if aspects_val is None or (isinstance(aspects_val, float) and pd.isna(aspects_val)):
         return ""
-    # если уже str — не трогаем
-    if isinstance(value, str):
-        return value.strip()
-    # list / tuple / set со строками
-    if isinstance(value, (list, tuple, set)):
-        parts = []
-        for v in value:
-            if v is None:
-                continue
-            parts.append(str(v).strip())
-        return ";".join(p for p in parts if p)
-    # на всякий случай fallback
-    return str(value).strip()
+    if isinstance(aspects_val, str):
+        return aspects_val
 
-def _serialize_topics_for_sheet(value: Any) -> str:
-    """
-    Превращает список пар (topic, subtopic) в строку:
-      [("breakfast","service_dining_staff"), ("checkin_stay","stay_support")]
-      -> "breakfast:service_dining_staff;checkin_stay:stay_support"
-    Если уже строка — возвращаем как есть.
-    """
-    if value is None:
-        return ""
-    if isinstance(value, str):
-        return value.strip()
-    if isinstance(value, (list, tuple, set)):
-        parts = []
-        for v in value:
-            # ожидаем кортеж/список длины >=2
-            if isinstance(v, (list, tuple)) and len(v) >= 2:
-                topic_key = str(v[0]).strip()
-                sub_key = str(v[1]).strip()
-                if topic_key or sub_key:
-                    parts.append(f"{topic_key}:{sub_key}")
+    # Частый вариант: список dict'ов
+    if isinstance(aspects_val, (list, tuple)):
+        items: List[str] = []
+        for a in aspects_val:
+            if isinstance(a, dict):
+                topic = a.get("topic") or ""
+                sub = a.get("subtopic") or ""
+                if topic and sub:
+                    items.append(f"{topic}:{sub}")
+                elif topic:
+                    items.append(str(topic))
             else:
-                # если вдруг прилетел одиночный код
-                parts.append(str(v).strip())
-        return ";".join(p for p in parts if p)
-    return str(value).strip()
+                items.append(str(a))
+        return ", ".join(items)
+    # fallback: просто строка
+    return str(aspects_val)
+
+
+def _serialize_topics_for_sheet(topics_val: Any) -> str:
+    """
+    Аналогично aspects: приводим список/NaN/строку к компактной строке для Google Sheets.
+    """
+    if topics_val is None or (isinstance(topics_val, float) and pd.isna(topics_val)):
+        return ""
+    if isinstance(topics_val, str):
+        return topics_val
+
+    if isinstance(topics_val, (list, tuple)):
+        items: List[str] = []
+        for t in topics_val:
+            if isinstance(t, dict):
+                topic = t.get("topic") or ""
+                sub = t.get("subtopic") or ""
+                if topic and sub:
+                    items.append(f"{topic}:{sub}")
+                elif topic:
+                    items.append(str(topic))
+            else:
+                items.append(str(t))
+        return ", ".join(items)
+    return str(topics_val)
+
 
 def _upsert_reviews_history_week(
-    sheets, spreadsheet_id: str, df_reviews: pd.DataFrame, df_raw_with_has_response: pd.DataFrame, week_key: str
+    sheets,
+    spreadsheet_id: str,
+    df_reviews: pd.DataFrame,
+    df_raw_with_has_response: pd.DataFrame,
+    week_key: str,
 ) -> int:
     """
-    История = канонический слой. Пишем строки только за заданную неделю, не дублируя review_key.
-    Схема:
-      date, iso_week, source, lang, rating10,
-      sentiment_score, sentiment_overall,
-      aspects, topics, has_response,
-      review_key, text_trimmed, ingested_at
+    Идемпотентное добавление строк за конкретную неделю в лист HISTORY_SHEET_NAME.
+    Не дублирует строки с уже существующим review_key в рамках той же iso_week.
     """
     _ensure_sheet_exists(sheets, spreadsheet_id, HISTORY_SHEET_NAME)
     df_sheet = _read_sheet_as_df(sheets, spreadsheet_id, HISTORY_SHEET_NAME)
@@ -312,29 +318,31 @@ def _upsert_reviews_history_week(
 
     # добавим has_response из сырой таблицы по review_id
     # df_raw_with_has_response: columns: review_id, has_response
-    raw_map = {}
+    raw_map: Dict[str, Any] = {}
     if not df_raw_with_has_response.empty:
         raw_map = dict(zip(df_raw_with_has_response["review_id"], df_raw_with_has_response["has_response"]))
 
     to_append: List[List[Any]] = []
     cols = [
-        "date","iso_week","source","lang","rating10",
-        "sentiment_score","sentiment_overall",
-        "aspects","topics","has_response",
-        "review_key","text_trimmed","ingested_at"
+        "date", "iso_week", "source", "lang", "rating10",
+        "sentiment_score", "sentiment_overall",
+        "aspects", "topics", "has_response",
+        "review_key", "text_trimmed", "ingested_at",
     ]
 
     now = _now_iso()
     for _, row in df_reviews.iterrows():
         if row.get("week_key") != week_key:
             continue
+
         review_id = str(row.get("review_id"))
-        review_key = review_id  # в нашем ядре review_id уже стабилен; если отдельный key нужен — можно прокинуть
+        review_key = review_id  # review_id уже уникальный и стабильный
+
         if review_key in existing_keys:
             continue
 
         aspects = _serialize_aspects_for_sheet(row.get("aspects"))
-        topics  = _serialize_topics_for_sheet(row.get("topics"))
+        topics = _serialize_topics_for_sheet(row.get("topics"))
         has_resp = raw_map.get(review_id, "")
         text_trimmed = _trim_text(str(row.get("raw_text") or ""), 280)
 
@@ -356,15 +364,18 @@ def _upsert_reviews_history_week(
         to_append.append(vals)
 
     if to_append:
-        _append_rows_to_sheet(sheets, spreadsheet_id, HISTORY_SHEET_NAME, [cols] if df_sheet.empty else [])
+        # если лист пуст — сначала пишем заголовки
+        if df_sheet.empty:
+            _append_rows_to_sheet(sheets, spreadsheet_id, HISTORY_SHEET_NAME, [cols])
         _append_rows_to_sheet(sheets, spreadsheet_id, HISTORY_SHEET_NAME, to_append)
+
     return len(to_append)
 
 def _render_sources_block_html(period_to_df: Dict[str, pd.DataFrame]) -> str:
     """
     Рендерим таблицу «Источник × Период».
-    Ожидает: {'week':df, 'mtd':df, 'qtd':df, 'ytd':df, 'all':df}
-    В каждой ячейке показываем: средняя /10 и нативная (для five-star источников), кол-во, %позитив/%негатив.
+    Ожидает: {'week': df, 'mtd': df, 'qtd': df, 'ytd': df, 'all': df}
+    В каждой ячейке: средняя /10, нативная /5 (для FIVE_STAR_SOURCES), кол-во отзывов, % негативных.
     """
     labels = {
         "week": "Неделя",
@@ -373,60 +384,77 @@ def _render_sources_block_html(period_to_df: Dict[str, pd.DataFrame]) -> str:
         "ytd": "Год-to-date",
         "all": "Исторический фон",
     }
-    # Собираем множество всех источников из всех периодов
-    all_sources = set()
+
+    # Собираем множество всех источников
+    all_sources: set = set()
     for df in period_to_df.values():
         if df is not None and len(df) > 0:
             all_sources.update(df["source"].astype(str).unique().tolist())
     if not all_sources:
         return "<p>Нет данных по источникам.</p>"
 
-    # Вспомогательный индекс: period->code->row
+    # Индекс вида period_key -> {source_code -> row}
     px: Dict[str, Dict[str, pd.Series]] = {}
     for pkey, df in period_to_df.items():
-        pm = {}
+        pm: Dict[str, pd.Series] = {}
         if df is not None and len(df) > 0:
             for _, r in df.iterrows():
                 pm[str(r["source"])] = r
         px[pkey] = pm
 
-    # Строим таблицу с блоками по периодам
-    rows = []
+    rows: List[str] = []
     for code in sorted(all_sources):
         name = reviews_io.source_display_name(code)
-        cell_html = []
-        for pkey in ["week","mtd","qtd","ytd","all"]:
+        cell_html: List[str] = []
+        for pkey in ["week", "mtd", "qtd", "ytd", "all"]:
             r = px.get(pkey, {}).get(code)
             if r is None:
                 cell_html.append("<td></td><td></td><td></td><td></td>")
                 continue
-            avg10 = "" if pd.isna(r["avg10"]) else f"{float(r['avg10']):.2f}"
-            native = reviews_io.to_native_for_sources_block(
-                rating10=float(r["avg10"]) if not pd.isna(r["avg10"]) else None,
-                source_code=code
-            )
+
+            avg10 = None if pd.isna(r["avg10"]) else float(r["avg10"])
+            avg10_str = "" if avg10 is None else f"{avg10:.2f}"
+            native = reviews_io.to_native_for_sources_block(avg10, code)
             native_str = "" if native is None else f"{native:.2f}"
+
+            cnt = int(r["reviews"]) if not pd.isna(r["reviews"]) else 0
+            neg_pct = float(r["neg_pct"]) if not pd.isna(r["neg_pct"]) else 0.0
+            neg_str = f"{neg_pct * 100:.1f}%"
+
             cell_html.append(
-                f"<td style='text-align:right'>{avg10}</td>"
+                f"<td style='text-align:right'>{avg10_str}</td>"
                 f"<td style='text-align:right'>{native_str}</td>"
-                f"<td style='text-align:right'>{int(r['reviews'])}</td>"
-                f"<td style='text-align:right'>{float(r['neg_pct'])*100:.1f}%</td>"
+                f"<td style='text-align:right'>{cnt}</td>"
+                f"<td style='text-align:right'>{neg_str}</td>"
             )
+
         rows.append(f"<tr><td>{name}</td>{''.join(cell_html)}</tr>")
 
+    # Шапка: первая строка — периоды, вторая — подписи колонок
     head_cols = "".join(
-        f"<th colspan='4'>{labels[k]}</th>" for k in ["week","mtd","qtd","ytd","all"]
+        f"<th colspan='4'>{labels[k]}</th>" for k in ["week", "mtd", "qtd", "ytd", "all"]
     )
-    subhead = ("<tr><th>Источник</th>" +
-               "<th>/10</th><th>Нативная</th><th>Кол-во</th><th>% негатив</th>" * 5 +
-               "</tr>")
+    sub_cols = "".join(
+        [
+            "<th>/10</th><th>Нативная</th><th>К-во</th><th>% негат.</th>"
+            for _ in ["week", "mtd", "qtd", "ytd", "all"]
+        ]
+    )
+    subhead = f"<tr><th>Источник</th>{sub_cols}</tr>"
 
-    table = (
-        "<table border='1' cellspacing='0' cellpadding='6'>"
-        f"<thead><tr><th></th>{head_cols}</tr>{subhead}</thead>"
-        "<tbody>" + "".join(rows) + "</tbody></table>"
+    html = (
+        "<table border='1' cellspacing='0' cellpadding='4'>"
+        "<thead>"
+        f"<tr><th></th>{head_cols}</tr>"
+        f"{subhead}"
+        "</thead>"
+        "<tbody>"
+        f"{''.join(rows)}"
+        "</tbody>"
+        "</table>"
     )
-    return table
+    return html
+
 
 def _send_email(
     smtp_host: str,
@@ -1046,15 +1074,22 @@ def main() -> None:
         LOG.warning(f"Ошибка сводки по источникам: {e}")
         df_sources = pd.DataFrame(columns=["source","reviews","avg10","pos_pct","neg_pct","pos_cnt","neg_cnt"])
 
-    # --- История в Google Sheets (идемпотентно) ---
-    appended = _upsert_reviews_history_week(
-        sheets=sheets,
-        spreadsheet_id=sheets_id,
-        df_reviews=df_reviews,
-        df_raw_with_has_response=df_raw_map,
-        week_key=anchor_week_key,
-    )
-    LOG.info(f"В историю добавлено строк: {appended}")
+    # --- История в Google Sheets (идемпотентно, по всем неделям из df_reviews) ---
+    total_appended = 0
+    if not df_reviews.empty and "week_key" in df_reviews.columns:
+        week_keys = sorted(set(df_reviews["week_key"].astype(str).dropna().tolist()))
+        for wk in week_keys:
+            appended = _upsert_reviews_history_week(
+                sheets=sheets,
+                spreadsheet_id=sheets_id,
+                df_reviews=df_reviews,
+                df_raw_with_has_response=df_raw_map,
+                week_key=wk,
+            )
+            LOG.info(f"Неделя {wk}: в историю добавлено строк: {appended}")
+            total_appended += appended
+    LOG.info(f"Всего добавлено строк в историю: {total_appended}")
+
 
     # --- E-mail (A–C) ---
     subject = f"ARTSTUDIO | Отчёт по отзывам — неделя {week_start.strftime('%d %b')}–{week_end.strftime('%d %b %Y')}"
