@@ -271,16 +271,26 @@ def slice_periods(df_reviews: "pd.DataFrame", anchor_week_key: str) -> Dict[str,
     wk_monday = iso_week_monday(anchor_week_key)
     ranges = period_ranges_for_week(wk_monday)  # {'week':{'start','end'}, ...}
 
-    def _cut(df, start, end):
-        m = (df["created_at"] >= start) & (df["created_at"] <= end)
-        return df.loc[m].copy()
+    def _cut(df: pd.DataFrame, start: date, end: date) -> pd.DataFrame:
+        """
+        Режем по диапазону дат [start, end], приводя created_at к date,
+        чтобы избежать сравнения datetime64[ns] и date в pandas 2.x.
+        """
+        if df.empty:
+            return df.iloc[0:0].copy()
 
-    out = {
+        # created_at -> datetime -> .dt.date (массив date-объектов)
+        created = pd.to_datetime(df["created_at"]).dt.date
+        mask = (created >= start) & (created <= end)
+        return df.loc[mask].copy()
+
+    return {
         "week": _cut(df_reviews, ranges["week"]["start"], ranges["week"]["end"]),
         "mtd":  _cut(df_reviews, ranges["mtd"]["start"],  ranges["mtd"]["end"]),
         "qtd":  _cut(df_reviews, ranges["qtd"]["start"],  ranges["qtd"]["end"]),
         "ytd":  _cut(df_reviews, ranges["ytd"]["start"],  ranges["ytd"]["end"]),
         "all":  df_reviews.copy(),
+        "ranges": ranges,
     }
     return out
 
