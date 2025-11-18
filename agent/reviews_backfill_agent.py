@@ -502,6 +502,18 @@ def main() -> None:
         LOG.info("В бэкфилл добавлено строк: %d", total_appended)
 
     LOG.info(f"Готово. Всего добавлено: {total_appended}")
+    
+    summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if summary_path:
+        try:
+            with open(summary_path, "a", encoding="utf-8") as fh:
+                fh.write("### Reviews backfill\n\n")
+                fh.write(f"- Файлов к обработке: {len(selected)}\n")
+                fh.write(f"- Входных записей (inputs): {len(all_inputs)}\n")
+                fh.write(f"- DRY_RUN: {'true' if dry_run else 'false'}\n")
+                fh.write(f"- Новых строк добавлено: {total_appended}\n\n")
+        except Exception as e:
+            LOG.debug("Не удалось записать summary для backfill: %s", e)
 
 if __name__ == "__main__":
     main()
