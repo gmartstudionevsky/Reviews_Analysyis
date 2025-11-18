@@ -1188,6 +1188,35 @@ def main() -> None:
     # D — сравнение с прошлым годом
     d_html = _section_D_yoy(df_hist_all, week_start, week_end, ranges)
 
+    # Лог-сводка по якорной неделе
+    if week_df is None or week_df.empty:
+        LOG.info("Anchor week %s: отзывов за этот период нет.", anchor_week_key)
+    else:
+        try:
+            week_total = int(week_df["review_id"].nunique())
+            week_avg = float(week_df["rating10"].mean()) if "rating10" in week_df.columns else float("nan")
+
+            pos_mask = ((week_df["sentiment_overall"] == "positive") | (week_df["rating10"] >= 9.0))
+            neg_mask = ((week_df["sentiment_overall"] == "negative") | (week_df["rating10"] <= 6.0))
+
+            week_pos = float(pos_mask.mean())
+            week_neg = float(neg_mask.mean())
+
+            pos_txt = f"{week_pos*100:.1f}%" if week_pos == week_pos else "n/a"
+            neg_txt = f"{week_neg*100:.1f}%" if week_neg == week_neg else "n/a"
+
+            LOG.info(
+                "Anchor week %s (%s..%s): %d отзывов, средняя оценка %.2f/10, доля позитивных %s, доля негативных %s",
+                anchor_week_key,
+                week_start.isoformat(),
+                week_end.isoformat(),
+                week_total,
+                week_avg if week_avg == week_avg else float("nan"),
+                pos_txt,
+                neg_txt,
+            )
+        except Exception as e:
+            LOG.warning("Не удалось сформировать краткую сводку по неделе %s: %s", anchor_week_key, e)
 
     sources_html = _render_sources_block_html({
         "week": src_week, "mtd": src_mtd, "qtd": src_qtd, "ytd": src_ytd, "all": src_all
