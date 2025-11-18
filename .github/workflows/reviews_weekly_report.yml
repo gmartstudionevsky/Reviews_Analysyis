@@ -16,6 +16,10 @@ on:
         default: false
         type: boolean
 
+concurrency:
+  group: reviews-${{ github.ref }}
+  cancel-in-progress: false
+
 permissions:
   contents: read
 
