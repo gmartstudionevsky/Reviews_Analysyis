@@ -1078,6 +1078,22 @@ def main() -> None:
                 f"(последняя дата отзыва {last_dt})"
             )
 
+    # --- Нарезаем периоды относительно этой якорной недели ---
+    periods = reviews_core.slice_periods(df_hist_all, anchor_week_key)
+    ranges = periods["ranges"]
+
+    # week_start / week_end теперь глобальные для всей дальнейшей логики
+    week_start = ranges["week"]["start"]
+    week_end = ranges["week"]["end"]
+    LOG.info(f"Anchor week: {anchor_week_key} ({week_start}..{week_end})")
+
+    # датафреймы на периодах для A/B-блоков
+    week_df = periods["week"]
+    mtd_df = periods["mtd"]
+    qtd_df = periods["qtd"]
+    ytd_df = periods["ytd"]
+    all_df = periods["all"]
+    
     periods = reviews_core.slice_periods(df_hist_all, anchor_week_key)
     ranges = periods["ranges"]
     
