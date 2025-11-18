@@ -273,6 +273,23 @@ def main():
         ensure_tab(HISTORY_SHEET_ID, SURVEYS_TAB, SURVEYS_HEADER)
         write_full_history(df_all)
         print("[INFO] Backfill завершён успешно.")
+    
+    summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if summary_path:
+        try:
+            total_rows = len(df_all)
+            weeks_count = df_all["week_key"].nunique()
+            print(f"[INFO] Summary: недель {weeks_count}, строк {total_rows}.")
+
+            with open(summary_path, "a", encoding="utf-8") as fh:
+                fh.write("### Surveys backfill\n\n")
+                fh.write(f"- Файлов Report_*.xlsx: {len(reports)}\n")
+                fh.write(f"- Уникальных недель: {weeks_count}\n")
+                fh.write(f"- Всего строк (week×param): {total_rows}\n")
+                fh.write(f"- DRY_RUN: {'true' if dry_run else 'false'}\n\n")
+        except Exception as e:
+            print(f"[DEBUG] Не удалось записать summary для surveys backfill: {e}")
+
 
 if __name__ == "__main__":
     main()
