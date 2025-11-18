@@ -14,6 +14,7 @@ from typing import (
 )
 import re
 import pandas as pd
+LOG = logging.getLogger("reviews_core")
 
 # --- пакетные импорты внутри agent ---
 from .metrics_core import iso_week_monday, period_ranges_for_week
@@ -561,12 +562,25 @@ def analyze_reviews_bulk(
     if not records:
         return results
 
+    error_shown = 0  # чтобы не заспамить лог
+
     for rec in records:
         try:
             res = analyze_single_review(rec, lexicon)
         except Exception as e:
-            # можно завести logger в этом модуле; если он уже есть – используй его
-            # LOG.warning(f"Ошибка анализа отзыва {rec.review_id}: {e}")
+            if error_shown < 10:
+                LOG.exception(
+                    "Ошибка при анализе отзыва %s: %s",
+                    getattr(rec, "review_id", "?"),
+                    e,
+                )
+                error_shown += 1
+            else:
+                # дальше только короткий debug, чтобы не было 3000 стеков
+                LOG.debug(
+                    "Ошибка при анализе отзыва %s (подавлена после первых 10).",
+                    getattr(rec, "review_id", "?"),
+                )
             continue
 
         if res is None:
@@ -577,6 +591,7 @@ def analyze_reviews_bulk(
         results.append(res)
 
     return results
+
 
 
 def build_reviews_dataframe(
