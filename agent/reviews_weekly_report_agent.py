@@ -371,6 +371,40 @@ def _upsert_reviews_history_week(
 
     return len(to_append)
 
+def _sort_reviews_history_by_date(sheets, spreadsheet_id: str) -> None:
+    """
+    Перечитывает лист HISTORY_SHEET_NAME, сортирует по полю 'date'
+    и перезаписывает его обратно.
+    """
+    df = _read_sheet_as_df(sheets, spreadsheet_id, HISTORY_SHEET_NAME)
+    if df.empty or "date" not in df.columns:
+        LOG.warning("Нечего сортировать в reviews_history (пусто или нет колонки 'date').")
+        return
+
+    # безопасно приводим к дате
+    sort_dates = pd.to_datetime(df["date"], errors="coerce")
+    df = df.assign(_sort_date=sort_dates).sort_values("_sort_date", ascending=True).drop(
+        columns=["_sort_date"]
+    )
+
+    cols = df.columns.tolist()
+    values = [cols] + df[cols].values.tolist()
+
+    # полностью очищаем и записываем отсортированную таблицу
+    sheets.values().clear(
+        spreadsheetId=spreadsheet_id,
+        range=f"{HISTORY_SHEET_NAME}!A1:Z",
+    ).execute()
+
+    sheets.values().update(
+        spreadsheetId=spreadsheet_id,
+        range=f"{HISTORY_SHEET_NAME}!A1",
+        valueInputOption="RAW",
+        body={"values": values},
+    ).execute()
+
+    LOG.info("Лист reviews_history отсортирован по дате.")
+
 def _render_sources_block_html(period_to_df: Dict[str, pd.DataFrame]) -> str:
     """
     Рендерим таблицу «Источник × Период».
@@ -954,13 +988,6 @@ def main() -> None:
 
     recipients = [r.strip() for r in recipients_env.split(",") if r.strip()]
 
-    # --- Период ---
-    anchor_week_key = _last_completed_week_key(week_key_env if week_key_env else None)
-    wk_monday = iso_week_monday(anchor_week_key)
-    ranges = period_ranges_for_week(wk_monday)
-    week_start, week_end = ranges["week"]["start"], ranges["week"]["end"]
-    LOG.info(f"Anchor week: {anchor_week_key} ({week_start}..{week_end})")
-
     # --- Google clients ---
     creds = _build_credentials_from_b64()
     drive = _build_drive(creds)
@@ -1006,10 +1033,12 @@ def main() -> None:
     df_hist = _parse_history_df(hist_df_raw)
 
     # объединяем: history ∪ текущая неделя (без дублей по review_id)
+    # df_reviews — текущие отзывы из файла недели
+    # df_hist — история из Google Sheets
+
     if not df_reviews.empty:
         cur = df_reviews.copy()
         cur["created_at"] = pd.to_datetime(cur["created_at"])
-        # у нас review_id — уже стабильный ключ
         if not df_hist.empty:
             known = set(df_hist["review_id"].astype(str).tolist())
             cur = cur[~cur["review_id"].astype(str).isin(known)].copy()
@@ -1019,13 +1048,44 @@ def main() -> None:
     else:
         df_hist_all = df_hist.copy()
 
-    # срезы периодов относительно anchor_week_key
+    # --- Определяем якорную неделю по последней дате отзыва ---
+    if df_hist_all.empty:
+        # fallback: если истории нет вообще, используем "последнюю завершённую неделю" от текущей даты
+        anchor_week_key = _last_completed_week_key()
+        LOG.warning(
+            f"История пустая, используем якорную неделю по дате запуска: {anchor_week_key}"
+        )
+    else:
+        created_all = pd.to_datetime(df_hist_all["created_at"], errors="coerce").dropna()
+        if created_all.empty:
+            anchor_week_key = _last_completed_week_key()
+            LOG.warning(
+                "Не удалось распарсить даты в df_hist_all, используем якорную неделю по дате "
+                f"запуска: {anchor_week_key}"
+            )
+        else:
+            last_dt = created_all.max().date()
+            iso_year, iso_week, _ = last_dt.isocalendar()
+            anchor_week_key = f"{iso_year}-W{iso_week:02d}"
+            LOG.info(
+                f"Anchor week по данным: {anchor_week_key} "
+                f"(последняя дата отзыва {last_dt})"
+            )
+
+    # --- Нарезаем периоды относительно этой якорной недели ---
     periods = reviews_core.slice_periods(df_hist_all, anchor_week_key)
-    week_df = periods["week"]
-    mtd_df  = periods["mtd"]
-    qtd_df  = periods["qtd"]
-    ytd_df  = periods["ytd"]
-    all_df  = periods["all"]
+    ranges = periods["ranges"]
+    week_start = ranges["week"]["start"]
+    week_end = ranges["week"]["end"]
+    LOG.info(f"Anchor week: {anchor_week_key} ({week_start}..{week_end})")
+
+    # сразу достаём датафреймы периодов для блока A/B
+    week_df = periods["week"]["df"]
+    mtd_df = periods["mtd"]["df"]
+    qtd_df = periods["qtd"]["df"]
+    ytd_df = periods["ytd"]["df"]
+    all_df = periods["all"]["df"]
+
 
     # базовая сводка по источникам по всем периодам (ядро блока C1)
     src_week = reviews_core.build_source_pivot(week_df)
@@ -1090,6 +1150,10 @@ def main() -> None:
             total_appended += appended
     LOG.info(f"Всего добавлено строк в историю: {total_appended}")
 
+    # после дозаливки истории сортируем лист по дате
+    if total_appended > 0:
+        LOG.info("Сортируем лист reviews_history по дате...")
+        _sort_reviews_history_by_date(sheets, sheets_id)
 
     # --- E-mail (A–C) ---
     subject = f"ARTSTUDIO | Отчёт по отзывам — неделя {week_start.strftime('%d %b')}–{week_end.strftime('%d %b %Y')}"
