@@ -210,48 +210,43 @@ def _serialize_topics_for_sheet(value: Any) -> str:
     return str(value).strip()
 
 def _upsert_reviews_history_week(
-    sheets, spreadsheet_id: str, df_reviews: pd.DataFrame, df_raw_with_has_response: pd.DataFrame, week_key: str
+    sheets,
+    spreadsheet_id: str,
+    df_reviews: pd.DataFrame,
+    df_raw_with_has_response: pd.DataFrame,
+    week_key: str,
+    existing_keys: set[str],
 ) -> int:
     """
-    История = канонический слой. Пишем строки только за заданную неделю, не дублируя review_key.
-    Схема:
-      date, iso_week, source, lang, rating10,
-      sentiment_score, sentiment_overall,
-      aspects, topics, has_response,
-      review_key, text_trimmed, ingested_at
+    Записывает в историю строки за указанную неделю week_key.
+    Для бэкфилла:
+    - не делает дополнительных чтений из Sheets;
+    - использует общий набор existing_keys, который передаётся снаружи;
+    - пополняет existing_keys новыми ключами по мере добавления строк.
     """
-    _ensure_sheet_exists(sheets, spreadsheet_id, HISTORY_SHEET_NAME)
-    df_sheet = _read_sheet_as_df(sheets, spreadsheet_id, HISTORY_SHEET_NAME)
-
-    existing_keys: set = set()
-    if not df_sheet.empty and "iso_week" in df_sheet.columns and "review_key" in df_sheet.columns:
-        existing_keys = set(
-            df_sheet.loc[df_sheet["iso_week"] == week_key, "review_key"].astype(str).tolist()
-        )
-
-    raw_map = {}
-    if not df_raw_with_has_response.empty:
-        raw_map = dict(zip(df_raw_with_has_response["review_id"], df_raw_with_has_response["has_response"]))
+    # review_id -> has_response
+    raw_map = (
+        df_raw_with_has_response.set_index("review_id")["has_response"].to_dict()
+        if not df_raw_with_has_response.empty
+        else {}
+    )
 
     to_append: List[List[Any]] = []
-    cols = [
-        "date","iso_week","source","lang","rating10",
-        "sentiment_score","sentiment_overall",
-        "aspects","topics","has_response",
-        "review_key","text_trimmed","ingested_at"
-    ]
-
     now = _now_iso()
+
     for _, row in df_reviews.iterrows():
         if row.get("week_key") != week_key:
             continue
+
         review_id = str(row.get("review_id"))
-        review_key = review_id  # наш review_id уже стабилен и уникален
+        review_key = review_id  # наш стабильный идентификатор
+
         if review_key in existing_keys:
+            # уже есть в истории — пропускаем (идемпотентность)
             continue
 
         aspects = _serialize_aspects_for_sheet(row.get("aspects"))
-        topics  = _serialize_topics_for_sheet(row.get("topics"))
+        topics = _serialize_topics_for_sheet(row.get("topics"))
         has_resp = raw_map.get(review_id, "")
         text_trimmed = _trim_text(str(row.get("raw_text") or ""), 280)
 
@@ -271,11 +266,54 @@ def _upsert_reviews_history_week(
             now,
         ]
         to_append.append(vals)
+        existing_keys.add(review_key)  # пополняем набор, чтобы не словить дубликат в этом же запуске
 
-    if to_append:
-        _append_rows_to_sheet(sheets, spreadsheet_id, HISTORY_SHEET_NAME, [cols] if df_sheet.empty else [])
-        _append_rows_to_sheet(sheets, spreadsheet_id, HISTORY_SHEET_NAME, to_append)
+    if not to_append:
+        return 0
+
+    _append_rows_to_sheet(sheets, spreadsheet_id, HISTORY_SHEET_NAME, to_append)
     return len(to_append)
+
+
+def _read_existing_review_keys_all(
+    sheets,
+    spreadsheet_id: str,
+    sheet_name: str,
+) -> set[str]:
+    """
+    Считает все уже записанные review_key из истории (колонка с ключами).
+    Предполагаем, что review_key лежит в 11-й колонке (K), начиная со строки 2.
+    """
+    try:
+        resp = (
+            sheets.spreadsheets()
+            .values()
+            .get(
+                spreadsheetId=spreadsheet_id,
+                range=f"'{sheet_name}'!K2:K",
+            )
+            .execute()
+        )
+    except Exception as e:
+        LOG.warning(
+            "Не удалось прочитать существующие review_key из листа %s: %s",
+            sheet_name,
+            e,
+        )
+        return set()
+
+    values = resp.get("values", [])
+    existing: set[str] = set()
+    for row in values:
+        if not row:
+            continue
+        key = str(row[0]).strip()
+        if key:
+            existing.add(key)
+
+    LOG.info("В истории уже есть %d review_key", len(existing))
+    return existing
+
 
 
 # -----------------------------------------------------------------------------
@@ -409,6 +447,17 @@ def main() -> None:
     if dry_run:
         LOG.info("DRY_RUN=true — запись в Google Sheets не выполняется.")
     else:
+        # 1) гарантируем, что лист существует (одна read-запрос на книгу)
+        _ensure_sheet_exists(sheets, sheets_id, HISTORY_SHEET_NAME)
+
+        # 2) читаем все уже существующие review_key (ещё один read-запрос)
+        existing_keys = _read_existing_review_keys_all(
+            sheets,
+            sheets_id,
+            HISTORY_SHEET_NAME,
+        )
+
+        # 3) проходимся по неделям и дописываем только новые записи
         for wk in weeks:
             appended = _upsert_reviews_history_week(
                 sheets=sheets,
@@ -416,6 +465,7 @@ def main() -> None:
                 df_reviews=df_reviews_period,
                 df_raw_with_has_response=df_raw_map,
                 week_key=wk,
+                existing_keys=existing_keys,
             )
             LOG.info(f"Неделя {wk}: добавлено строк {appended}")
             total_appended += appended
