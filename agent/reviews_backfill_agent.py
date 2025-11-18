@@ -14,6 +14,7 @@ import pandas as pd
 # --- наши модули (пакетные импорты) ---
 from . import reviews_io, reviews_core
 from .metrics_core import iso_week_monday, period_ranges_for_week
+from .connectors import build_credentials_from_b64, get_drive_client, get_sheets_client
 
 # --- Google API ---
 from google.oauth2 import service_account
@@ -74,31 +75,6 @@ def _date_from_env(var_name: str) -> date:
         return datetime.strptime(val, "%Y-%m-%d").date()
     except Exception:
         raise RuntimeError(f"{var_name} имеет неверный формат: {val} (ожидается YYYY-MM-DD).")
-
-def _b64_to_sa_json_path(b64_env: str) -> str:
-    """
-    Декодирует GOOGLE_SERVICE_ACCOUNT_JSON_B64 в временный файл и возвращает путь.
-    """
-    content_b64 = os.environ.get(b64_env) or ""
-    if not content_b64:
-        raise RuntimeError(f"{b64_env} не задан.")
-    raw = base64.b64decode(content_b64)
-    out_path = "/tmp/sa.json"
-    with open(out_path, "wb") as f:
-        f.write(raw)
-    return out_path
-
-def _build_credentials_from_b64() -> "service_account.Credentials":
-    sa_path = _b64_to_sa_json_path("GOOGLE_SERVICE_ACCOUNT_JSON_B64")
-    return service_account.Credentials.from_service_account_file(
-        sa_path, scopes=DRIVE_SCOPES + SHEETS_SCOPES
-    )
-
-def _build_drive(creds):
-    return build("drive", "v3", credentials=creds, cache_discovery=False)
-
-def _build_sheets(creds):
-    return build("sheets", "v4", credentials=creds, cache_discovery=False)
 
 def _drive_list_files_in_folder(drive, folder_id: str) -> List[Dict[str, Any]]:
     q = f"'{folder_id}' in parents and trashed = false"
@@ -391,9 +367,9 @@ def main() -> None:
         raise RuntimeError("SHEETS_HISTORY_ID не задан.")
 
     # --- Google clients (через B64 секрет) ---
-    creds = _build_credentials_from_b64()
-    drive = _build_drive(creds)
-    sheets = _build_sheets(creds)
+    creds = build_credentials_from_b64()
+    drive = get_drive_client(creds)
+    sheets = get_sheets_client(creds)
 
     # --- Выбор файла: BACKFILL_FILE -> reviews_YYYY-YY.* -> ошибка ---
     backfill_file = (os.environ.get("BACKFILL_FILE") or "").strip()
