@@ -1,28 +1,4 @@
 # agent/surveys_backfill_agent.py
-#
-# Полная пересборка истории анкет TL: Marketing.
-#
-# Что делает:
-#   1. Идёт в папку DRIVE_FOLDER_ID в Google Drive.
-#   2. Собирает:
-#        - Report_history.xlsx (агрегированная история)
-#        - все Report_DD-MM-YYYY.xlsx (недельные выгрузки)
-#   3. Для каждого файла:
-#        - читает лист "Оценки гостей" (или "Reviews" в старых файлах)
-#        - прогоняет через parse_and_aggregate_weekly() из surveys_core
-#          -> получаем df_week (week_key, param, surveys_total, answered, avg5,
-#             promoters, detractors, nps_answers, nps_value)
-#   4. Сливает все результаты:
-#        - ключ = (week_key, param)
-#        - если одна и та же неделя+показатель встречается в нескольких файлах,
-#          берём последний по дате файла (т.е. более новый перезаписывает старый)
-#   5. Сортирует недели по возрастанию, параметры — по нашему порядку PARAM_ORDER.
-#   6. Полностью ПЕРЕЗАПИСЫВАЕТ лист surveys_history в Google Sheets:
-#        - сначала шапка
-#        - затем все строки.
-#
-# ЭТОТ СКРИПТ нужно запускать вручную (через отдельный workflow_dispatch),
-# а не по расписанию. В еженедельном отчёте backfill не гоняем.
 
 import os, io, re, sys, json, datetime as dt
 from datetime import date
@@ -32,6 +8,7 @@ import numpy as np
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
+from .connectors import build_credentials_from_env, get_drive_client, get_sheets_client
 
 # импортируем ядро обработки анкет
 try:
@@ -51,26 +28,13 @@ except ModuleNotFoundError:
 # =========================
 # ENV & Google API clients
 # =========================
-SCOPES = [
-    "https://www.googleapis.com/auth/drive.readonly",
-    "https://www.googleapis.com/auth/spreadsheets",
-]
 
-SA_PATH    = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
-SA_CONTENT = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON_CONTENT")
+CREDS = build_credentials_from_env()
+DRIVE = get_drive_client(CREDS)
+SHEETS = get_sheets_client(CREDS).spreadsheets()
 
-if SA_CONTENT and SA_CONTENT.strip().startswith("{"):
-    CREDS = Credentials.from_service_account_info(json.loads(SA_CONTENT), scopes=SCOPES)
-else:
-    if not SA_PATH:
-        raise RuntimeError("No GOOGLE_SERVICE_ACCOUNT_JSON or GOOGLE_SERVICE_ACCOUNT_JSON_CONTENT provided.")
-    CREDS = Credentials.from_service_account_file(SA_PATH, scopes=SCOPES)
-
-DRIVE  = build("drive",  "v3", credentials=CREDS)
-SHEETS = build("sheets", "v4", credentials=CREDS).spreadsheets()
-
-DRIVE_FOLDER_ID   = os.environ["DRIVE_FOLDER_ID"]
-HISTORY_SHEET_ID  = os.environ["SHEETS_HISTORY_ID"]
+DRIVE_FOLDER_ID = os.environ["DRIVE_FOLDER_ID"]
+HISTORY_SHEET_ID = os.environ["SHEETS_HISTORY_ID"]
 
 # =========================
 # Настройки форматов
