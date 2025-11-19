@@ -54,6 +54,15 @@ except ModuleNotFoundError:
         year_label,
     )
 
+def _require_env(name: str) -> str:
+    """
+    Берёт переменную окружения name или падает с понятной ошибкой.
+    Используем для критичных настроек, без которых агент работать не может.
+    """
+    value = os.environ.get(name)
+    if not value:
+        raise RuntimeError(f"Environment variable {name} is required but not set.")
+    return value
 
 # =========================================
 # ENV, creds, Google API clients
@@ -63,8 +72,8 @@ CREDS = build_credentials_from_env()
 DRIVE = get_drive_client(CREDS)
 SHEETS = get_sheets_client(CREDS).spreadsheets()
 
-DRIVE_FOLDER_ID   = os.environ["DRIVE_FOLDER_ID"]
-HISTORY_SHEET_ID  = os.environ["SHEETS_HISTORY_ID"]
+DRIVE_FOLDER_ID = _require_env("DRIVE_FOLDER_ID")
+HISTORY_SHEET_ID = _require_env("SHEETS_HISTORY_ID")
 
 RECIPIENTS        = [e.strip() for e in os.environ.get("RECIPIENTS","").split(",") if e.strip()]
 SMTP_USER         = os.environ.get("SMTP_USER")
