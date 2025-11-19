@@ -957,10 +957,6 @@ def main() -> None:
 
     if not (os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON_B64") or "").strip():
         raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON_B64 не задан.")
-    if not drive_folder_id:
-        raise RuntimeError("DRIVE_FOLDER_ID не задан.")
-    if not sheets_id:
-        raise RuntimeError("SHEETS_HISTORY_ID не задан.")
 
     recipients = [r.strip() for r in recipients_env.split(",") if r.strip()]
 
