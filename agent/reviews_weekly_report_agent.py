@@ -30,6 +30,16 @@ from . import reviews_io, reviews_core
 from .metrics_core import iso_week_monday, period_ranges_for_week
 from .connectors import build_credentials_from_b64, get_drive_client, get_sheets_client
 
+def _require_env(name: str) -> str:
+    """
+    Берёт переменную окружения name или падает с понятной ошибкой.
+    Используем для критичных настроек, без которых агент работать не может.
+    """
+    value = os.environ.get(name)
+    if not value:
+        raise RuntimeError(f"Environment variable {name} is required but not set.")
+    return value
+
 # --- Google API ---
 from googleapiclient.http import MediaIoBaseDownload
 
@@ -936,8 +946,8 @@ def _make_plot_sources_week(src_week: pd.DataFrame) -> Tuple[str, bytes]:
 # -----------------------------------------------------------------------------
 def main() -> None:
     # --- ENV ---
-    drive_folder_id = os.environ.get("DRIVE_FOLDER_ID") or ""
-    sheets_id = os.environ.get("SHEETS_HISTORY_ID") or ""
+    drive_folder_id = _require_env("DRIVE_FOLDER_ID")
+    sheets_id = _require_env("SHEETS_HISTORY_ID")
     recipients_env = os.environ.get("RECIPIENTS") or ""
     smtp_from = os.environ.get("SMTP_FROM") or ""
     smtp_user = os.environ.get("SMTP_USER") or ""
