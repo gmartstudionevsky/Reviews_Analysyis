@@ -1,0 +1,37 @@
+name: Merge apartment PDFs from Google Drive
+
+on:
+  workflow_dispatch:
+  # если захочешь по расписанию — раскомментируй и подправь cron
+  # schedule:
+  #   - cron: '0 3 * * *'  # каждый день в 03:00 UTC
+
+jobs:
+  merge:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Write service account credentials
+        env:
+          G00GLE_SERVICE_ACCOUNT_JSON_B64: ${{ secrets.G00GLE_SERVICE_ACCOUNT_JSON_B64 }}
+        run: |
+          echo "$G00GLE_SERVICE_ACCOUNT_JSON_B64" | base64 --decode > service_account.json
+
+      - name: Merge PDFs from Google Drive
+        env:
+          ROOT_DRIVE_FOLDER_ID: 1jGFfWBoz2g7H0xz59Tj31zSUEWwTFZXC
+        run: |
+          python merge_pdfs_from_drive.py
